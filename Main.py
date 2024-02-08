@@ -13,7 +13,7 @@ class Main:
 
     def __init__(self, board=None):
         self.board = board if board else chess.Board()
-        self.width, self.height = 400, 400
+        self.width, self.height = 500, 500
         self.square_size = self.width // 8
         self.screen = pygame.display.set_mode((self.width, self.height))
         if Main.piece_images is None:
@@ -65,7 +65,11 @@ class Main:
                     piece_key = piece_name + piece_color
                     piece_image = self.piece_images[piece_key]
                     self.screen.blit(
-                        piece_image, (col * self.square_size, row * self.square_size)
+                        piece_image,
+                        (
+                            col * self.square_size + self.square_size / 4,
+                            row * self.square_size + self.square_size / 4,
+                        ),
                     )
 
     def handle_mouse_click(self, event):
