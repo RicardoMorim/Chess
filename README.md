@@ -32,6 +32,7 @@ Before running the chess game, ensure you have the following dependencies instal
    pip install -r requirements.txt
 
 -> chess: A chess library for Python.
+
 -> pygame: A set of Python modules designed for writing video games.
 
 These libraries are specified in the requirements.txt file and will be installed automatically during the setup process.
