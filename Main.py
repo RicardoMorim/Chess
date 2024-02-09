@@ -279,7 +279,7 @@ class Main:
 
             self.draw_pieces()
             pygame.display.flip()
-
+            
             if self.AI_turn:
                 print("The engine is thinking...")
                 self.play_engine_move(max_depth, ai_color)
