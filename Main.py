@@ -169,7 +169,7 @@ class Main:
             row = y // self.square_size
         else:
             col = x // self.square_size
-            row = y // self.square_size
+            row = 7 - y // self.square_size
 
         if 0 <= col < 8 and 0 <= row < 8:
             return chess.square(col, row)
@@ -258,7 +258,7 @@ class Main:
 
         ai_color = "w" if self.color == "b" else "b"
         self.AI_turn = False if self.color == "w" else True
-        max_depth = 7  # Set the initial max depth for the engine
+        max_depth = 4  # Set the initial max depth for the engine
 
         clock = pygame.time.Clock()
 
