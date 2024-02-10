@@ -279,7 +279,12 @@ class Main:
 
             self.draw_pieces()
             pygame.display.flip()
-            
+
+            # ## TEST AI VS AI ##
+            # print("The engine is thinking...")
+            # self.play_engine_move(max_depth, ai_color)  ##
+            # ai_color = "w" if ai_color == "b" else "b"  ##
+
             if self.AI_turn:
                 print("The engine is thinking...")
                 self.play_engine_move(max_depth, ai_color)

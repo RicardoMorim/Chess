@@ -65,13 +65,15 @@ class Engine:
             with open(self.cache_file, "r") as file:
                 cache_data = json.load(file)
                 self.transposition_table.update(cache_data)
+
         except (FileNotFoundError, json.JSONDecodeError):
             with open(self.cache_file, "w") as file:
                 file.write(
                     "{}"
                 )  # Write an empty JSON object if the file is newly created or contains invalid data
+        print("Done loading table")
 
-    def update_cache(self, board, depth, value, best_move, flag):
+    def update_cache(self):
         """
         Update the transposition cache with the latest information.
 
@@ -82,26 +84,15 @@ class Engine:
         - best_move: The best move found.
         - flag: The flag indicating the type of result (exact, lowerbound, upperbound).
         """
-        key = self.calculate_board_hash(board)
 
         # Make a copy of the transposition table before modifying it
         with self.transposition_table_lock:
             transposition_copy = self.transposition_table.copy()
 
-        if key not in transposition_copy or depth >= transposition_copy[key]["depth"]:
-            serialized_best_move = best_move.uci() if best_move is not None else None
-
-            # Update the copy of the transposition table
-            transposition_copy[key] = {
-                "depth": depth,
-                "value": value,
-                "best_move": serialized_best_move,
-                "flag": flag,
-            }
-
             # Save the updated transposition table to the cache file
             with open(self.cache_file, "w") as file:
                 json.dump(transposition_copy, file, cls=ChessEncoder)
+        print("done updating cache file")
 
     def getBestMove(self):
         """
@@ -248,8 +239,9 @@ class Engine:
         Returns:
         - The best move found by the engine.
         """
-
-        return self.search_parallel(self.maxDepth)
+        move = self.search_parallel(self.maxDepth)
+        self.update_cache()
+        return move
 
     def calculate_complexity(self):
         """
@@ -444,8 +436,6 @@ class Engine:
                     board, depth, max_eval, best_move, "exact"
                 )
 
-                self.update_cache(board, depth, max_eval, best_move, "exact")
-
                 return max_eval, best_move
 
             else:
@@ -470,7 +460,7 @@ class Engine:
                 self.store_transposition_table_entry(
                     board, depth, min_eval, best_move, "exact"
                 )
-                self.update_cache(board, depth, min_eval, best_move, "exact")
+
                 return min_eval, best_move
 
     def search(
