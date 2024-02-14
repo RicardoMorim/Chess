@@ -2,18 +2,38 @@ import chess as ch
 import random as rd
 import os
 import concurrent.futures
-import copy
-from collections import namedtuple
+from collections import OrderedDict, namedtuple
 import json
-import threading
+import logging
+import copy
 
 
 class ChessEncoder(json.JSONEncoder):
+    """
+    JSON encoder for chess-related objects.
+    """
+
+    KEY_SAN = "san"
+    KEY_VALUE = "value"
+    KEY_MOVE = "move"
+
     def default(self, obj):
-        if isinstance(obj, ch.Move):
-            return {"san": obj.uci()}
-        elif isinstance(obj, MoveEvaluation):
-            return {"value": obj.value, "move": obj.move.uci() if obj.move else None}
+        """
+        Convert chess-related objects to JSON-compatible format.
+
+        Args:
+            obj: The object to be converted.
+
+        Returns:
+            The JSON-compatible representation of the object.
+        """
+        if type(obj) == ch.Move:
+            return {self.KEY_SAN: obj.uci()}
+        elif type(obj) == MoveEvaluation:
+            return {
+                self.KEY_VALUE: obj.value,
+                self.KEY_MOVE: obj.move.uci() if obj.move else None,
+            }
         return super().default(obj)
 
 
@@ -22,18 +42,23 @@ MoveEvaluation = namedtuple("MoveEvaluation", ["value", "move"])
 
 # Piece values for evaluation
 piece_values = {
-    ch.PAWN: 1,
-    ch.ROOK: 5.1,
-    ch.BISHOP: 3.33,
-    ch.KNIGHT: 3.2,
-    ch.QUEEN: 8.8,
-    ch.KING: 999,
+    ch.PAWN: 10,
+    ch.ROOK: 51,
+    ch.BISHOP: 33,
+    ch.KNIGHT: 32,
+    ch.QUEEN: 88,
+    ch.KING: 99999,
 }
 
 
 class Engine:
     def __init__(
-        self, board, maxDepth, color, cache_file="./cache/transposition_cache.json"
+        self,
+        board,
+        maxDepth,
+        color,
+        cache_file="E:/chess_cache/transposition_cache.json",
+        # cache_file="./cache/transposition_cache.json"
     ):
         """
         Initialize the chess engine.
@@ -49,10 +74,28 @@ class Engine:
         self.board = board
         self.color = color
         self.maxDepth = maxDepth
-        self.transposition_table = {}
-        self.transposition_table_lock = threading.Lock()
+        self.transposition_table = OrderedDict()
         self.cache_file = cache_file
         self.load_cache()
+
+    def store_transposition_table_entry(self, board, depth, value, best_move, flag):
+        """
+        Store an entry in the transposition table.
+
+        Parameters:
+        - board: The chess board.
+        - depth: The depth of the search.
+        - value: The evaluation value.
+        - best_move: The best move found.
+        - flag: The flag indicating the type of result (exact, lowerbound, upperbound).
+        """
+        key = self.calculate_board_hash(board)
+        self.transposition_table[key] = {
+            "depth": depth,
+            "value": value,
+            "best_move": best_move,
+            "flag": flag,
+        }
 
     def load_cache(self):
         """
@@ -65,13 +108,11 @@ class Engine:
             with open(self.cache_file, "r") as file:
                 cache_data = json.load(file)
                 self.transposition_table.update(cache_data)
-
+                logging.info("Transposition cache loaded")
         except (FileNotFoundError, json.JSONDecodeError):
             with open(self.cache_file, "w") as file:
-                file.write(
-                    "{}"
-                )  # Write an empty JSON object if the file is newly created or contains invalid data
-        print("Done loading table")
+                json.dump({}, file)
+                logging.info("Cache file didn't exist. Created a new cache file.")
 
     def update_cache(self):
         """
@@ -84,15 +125,10 @@ class Engine:
         - best_move: The best move found.
         - flag: The flag indicating the type of result (exact, lowerbound, upperbound).
         """
-
-        # Make a copy of the transposition table before modifying it
-        with self.transposition_table_lock:
-            transposition_copy = self.transposition_table.copy()
-
-            # Save the updated transposition table to the cache file
-            with open(self.cache_file, "w") as file:
-                json.dump(transposition_copy, file, cls=ChessEncoder)
-        print("done updating cache file")
+        transposition_copy = self.transposition_table.copy()
+        with open(self.cache_file, "w") as file:
+            json.dump(transposition_copy, file, cls=ChessEncoder)
+        logging.info("done updating cache file")
 
     def getBestMove(self):
         """
@@ -101,6 +137,7 @@ class Engine:
         Returns:
         - The best move found by the engine.
         """
+
         return self.engine()
 
     def evalFunct(self):
@@ -128,9 +165,9 @@ class Engine:
         """
         if self.board.is_checkmate():
             if self.board.turn == self.color:
-                return -999
+                return -99999
             else:
-                return 999
+                return 999999
         else:
             return 0
 
@@ -319,7 +356,7 @@ class Engine:
         Returns:
         - The evaluation score and the best move found.
         """
-        if depth >= 2:
+        if depth >= 3:
             return self.evalFunct(), None
 
         stand_pat = self.evalFunct()
@@ -356,25 +393,6 @@ class Engine:
         """
         return board.fen()
 
-    def store_transposition_table_entry(self, board, depth, value, best_move, flag):
-        """
-        Store an entry in the transposition table.
-
-        Parameters:
-        - board: The chess board.
-        - depth: The depth of the search.
-        - value: The evaluation value.
-        - best_move: The best move found.
-        - flag: The flag indicating the type of result (exact, lowerbound, upperbound).
-        """
-        key = self.calculate_board_hash(board)
-        self.transposition_table[key] = {
-            "depth": depth,
-            "value": value,
-            "best_move": best_move,
-            "flag": flag,
-        }
-
     def minimax(self, board, depth, alpha, beta, maximizing_player, color):
         """
         Perform minimax search with alpha-beta pruning.
@@ -409,10 +427,11 @@ class Engine:
                         return entry["value"], entry["best_move"]
 
             if depth == 0 or board.is_game_over():
-                return self.quiescenceSearch(board, alpha, beta)
+                # return self.quiescenceSearch(board, alpha, beta)
+                return self.evalFunct()
 
             if maximizing_player:
-                max_eval = -99999
+                max_eval = float("-inf")
                 best_move = None
                 for move in board.legal_moves:
                     board.push(move)
@@ -439,7 +458,7 @@ class Engine:
                 return max_eval, best_move
 
             else:
-                min_eval = 99999
+                min_eval = float("inf")
                 best_move = None
                 for move in board.legal_moves:
                     board.push(move)
@@ -464,7 +483,7 @@ class Engine:
                 return min_eval, best_move
 
     def search(
-        self, depth, alpha=-99999, beta=99999
+        self, depth, alpha=float("-inf"), beta=float("inf")
     ):  # currently unused (using the search with parallelization)
         """
         Perform a simple search without parallelization.
@@ -486,7 +505,9 @@ class Engine:
 
         for move in moves:
             self.board.push(move)
-            move_value = self.minimax(depth - 1, alpha, beta, False, self.color)
+            move_value = self.minimax(
+                self.board, depth - 1, alpha, beta, False, self.color
+            )
             self.board.pop()
             if move_value > alpha:
                 alpha = move_value
@@ -495,7 +516,7 @@ class Engine:
                 break
         return best_move
 
-    def search_parallel(self, depth, alpha=-99999, beta=99999):
+    def search_parallel(self, depth, alpha=float("-inf"), beta=float("inf")):
         """
         Perform parallelized search using parallelization for better performance.
 
@@ -509,6 +530,11 @@ class Engine:
         """
         best_move = None
         moves = list(self.board.legal_moves)
+
+        moves.sort(
+            key=lambda move: self.board.is_capture(move) or self.board.is_check()
+        )
+
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = {
                 executor.submit(
@@ -530,6 +556,8 @@ class Engine:
                     break
         return best_move
 
+        return best_move
+
     def evaluate_move(self, board_copy, move, depth, alpha, beta):
         """
         Evaluate a move using minimax within a parallelized context.
@@ -549,8 +577,8 @@ class Engine:
             board_copy, depth - 1, -beta, -alpha, False, self.color
         )
 
-        if move_value == -99999:
-            return MoveEvaluation(value=-99999, move=move)
+        if move_value == float("-inf"):
+            return MoveEvaluation(value=float("-inf"), move=move)
         if type(move_value) == float:
             move_value = (move_value, None)
         return MoveEvaluation(value=move_value[0], move=move)
