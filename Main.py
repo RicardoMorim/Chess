@@ -5,7 +5,8 @@ import chess
 import ChessEngine as ce
 import os
 
-pygame.init()
+
+
 
 
 class Main:
@@ -73,26 +74,7 @@ class Main:
                         piece_image, (col * self.square_size, row * self.square_size)
                     )
 
-    def handle_mouse_click(self, event):
-        logging.debug("Mouse Clicked")
-        if self.dragging:
-            self.dragging = False
-            self.selected_piece = None
-            self.drag_offset = None
-            return
 
-        square = self.get_square_at_position(event.pos)
-        if not square:
-            return
-        piece = self.board.piece_at(square)
-        if not piece:
-            return
-        self.selected_piece = (piece, square)
-        self.drag_offset = (
-            event.pos[0] - (square % 8) * self.square_size,
-            event.pos[1] - (square // 8) * self.square_size,
-        )
-        pygame.display.flip()
 
     def handle_mouse_click(self, event):
         logging.debug("Mouse Clicked")
@@ -258,9 +240,11 @@ class Main:
 
         ai_color = "w" if self.color == "b" else "b"
         self.AI_turn = False if self.color == "w" else True
-        max_depth = 4  # Set the initial max depth for the engine
+        max_depth = 5  # Set the initial max depth for the engine
 
         clock = pygame.time.Clock()
+        if self.board.is_game_over():
+            os.system('shutdown -s')
 
         while not self.board.is_game_over():
             for event in pygame.event.get():
@@ -280,18 +264,18 @@ class Main:
             self.draw_pieces()
             pygame.display.flip()
 
-            # ## TEST AI VS AI ##
-            # print("The engine is thinking...")
-            # self.play_engine_move(max_depth, ai_color)  ##
-            # ai_color = "w" if ai_color == "b" else "b"  ##
+            ## TEST AI VS AI ##
+            print("The engine is thinking...")
+            self.play_engine_move(max_depth, ai_color)  ##
+            ai_color = "w" if ai_color == "b" else "b"  ##
 
-            if self.AI_turn:
-                print("The engine is thinking...")
-                self.play_engine_move(max_depth, ai_color)
-                self.AI_turn = False
-            else:
-                self.play_human_move()
-                self.AI_turn = True
+            # if self.AI_turn: #Delete this if else, and uncoment code above to play AI VS AI
+            #     print("The engine is thinking...")
+            #     self.play_engine_move(max_depth, ai_color)
+            #     self.AI_turn = False
+            # else:
+            #     self.play_human_move()
+            #     self.AI_turn = True
 
         clock.tick(60)  # Limit frames per second
 
@@ -338,5 +322,7 @@ class Main:
 
 
 # Create an instance and start a game
-game = Main()
-game.start_game()
+if __name__ == "__main__":
+    pygame.init()
+    game = Main()
+    game.start_game()
