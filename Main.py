@@ -6,9 +6,6 @@ import ChessEngine as ce
 import os
 
 
-
-
-
 class Main:
     piece_images = None
 
@@ -73,8 +70,6 @@ class Main:
                     self.screen.blit(
                         piece_image, (col * self.square_size, row * self.square_size)
                     )
-
-
 
     def handle_mouse_click(self, event):
         logging.debug("Mouse Clicked")
@@ -228,6 +223,7 @@ class Main:
     def play_engine_move(self, max_depth, color):
         engine = ce.Engine(self.board, max_depth, color)
         best_move = engine.getBestMove()
+        print(best_move)
         if best_move in self.board.legal_moves:
             self.board.push(best_move)
         else:
@@ -240,11 +236,9 @@ class Main:
 
         ai_color = "w" if self.color == "b" else "b"
         self.AI_turn = False if self.color == "w" else True
-        max_depth = 5  # Set the initial max depth for the engine
+        max_depth = 6  # Set the initial max depth for the engine
 
         clock = pygame.time.Clock()
-        if self.board.is_game_over():
-            os.system('shutdown -s')
 
         while not self.board.is_game_over():
             for event in pygame.event.get():
@@ -265,17 +259,18 @@ class Main:
             pygame.display.flip()
 
             ## TEST AI VS AI ##
-            print("The engine is thinking...")
-            self.play_engine_move(max_depth, ai_color)  ##
-            ai_color = "w" if ai_color == "b" else "b"  ##
+            # print("The engine is thinking...")
+            # self.play_engine_move(max_depth, ai_color)  ##
+            # ai_color = "w" if ai_color == "b" else "b"  ##
 
-            # if self.AI_turn: #Delete this if else, and uncoment code above to play AI VS AI
-            #     print("The engine is thinking...")
-            #     self.play_engine_move(max_depth, ai_color)
-            #     self.AI_turn = False
-            # else:
-            #     self.play_human_move()
-            #     self.AI_turn = True
+            ## HUMAN VS AI ##
+            if self.AI_turn: #comment this if else, and uncoment code above to play AI VS AI
+                print("The engine is thinking...")
+                self.play_engine_move(max_depth, ai_color)
+                self.AI_turn = False
+            else:
+                self.play_human_move()
+                self.AI_turn = True
 
         clock.tick(60)  # Limit frames per second
 
