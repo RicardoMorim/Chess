@@ -1,9 +1,23 @@
 import logging
 import sys
-import pygame
-import chess
-import ChessEngine as ce
 import os
+# Save the original stdout and stderr
+orig_stdout = sys.stdout
+orig_stderr = sys.stderr
+
+# Redirect stdout and stderr to os.devnull
+sys.stdout = open(os.devnull, "w")
+sys.stderr = open(os.devnull, "w")
+
+# Import pygame
+import pygame
+
+# Restore stdout and stderr
+sys.stdout = orig_stdout
+sys.stderr = orig_stderr
+import chess
+import MonteCarlo as MTCS
+import Minimax as Minimax
 
 
 class Main:
@@ -21,6 +35,7 @@ class Main:
         self.dragging = False
         self.AI_turn = False
         self.color = "w"
+        self.AI_type = "minimax"
         pygame.display.set_caption("Chess Game")
 
     @classmethod
@@ -221,9 +236,15 @@ class Main:
                     sys.exit()
 
     def play_engine_move(self, max_depth, color):
-        engine = ce.Engine(self.board, max_depth, color)
+        print("engine: " + self.AI_type)
+        engine = (
+            Minimax.Engine(self.board, max_depth, color)
+            if self.AI_type == "minimax"
+            else MTCS.Engine(self.board, color)
+        )
+
         best_move = engine.getBestMove()
-        print(best_move)
+        print(best_move, "best move")
         if best_move in self.board.legal_moves:
             self.board.push(best_move)
         else:
@@ -236,7 +257,7 @@ class Main:
 
         ai_color = "w" if self.color == "b" else "b"
         self.AI_turn = False if self.color == "w" else True
-        max_depth = 6  # Set the initial max depth for the engine
+        max_depth = 7  # Set the initial max depth for the engine
 
         clock = pygame.time.Clock()
 
@@ -258,50 +279,129 @@ class Main:
             self.draw_pieces()
             pygame.display.flip()
 
-            ## TEST AI VS AI ##
-            # print("The engine is thinking...")
-            # self.play_engine_move(max_depth, ai_color)  ##
-            # ai_color = "w" if ai_color == "b" else "b"  ##
+            ## TEST AI MTCS VS AI Minimax ##
+            print("The engine is thinking...")
+
+            self.play_engine_move(max_depth, ai_color)
+
+            self.AI_type = "monte_carlo" if self.AI_type == "minimax" else "minimax"
+
+            ai_color = "w" if ai_color == "b" else "b"
 
             ## HUMAN VS AI ##
-            if self.AI_turn: #comment this if else, and uncoment code above to play AI VS AI
-                print("The engine is thinking...")
-                self.play_engine_move(max_depth, ai_color)
-                self.AI_turn = False
-            else:
-                self.play_human_move()
-                self.AI_turn = True
+            # if self.AI_turn:
+            #     print("The engine is thinking...")
+            #     self.play_engine_move(max_depth, ai_color, self.AI_type)
+            #     self.AI_turn = False
+            # else:
+            #     self.play_human_move()
+            #     self.AI_turn = True
+
+        # Game over, show end game screen
+        winner = "White" if self.board.turn == chess.BLACK else "Black"
+        print("Looser: " + self.AI_type)
+        print("Winner: " + "monte_carlo" if self.AI_type == "minimax" else "minimax")
+        if self.end_game_screen(winner):
+            return True  # Start a new game
+
+        else:
+            pygame.quit()
 
         clock.tick(60)  # Limit frames per second
 
         pygame.quit()
 
-    def select_side_screen(self):
+    def end_game_screen(self, winner):
         font = pygame.font.Font(None, 36)
-        text = font.render("Select Your Side:", True, (255, 255, 255))
+        text = font.render(f"Winner: {winner}", True, (255, 255, 255))
         text_rect = text.get_rect(center=(self.width // 2, self.height // 2 - 50))
 
-        white_button = pygame.Rect(self.width // 4 - 75, self.height // 2, 150, 50)
-        black_button = pygame.Rect(3 * self.width // 4 - 75, self.height // 2, 150, 50)
+        restart_button = pygame.Rect(self.width // 2 - 75, self.height // 2, 150, 50)
 
-        pygame.draw.rect(self.screen, (255, 255, 255), white_button)
-        pygame.draw.rect(self.screen, (0, 0, 0), black_button)
+        pygame.draw.rect(self.screen, (255, 255, 255), restart_button)
 
-        white_text = font.render("White", True, (0, 0, 0))
-        white_text_rect = white_text.get_rect(center=white_button.center)
-
-        black_text = font.render("Black", True, (255, 255, 255))
-        black_text_rect = black_text.get_rect(center=black_button.center)
+        restart_text = font.render("Restart", True, (0, 0, 0))
+        restart_text_rect = restart_text.get_rect(center=restart_button.center)
 
         while True:
             self.screen.fill((0, 0, 0))
             self.screen.blit(text, text_rect)
-            pygame.draw.rect(self.screen, (255, 255, 255), white_button)
-            pygame.draw.rect(self.screen, (10, 10, 10), black_button)
-            self.screen.blit(white_text, white_text_rect)
-            self.screen.blit(black_text, black_text_rect)
+            pygame.draw.rect(self.screen, (255, 255, 255), restart_button)
+            self.screen.blit(restart_text, restart_text_rect)
             pygame.display.flip()
 
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    sys.exit()
+
+                if event.type == pygame.MOUSEBUTTONDOWN:
+                    if restart_button.collidepoint(event.pos):
+                        return True  # Restart the game
+            pygame.time.Clock().tick(60)
+
+    def select_side_screen(self):
+        font = pygame.font.Font(None, 36)
+        text = font.render("Select Your Side and AI Type:", True, (255, 255, 255))
+        text_rect = text.get_rect(center=(self.width // 2, self.height // 2 - 50))
+
+        white_button = pygame.Rect(self.width // 4 - 75, self.height // 2, 150, 50)
+        black_button = pygame.Rect(3 * self.width // 4 - 75, self.height // 2, 150, 50)
+        minimax_button = pygame.Rect(
+            self.width // 4 - 75, self.height // 2 + 75, 150, 50
+        )
+        monte_carlo_button = pygame.Rect(
+            self.width // 2.5 + 75, self.height // 2 + 75, 200, 50
+        )
+
+        while True:
+            self.screen.fill((0, 0, 0))
+            self.screen.blit(text, text_rect)
+
+            # Change the color of the buttons based on the selected AI type
+            minimax_color = (
+                (0, 255, 0) if self.AI_type == "minimax" else (255, 255, 255)
+            )
+            monte_carlo_color = (
+                (0, 255, 0) if self.AI_type == "monte_carlo" else (10, 10, 10)
+            )
+            minimax_button = (
+                pygame.Rect(self.width // 4 - 75, self.height // 2 + 75, 170, 60)
+                if self.AI_type == "minimax"
+                else pygame.Rect(self.width // 4 - 75, self.height // 2 + 75, 150, 50)
+            )
+            monte_carlo_button = (
+                pygame.Rect(self.width // 2.5 + 75, self.height // 2 + 75, 220, 60)
+                if self.AI_type == "monte_carlo"
+                else pygame.Rect(self.width // 2.5 + 75, self.height // 2 + 75, 200, 50)
+            )
+
+            pygame.draw.rect(self.screen, (255, 255, 255), white_button)
+            pygame.draw.rect(self.screen, (10, 10, 10), black_button)
+            pygame.draw.rect(self.screen, minimax_color, minimax_button)
+            pygame.draw.rect(self.screen, monte_carlo_color, monte_carlo_button)
+
+            white_text = font.render("White", True, (0, 0, 0))
+            white_text_rect = white_text.get_rect(center=white_button.center)
+
+            black_text = font.render("Black", True, (255, 255, 255))
+            black_text_rect = black_text.get_rect(center=black_button.center)
+
+            minimax_text = font.render("Minimax AI", True, (0, 0, 0))
+            minimax_text_rect = minimax_text.get_rect(center=minimax_button.center)
+
+            monte_carlo_text = font.render("Monte Carlo AI", True, (255, 255, 255))
+            monte_carlo_text_rect = monte_carlo_text.get_rect(
+                center=monte_carlo_button.center
+            )
+
+            self.screen.blit(white_text, white_text_rect)
+            self.screen.blit(black_text, black_text_rect)
+            self.screen.blit(minimax_text, minimax_text_rect)
+            self.screen.blit(monte_carlo_text, monte_carlo_text_rect)
+
+            pygame.display.flip()
+            
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     pygame.quit()
@@ -314,10 +414,16 @@ class Main:
                     elif black_button.collidepoint(event.pos):
                         self.color = "b"
                         return
+                    elif minimax_button.collidepoint(event.pos):
+                        self.AI_type = "minimax"
+                    elif monte_carlo_button.collidepoint(event.pos):
+                        self.AI_type = "monte_carlo"
 
 
 # Create an instance and start a game
 if __name__ == "__main__":
     pygame.init()
     game = Main()
-    game.start_game()
+    start_game = True
+    while start_game:
+        start_game = game.start_game()
