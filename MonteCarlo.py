@@ -66,9 +66,9 @@ class Engine:
         board,
         color,
         # cache_file="E:/chess_cache/transposition_cache.json",
-        iterations=10000,
+        stockfish,
+        iterations=16,
         cache_file="./cache/transposition_cache_MTCS.json",
-        stockfish_path="./stockfish/stockfish-windows-x86-64-avx2.exe",
     ):
         """
         Initialize the chess engine.
@@ -87,10 +87,7 @@ class Engine:
         self.cache_file = cache_file
         self.iterations = iterations
         self.load_cache()
-        self.engine_eval = chess.engine.SimpleEngine.popen_uci(
-            stockfish_path, debug=False
-        )
-        self.engine_eval.configure({"Threads": 8})
+        self.engine_eval = stockfish
 
     def load_cache(self):
         """
@@ -135,23 +132,27 @@ class Engine:
 
         return self.engine()
 
-    def stockfishEvalFunct(self, board):
+    def stockfish_evalFunct(self, board):
         """
         Evaluate the current position based on material and positional factors.
 
         Returns:
         - The evaluation score for the current position.
         """
+        if self.engine_eval is None:
+            return self.built_in_evalFunct(board)
+
         try:
-            score = None
-            while score is None:
-                result = self.engine_eval.analyse(board, chess.engine.Limit(time=0.25))
-                score = result["score"].relative.score()
+            result = self.engine_eval.analyse(board, chess.engine.Limit(time=0.5))
+            score = result["score"].relative.score()
+            if not isinstance(score, (int, float, complex)):
+                print("error getting stockfish score")
+                score = 0
             return score
-        except ValueError:
+        except (ValueError, TimeoutError) as e:
             logging.error("Error parsing Stockfish output.")
-            logging.error("Using built-in eval...")
-            return self.built_in_evalFunc(board)
+            logging.error("Retying to get the value for the board.")
+            return self.stockfish_evalFunct(board)
 
     def built_in_evalFunc(self, board):
         compt = 0
@@ -288,7 +289,7 @@ class Engine:
         # move = self.iterative_deepening_search()
         root_node = Node(self.board)
         move = self.mcts_search(root_node, self.iterations)
-        self.update_cache()
+
         return move
 
     def calculate_king_safety_evaluation(self, board):
@@ -337,6 +338,17 @@ class Engine:
         return board.fen()
 
     def mcts_search(self, root, iterations):
+
+        key = self.calculate_board_hash(self.board)
+
+        if key in self.transposition_table:
+            entry = self.transposition_table[key]
+            if entry["depth"] >= self.iterations:
+                if (entry["flag"] == True and self.engine_eval is not None) or (
+                    entry["flag"] == False and self.engine_eval == None
+                ):
+                    return chess.Move.from_uci(entry["best_move"]["san"])
+
         for i in range(1, iterations + 1):
             selected_node = self.selection(root)
             expanded_node = self.expansion(selected_node)
@@ -344,15 +356,14 @@ class Engine:
             self.backpropagation(expanded_node, simulation_result, i)
 
         # After all iterations, select the best move based on statistics
-        self.update_cache()
         best_child = max(root.children, key=lambda child: child.visits)
+        self.update_transposition_table(self.board, best_child, self.iterations)
+        self.update_cache()
         return best_child.state.peek()  # Return the move from the best child
 
     def selection(self, node):
         while node.children:
             node = max(node.children, key=lambda child: ucb1(child))
-            if self.check_transposition_table(node.state):
-                return node
         return node
 
     def expansion(self, node):
@@ -373,11 +384,6 @@ class Engine:
             new_state = node.state.copy()
             new_state.push(best_move)
 
-            if self.check_transposition_table(new_state):
-                return (
-                    node  # If the position is in the transposition table, don't expand
-                )
-
             new_node = Node(new_state, parent=node)
             node.children.append(new_node)
             return new_node
@@ -388,8 +394,6 @@ class Engine:
         while node:
             node.visits += 1
             node.score += result
-            if node.parent:
-                self.update_transposition_table(node.parent.state, result, iteration)
             node = node.parent
 
     def check_transposition_table(self, state):
@@ -399,21 +403,14 @@ class Engine:
     def update_transposition_table(self, state, result, iteration):
         key = self.calculate_board_hash(state)
 
-        # Check if the move stack is not empty
-        if state.move_stack:
-            last_move = state.peek()
-        else:
-            return
-
         if (
             key not in self.transposition_table
             or result > self.transposition_table[key]["value"]
         ):
             self.transposition_table[key] = {
                 "iterations": iteration,
-                "value": result,
-                "best_move": last_move,
-                "flag": "exact",
+                "best_move": result,
+                "flag": True if self.engine_eval is not None else False,
             }
 
     def simulation(self, node):
@@ -423,7 +420,7 @@ class Engine:
             sim_moves = list(sim_board.legal_moves)
             sim_move = rd.choice(sim_moves)
             sim_board.push(sim_move)
-        return self.built_in_evalFunc(sim_board)
+        return self.stockfish_evalFunct(sim_board)
 
     def eval_move(self, board, move):
         """
@@ -432,7 +429,7 @@ class Engine:
         """
         board.push(move)
 
-        value = self.built_in_evalFunc(board)
+        value = self.stockfish_evalFunct(board)
 
         board.pop()
         return value

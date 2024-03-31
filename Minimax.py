@@ -1,9 +1,12 @@
+import random
+from time import sleep
 import chess as ch
 import os
 from collections import OrderedDict, namedtuple
 import json
 import logging
 import chess.engine
+import stable
 
 
 class ChessEncoder(json.JSONEncoder):
@@ -56,8 +59,8 @@ class Engine:
         maxDepth,
         color,
         # cache_file="E:/chess_cache/transposition_cache.json",
+        stockfish,
         cache_file="./cache/transposition_cache_Minimax.json",
-        stockfish_path="./stockfish/stockfish-windows-x86-64-avx2.exe",
     ):
         """
         Initialize the chess engine.
@@ -76,8 +79,10 @@ class Engine:
         self.transposition_table = OrderedDict()
         self.cache_file = cache_file
         self.load_cache()
-        self.engine_eval = chess.engine.SimpleEngine.popen_uci(stockfish_path)
-        self.engine_eval.configure({"Threads": 8})
+        self.engine_eval = stockfish
+        self.openings_folder = "./oppenings"
+        self.openings = {}
+        self.load_openings()
 
     def store_transposition_table_entry(self, board, depth, value, best_move, flag):
         """
@@ -88,7 +93,8 @@ class Engine:
         - depth: The depth of the search.
         - value: The evaluation value.
         - best_move: The best move found.
-        - flag: The flag indicating the type of result (exact, lowerbound, upperbound).
+        - flag: the flag indicating if a move was evaluated by stockfish
+
         """
         key = self.calculate_board_hash(board)
         self.transposition_table[key] = {
@@ -124,7 +130,7 @@ class Engine:
         - depth: The depth of the search.
         - value: The evaluation value.
         - best_move: The best move found.
-        - flag: The flag indicating the type of result (exact, lowerbound, upperbound).
+        - flag: the flag indicating if a move was evaluated by stockfish
         """
         transposition_copy = self.transposition_table.copy()
         with open(self.cache_file, "w") as file:
@@ -139,31 +145,170 @@ class Engine:
         - The best move found by the engine.
         """
 
+        if len(self.board.move_stack) < 20:
+            return self.play_opening_move(self.board)
+
+        if self.engine_eval is not None:
+            result = self.engine_eval.play(self.board, chess.engine.Limit(time=2))
+            return result.move
         return self.engine()
 
-    def stockfish_evalFunct(self, board):
+    def evalFunct(self, board):
         """
         Evaluate the current position based on material and positional factors.
 
         Returns:
         - The evaluation score for the current position.
         """
-        try:
-            result = self.engine_eval.analyse(board, chess.engine.Limit(time=0.1))
-            score = result["score"].relative.score()
-            return score
-        except ValueError:
-            logging.error("Error parsing Stockfish output.")
-            logging.error("Using built-in eval...")
+        if self.engine_eval is None:
             return self.built_in_evalFunc(board)
+        try:
+            result = self.engine_eval.analyse(board, chess.engine.Limit(time=0.5))
+            score = result["score"].relative.score()
+            if not isinstance(score, (int, float, complex)):
+                print("error getting stockfish score")
+                score = 0
+            return score
+        except (ValueError, TimeoutError) as e:
+            logging.error("Error parsing Stockfish output.")
+            logging.error("Retying to get the value for the board.")
+            return self.evalFunct(board)
+
+    def calculate_repetition_penalty(self, move, board):
+        """
+        Calculate a penalty for move repetition.
+
+        Parameters:
+        - move: The chess move.
+
+        Returns:
+        - A penalty if the move has been repeated, 0 otherwise.
+        """
+        move_history = [board_move.uci() for board_move in board.move_stack]
+        move_count = move_history.count(move.uci())
+
+        # Apply a penalty if the move has been repeated more than once
+        if move_count > 1:
+            return -100 * move_count
+        else:
+            return 0
+
+    def load_openings(self):
+        """
+        Load openings from PGN files in the specified folder and its subfolders.
+        """
+        self.openings = {}
+        for root, dirs, files in os.walk(self.openings_folder):
+            for filename in files:
+                if filename.endswith(".pgn"):
+                    opening_name = os.path.splitext(filename)[0]
+                    full_path = os.path.join(root, filename)
+                    self.openings[opening_name] = chess.pgn.read_game(open(full_path))
+        # Shuffle the keys of the openings dictionary
+        keys = list(self.openings.keys())
+        random.shuffle(keys)
+        self.openings = {key: self.openings[key] for key in keys}
+
+    def play_opening_move(self, board):
+        """
+        Play an opening move from the loaded openings.
+
+        Parameters:
+        - board: The current chess board.
+
+        Returns:
+        - The updated board after playing the move.
+        - The move played.
+        """
+        for opening_name, opening in self.openings.items():
+            newBoard = chess.Board()
+            for move in opening.mainline_moves():
+                if newBoard == board:
+                    sleep(1)
+                    print(move)
+                    return move
+                newBoard.push(move)
+
+        return self.engine()
+
+    def getPieceValue(self, piece, x, y):
+
+        if piece == None:
+            return 0
+
+        def getAbsoluteValue(piece, isWhite, x, y):
+            piece_type = piece.piece_type
+            if piece_type == chess.PAWN:
+                return 10 + (
+                    stable.pawnEvalWhite[y][x]
+                    if isWhite
+                    else stable.pawnEvalBlack[y][x]
+                )
+            elif piece_type == chess.ROOK:
+                return 50 + (
+                    stable.rookEvalWhite[y][x]
+                    if isWhite
+                    else stable.rookEvalBlack[y][x]
+                )
+            elif piece_type == chess.KNIGHT:
+                return 30 + stable.knightEval[y][x]
+            elif piece_type == chess.BISHOP:
+                return 30 + (
+                    stable.bishopEvalWhite[y][x]
+                    if isWhite
+                    else stable.bishopEvalBlack[y][x]
+                )
+            elif piece_type == chess.QUEEN:
+                return 90 + stable.evalQueen[y][x]
+            elif piece_type == chess.KING:
+                return 900 + (
+                    stable.kingEvalWhite[y][x]
+                    if isWhite
+                    else stable.kingEvalBlack[y][x]
+                )
+
+        absolute_value = getAbsoluteValue(piece, piece.color == "w", x, y)
+        return absolute_value if piece.color == chess.WHITE else -absolute_value
 
     def built_in_evalFunc(self, board):
+        a = self.mateOpportunity(board)
+        if a is not None:
+            return a
+
         compt = 0
         # Sums up the material values
-        for square in board.piece_map():
-            compt += self.squareResPoints(square, board)
-        compt *= 0.7
-        compt += self.mateOpportunity(board) * 0.15 + self.openning(board) * 0.15
+        for i in range(8):
+            for j in range(8):
+                square = chess.square(j, 7 - i)
+                compt += self.getPieceValue(board.piece_at(square), i, j)
+
+        compt *= 2
+
+        def has_castled(board, color):
+            for move in board.move_stack:
+                if (
+                    board.is_castling(move)
+                    and board.color_at(move.from_square) == color
+                ):
+                    return True
+            return False
+
+        # Then in your evaluation function:
+        if has_castled(board, self.color):
+            compt += 100  # Give 100 points if the AI has castled
+
+        last_move = board.peek()
+        compt += self.openning(board) + self.calculate_repetition_penalty(
+            last_move, board
+        )
+
+        if board.is_check():
+            if board.turn == self.color:
+                compt -= 50
+            else:
+                compt += 50
+
+        compt += random.randint(-1, 1)
         return compt
 
     def mateOpportunity(self, board):
@@ -178,10 +323,12 @@ class Engine:
         if board.is_checkmate():
             if board.turn == self.color:
                 return 999999
-            else:
-                return -999999
-        else:
+
+            return -999999
+
+        if board.is_game_over():
             return 0
+        return None
 
     def openning(self, board):
         """
@@ -197,6 +344,7 @@ class Engine:
             else:
                 return -1 / 30 * len(legal_moves)
         else:
+            return 0
             opening_evaluation = self.calculate_opening_evaluation(board)
             return opening_evaluation
 
@@ -208,9 +356,10 @@ class Engine:
         - The opening evaluation score.
         """
         return (
-            0.5 * self.calculate_material_evaluation(board)
+            0.2 * self.calculate_material_evaluation(board)
             + 0.3 * self.calculate_pawn_structure_evaluation(board)
             + 0.2 * self.calculate_mobility_evaluation(board)
+            + 0.3 * self.calculate_king_safety_evaluation(board)
         )
 
     def calculate_material_evaluation(self, board):
@@ -258,28 +407,29 @@ class Engine:
                 mobility_eval -= 1  # Decrease for opponent's legal moves
         return mobility_eval
 
-    def squareResPoints(self, square, board):
+    def deepening_search_depth(self):
         """
-        Calculate the evaluation points for a given square.
+        Increase the search depth as the game progresses.
 
-        Parameters:
-        - square: The chess square.
-
-        Returns:
-        - The evaluation points for the specified square.
+        This function adjusts the maximum depth for the search algorithm based on the number of pieces on the board.
         """
-        piece_type = board.piece_type_at(square)
-        piece_value = piece_values.get(piece_type, 0)
+        # Calculate the number of pieces on the board
+        num_pieces = len(self.board.piece_map())
 
-        if board.color_at(square) != board.turn:
-            return -piece_value
-        else:
-            if piece_type == ch.PAWN:
-                file, rank = ch.square_file(square), ch.square_rank(square)
-                pawn_structure_value = 0.1 * (4 - abs(3 - file))
-                return piece_value + pawn_structure_value
-            else:
-                return piece_value
+        # Adjust the maximum depth based on the number of pieces
+        if num_pieces < 5:
+            self.maxDepth += 6
+        elif num_pieces < 8:
+            self.maxDepth += 5
+        elif num_pieces < 10:
+            self.maxDepth += 4
+        elif num_pieces < 13:
+            self.maxDepth += 3
+        elif num_pieces < 15:
+            self.maxDepth += 2
+        elif num_pieces < 20:
+            self.maxDepth += 1
+        print(self.maxDepth)
 
     def engine(self):
         """
@@ -288,7 +438,29 @@ class Engine:
         Returns:
         - The best move found by the engine.
         """
-        move, _ = self.minimax(self.board.copy(), float("-inf"), float("inf"), 1)
+        key = self.calculate_board_hash(self.board)
+
+        if key in self.transposition_table:
+            entry = self.transposition_table[key]
+            if entry["depth"] >= self.maxDepth:
+                if (entry["flag"] == True and self.engine_eval is not None) or (
+                    entry["flag"] == False and self.engine_eval is None
+                ):
+                    return chess.Move.from_uci(entry["best_move"]["san"])
+
+        if self.engine_eval is None:
+            self.deepening_search_depth()
+
+        move, val = self.minimax(self.board.copy(), float("-inf"), float("inf"), 1)
+
+        self.store_transposition_table_entry(
+            self.board,
+            self.maxDepth,
+            val,
+            move,
+            True if self.engine_eval is not None else False,
+        )
+
         self.update_cache()
         return move
 
@@ -308,7 +480,7 @@ class Engine:
         )
         return total_complexity
 
-    def calculate_king_safety_evaluation(self):
+    def calculate_king_safety_evaluation(self, board):
         """
         Calculate the king safety evaluation based on pawn shields.
 
@@ -316,7 +488,7 @@ class Engine:
         - The king safety evaluation score.
         """
         pawn_shield_eval = 0
-        for square, piece in self.board.piece_map().items():
+        for square, piece in board.piece_map().items():
             if piece.piece_type == ch.PAWN and piece.color == self.color:
                 file, rank = ch.square_file(square), ch.square_rank(square)
                 if rank == 1 and self.color == ch.WHITE:
@@ -353,19 +525,6 @@ class Engine:
         return board.fen()
 
     def minimax(self, board, alpha, beta, depth):
-        key = self.calculate_board_hash(board)
-
-        if key in self.transposition_table:
-            entry = self.transposition_table[key]
-            if entry["depth"] >= depth:
-                if entry["flag"] == "exact":
-                    return entry["best_move"], entry["value"]
-                elif entry["flag"] == "lowerbound":
-                    alpha = max(alpha, entry["value"])
-                elif entry["flag"] == "upperbound":
-                    beta = min(beta, entry["value"])
-                if alpha >= beta:
-                    return entry["best_move"], entry["value"]
 
         moveList = list(board.legal_moves)
         moveList.sort(
@@ -374,7 +533,7 @@ class Engine:
         )
 
         if not moveList:
-            return None, self.built_in_evalFunc(board)
+            return None, self.evalFunct(board)
 
         newCandidate = float("-inf") if depth % 2 != 0 else float("inf")
         best_move = None
@@ -382,7 +541,7 @@ class Engine:
         for i in moveList:
             board.push(i)
             if depth == self.maxDepth:
-                value = self.built_in_evalFunc(board)
+                value = self.evalFunct(board)
             else:
                 _, value = self.minimax(board, alpha, beta, depth + 1)
 
@@ -402,13 +561,4 @@ class Engine:
             if beta <= alpha:
                 break
 
-        flag = (
-            "exact"
-            if newCandidate > alpha and newCandidate < beta
-            else "lowerbound" if newCandidate >= beta else "upperbound"
-        )
-
-        self.store_transposition_table_entry(
-            board, self.maxDepth, newCandidate, best_move, flag
-        )
         return best_move, newCandidate

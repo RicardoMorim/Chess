@@ -18,6 +18,7 @@ This is a simple chess game implemented in Python using the Pygame library. The 
 - Graphical chessboard with a user-friendly interface.
 - Ability to play against an AI opponent.
 - AI engine with basic evaluation function and minimax algorithm with alpha-beta pruning.
+- AI engine with stockfish evaluation.
 
 ## Dependencies
 
@@ -57,6 +58,10 @@ These libraries are specified in the requirements.txt file and will be installed
 
    python main.py
 
+### Note
+
+There are some different code snippets in the start_game_function and in the play_engine_move in the main.py file so that you may play aganist other AI or to play AI vs AI to see how they behave.
+
 ## Game Controls
 
 -> Click on a piece to select it.
@@ -66,7 +71,7 @@ These libraries are specified in the requirements.txt file and will be installed
 ## AI Engine
 
 The AI engine uses a basic evaluation function and the minimax algorithm with alpha-beta pruning to make decisions.
-The depth of the search tree is configurable in the ChessEngine.py file.
+The depth of the search tree is configurable in the Main.py file.
 
 ## Contributing
 

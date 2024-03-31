@@ -1,6 +1,7 @@
 import logging
 import sys
 import os
+
 # Save the original stdout and stderr
 orig_stdout = sys.stdout
 orig_stderr = sys.stderr
@@ -17,13 +18,21 @@ sys.stdout = orig_stdout
 sys.stderr = orig_stderr
 import chess
 import MonteCarlo as MTCS
-import Minimax as Minimax
-
+import Minimax
+import Minimaxv2
+import chess.engine
+import mtcs
+import newAI
 
 class Main:
     piece_images = None
 
-    def __init__(self, board=None):
+    def __init__(
+        self,
+        board=None,
+        stockfish_path="./stockfish/stockfish-windows-x86-64-avx2.exe",
+        
+    ):
         self.board = board if board else chess.Board()
         self.width, self.height = 500, 500
         self.square_size = self.width // 8
@@ -36,6 +45,11 @@ class Main:
         self.AI_turn = False
         self.color = "w"
         self.AI_type = "minimax"
+        self.stockfish = None
+        self.engine_eval = chess.engine.SimpleEngine.popen_uci(
+            stockfish_path, debug=False
+        )
+        self.engine_eval.configure({"Threads": 8})
         pygame.display.set_caption("Chess Game")
 
     @classmethod
@@ -235,20 +249,53 @@ class Main:
                     pygame.quit()
                     sys.exit()
 
-    def play_engine_move(self, max_depth, color):
-        print("engine: " + self.AI_type)
-        engine = (
-            Minimax.Engine(self.board, max_depth, color)
-            if self.AI_type == "minimax"
-            else MTCS.Engine(self.board, color)
-        )
-
-        best_move = engine.getBestMove()
-        print(best_move, "best move")
+    def push_move(self, best_move):
         if best_move in self.board.legal_moves:
             self.board.push(best_move)
         else:
             print("Engine made an illegal move!")
+
+    def play_engine_move(self, max_depth, color):
+        print("engine: " + self.AI_type)
+        ## OTHER ENGINES TO USE ##
+        # Minimaxv2.Minimax(self.board, max_depth, color)
+        # mtcs.MonteCarloTreeSearchAI(self.engine_eval if self.stockfish else None)
+
+        ## COMPARE BUILT-IN EVAL WITH STOCKFISH EVAL ##
+        # if self.AI_type == "minimax":
+        #     if self.stockfish:
+        #         engine = Minimax.Engine(self.board, 2, color, self.engine_eval)
+        #         best_move = engine.getBestMove()
+        #         self.push_move(best_move)
+        #         return
+        # engine = Minimax.Engine(self.board, 5, color, None)
+        # best_move = engine.getBestMove()
+        # self.push_move(best_move)
+        # return
+
+        if self.AI_type == "minimax":
+            if self.stockfish:
+                engine = Minimax.Engine(self.board, 2, color, self.engine_eval)
+                best_move = engine.getBestMove()
+                self.push_move(best_move)
+                return
+            engine = Minimax.Engine(self.board, 6, color, None)
+            best_move = engine.getBestMove()
+            self.push_move(best_move)
+            return
+        engine = Minimaxv2.Minimax(self.board, 4, color)
+        best_move = engine.getBestMove()
+        self.push_move(best_move)
+        return
+    
+        if self.stockfish:
+            engine = MTCS.Engine(self.board, color, self.engine_eval)
+            best_move = engine.getBestMove()
+            self.push_move(best_move)
+            return
+        engine = MTCS.Engine(self.board, color, None, iterations=2000)
+        best_move = engine.getBestMove()
+        self.push_move(best_move)
 
     def start_game(self):
         logging.basicConfig(level=logging.DEBUG)
@@ -257,7 +304,7 @@ class Main:
 
         ai_color = "w" if self.color == "b" else "b"
         self.AI_turn = False if self.color == "w" else True
-        max_depth = 7  # Set the initial max depth for the engine
+        max_depth = 4  # Set the initial max depth for the engine
 
         clock = pygame.time.Clock()
 
@@ -279,25 +326,24 @@ class Main:
             self.draw_pieces()
             pygame.display.flip()
 
-            ## TEST AI MTCS VS AI Minimax ##
-            print("The engine is thinking...")
-
+            ## TEST AI VS AI  ##
             self.play_engine_move(max_depth, ai_color)
 
             self.AI_type = "monte_carlo" if self.AI_type == "minimax" else "minimax"
 
             ai_color = "w" if ai_color == "b" else "b"
 
-            ## HUMAN VS AI ##
+            # HUMAN VS AI ##
             # if self.AI_turn:
             #     print("The engine is thinking...")
-            #     self.play_engine_move(max_depth, ai_color, self.AI_type)
+            #     self.play_engine_move(max_depth, ai_color)
             #     self.AI_turn = False
             # else:
             #     self.play_human_move()
             #     self.AI_turn = True
 
         # Game over, show end game screen
+        print(self.board.outcome)
         winner = "White" if self.board.turn == chess.BLACK else "Black"
         print("Looser: " + self.AI_type)
         print("Winner: " + "monte_carlo" if self.AI_type == "minimax" else "minimax")
@@ -353,6 +399,9 @@ class Main:
         monte_carlo_button = pygame.Rect(
             self.width // 2.5 + 75, self.height // 2 + 75, 200, 50
         )
+        stockfish_button = pygame.Rect(
+            self.width // 4 - 75, self.height // 2 + 150, 150, 50
+        )
 
         while True:
             self.screen.fill((0, 0, 0))
@@ -365,6 +414,8 @@ class Main:
             monte_carlo_color = (
                 (0, 255, 0) if self.AI_type == "monte_carlo" else (10, 10, 10)
             )
+            stockfish_color = (0, 255, 0) if self.stockfish else (10, 10, 10)
+
             minimax_button = (
                 pygame.Rect(self.width // 4 - 75, self.height // 2 + 75, 170, 60)
                 if self.AI_type == "minimax"
@@ -375,11 +426,17 @@ class Main:
                 if self.AI_type == "monte_carlo"
                 else pygame.Rect(self.width // 2.5 + 75, self.height // 2 + 75, 200, 50)
             )
+            stockfish_button = (
+                pygame.Rect(self.width // 4 - 75, self.height // 2 + 150, 420, 60)
+                if self.stockfish
+                else pygame.Rect(self.width // 4 - 75, self.height // 2 + 150, 400, 50)
+            )
 
             pygame.draw.rect(self.screen, (255, 255, 255), white_button)
             pygame.draw.rect(self.screen, (10, 10, 10), black_button)
             pygame.draw.rect(self.screen, minimax_color, minimax_button)
             pygame.draw.rect(self.screen, monte_carlo_color, monte_carlo_button)
+            pygame.draw.rect(self.screen, stockfish_color, stockfish_button)
 
             white_text = font.render("White", True, (0, 0, 0))
             white_text_rect = white_text.get_rect(center=white_button.center)
@@ -395,13 +452,21 @@ class Main:
                 center=monte_carlo_button.center
             )
 
+            stockfish_text = font.render(
+                "Allow Stockfish Evaluation", True, (255, 255, 255)
+            )
+            stockfish_text_rect = stockfish_text.get_rect(
+                center=stockfish_button.center
+            )
+
             self.screen.blit(white_text, white_text_rect)
             self.screen.blit(black_text, black_text_rect)
             self.screen.blit(minimax_text, minimax_text_rect)
             self.screen.blit(monte_carlo_text, monte_carlo_text_rect)
+            self.screen.blit(stockfish_text, stockfish_text_rect)
 
             pygame.display.flip()
-            
+
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     pygame.quit()
@@ -418,6 +483,8 @@ class Main:
                         self.AI_type = "minimax"
                     elif monte_carlo_button.collidepoint(event.pos):
                         self.AI_type = "monte_carlo"
+                    elif stockfish_button.collidepoint(event.pos):
+                        self.stockfish = not self.stockfish
 
 
 # Create an instance and start a game
@@ -426,4 +493,5 @@ if __name__ == "__main__":
     game = Main()
     start_game = True
     while start_game:
+        game = Main()
         start_game = game.start_game()
