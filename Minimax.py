@@ -149,7 +149,7 @@ class Engine:
             return self.play_opening_move(self.board)
 
         if self.engine_eval is not None:
-            result = self.engine_eval.play(self.board, chess.engine.Limit(time=2))
+            result = self.engine_eval.play(self.board, chess.engine.Limit(time=0.1))
             return result.move
         return self.engine()
 
@@ -417,17 +417,17 @@ class Engine:
         num_pieces = len(self.board.piece_map())
 
         # Adjust the maximum depth based on the number of pieces
-        if num_pieces < 5:
+        if num_pieces < 4:
             self.maxDepth += 6
-        elif num_pieces < 8:
+        elif num_pieces < 5:
             self.maxDepth += 5
-        elif num_pieces < 10:
+        elif num_pieces < 6:
             self.maxDepth += 4
-        elif num_pieces < 13:
+        elif num_pieces < 8:
             self.maxDepth += 3
-        elif num_pieces < 15:
+        elif num_pieces < 12:
             self.maxDepth += 2
-        elif num_pieces < 20:
+        elif num_pieces < 14:
             self.maxDepth += 1
         print(self.maxDepth)
 

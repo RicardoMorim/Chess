@@ -1,4 +1,5 @@
 import logging
+import random
 import sys
 import os
 
@@ -24,6 +25,7 @@ import chess.engine
 import mtcs
 import newAI
 
+
 class Main:
     piece_images = None
 
@@ -31,7 +33,6 @@ class Main:
         self,
         board=None,
         stockfish_path="./stockfish/stockfish-windows-x86-64-avx2.exe",
-        
     ):
         self.board = board if board else chess.Board()
         self.width, self.height = 500, 500
@@ -51,7 +52,10 @@ class Main:
         )
         self.engine_eval.configure({"Threads": 8})
         pygame.display.set_caption("Chess Game")
-
+        self.openings_folder = "./oppenings"
+        self.openings = {}
+        self.load_openings()
+    
     @classmethod
     def load_piece_images(cls):
         piece_images = {}
@@ -66,7 +70,23 @@ class Main:
                 )
 
         return piece_images
-
+    
+    def load_openings(self):
+        """
+        Load openings from PGN files in the specified folder and its subfolders.
+        """
+        self.openings = {}
+        for root, dirs, files in os.walk(self.openings_folder):
+            for filename in files:
+                if filename.endswith(".pgn"):
+                    opening_name = os.path.splitext(filename)[0]
+                    full_path = os.path.join(root, filename)
+                    self.openings[opening_name] = chess.pgn.read_game(open(full_path))
+        # Shuffle the keys of the dictionary
+        opening_names = list(self.openings.keys())
+        random.shuffle(opening_names)
+        self.openings = {name: self.openings[name] for name in opening_names}
+        
     def draw_board(self):
         colors = [(255, 255, 255), (0, 0, 0)]
         for row in range(8):
@@ -279,15 +299,15 @@ class Main:
                 best_move = engine.getBestMove()
                 self.push_move(best_move)
                 return
-            engine = Minimax.Engine(self.board, 6, color, None)
+            engine = Minimax.Engine(self.board, 4, color, None)
             best_move = engine.getBestMove()
             self.push_move(best_move)
             return
-        engine = Minimaxv2.Minimax(self.board, 4, color)
+        engine = Minimaxv2.Minimax(self.board, 3, color, self.openings)
         best_move = engine.getBestMove()
         self.push_move(best_move)
         return
-    
+
         if self.stockfish:
             engine = MTCS.Engine(self.board, color, self.engine_eval)
             best_move = engine.getBestMove()
@@ -304,7 +324,7 @@ class Main:
 
         ai_color = "w" if self.color == "b" else "b"
         self.AI_turn = False if self.color == "w" else True
-        max_depth = 4  # Set the initial max depth for the engine
+        max_depth = 3  # Set the initial max depth for the engine
 
         clock = pygame.time.Clock()
 
