@@ -2,6 +2,7 @@ import logging
 import random
 import sys
 import os
+from time import sleep
 
 # Save the original stdout and stderr
 orig_stdout = sys.stdout
@@ -24,6 +25,7 @@ import Minimaxv2
 import chess.engine
 import mtcs
 import newAI
+from pytorch_model import PytorchModel
 
 
 class Main:
@@ -46,16 +48,16 @@ class Main:
         self.AI_turn = False
         self.color = "w"
         self.AI_type = "minimax"
-        self.stockfish = None
-        self.engine_eval = chess.engine.SimpleEngine.popen_uci(
-            stockfish_path, debug=False
-        )
-        self.engine_eval.configure({"Threads": 8})
+        # self.engine_eval = chess.engine.SimpleEngine.popen_uci(
+        #     stockfish_path, debug=False
+        # )
+        # self.engine_eval.configure({"Threads": 8})
         pygame.display.set_caption("Chess Game")
         self.openings_folder = "./oppenings"
         self.openings = {}
         self.load_openings()
-    
+        self.pytorch_engine = PytorchModel()
+
     @classmethod
     def load_piece_images(cls):
         piece_images = {}
@@ -70,7 +72,7 @@ class Main:
                 )
 
         return piece_images
-    
+
     def load_openings(self):
         """
         Load openings from PGN files in the specified folder and its subfolders.
@@ -86,7 +88,7 @@ class Main:
         opening_names = list(self.openings.keys())
         random.shuffle(opening_names)
         self.openings = {name: self.openings[name] for name in opening_names}
-        
+
     def draw_board(self):
         colors = [(255, 255, 255), (0, 0, 0)]
         for row in range(8):
@@ -293,29 +295,46 @@ class Main:
         # self.push_move(best_move)
         # return
 
-        if self.AI_type == "minimax":
-            if self.stockfish:
-                engine = Minimax.Engine(self.board, 2, color, self.engine_eval)
-                best_move = engine.getBestMove()
-                self.push_move(best_move)
-                return
-            engine = Minimax.Engine(self.board, 4, color, None)
-            best_move = engine.getBestMove()
-            self.push_move(best_move)
-            return
-        engine = Minimaxv2.Minimax(self.board, 3, color, self.openings)
-        best_move = engine.getBestMove()
-        self.push_move(best_move)
-        return
+        #       if self.AI_type == "minimax":
+        # if self.stockfish:
 
-        if self.stockfish:
-            engine = MTCS.Engine(self.board, color, self.engine_eval)
-            best_move = engine.getBestMove()
+        if self.AI_turn:
+            # print("The engine is thinking DIRECT for color: " + self.color)
+            # best_move = self.pytorch_engine.best_move_direct(self.board)
+            # self.push_move(best_move)
+            # print("MOVE DIRECT:", best_move)
+            # return
+        
+            print("The engine is thinking MTCS for color: " + self.color)
+            best_move = self.pytorch_engine.get_best_move_mtcs(self.board, iterations=2000) 
             self.push_move(best_move)
+            print("MOVE BY MTCS:", best_move)
             return
-        engine = MTCS.Engine(self.board, color, None, iterations=2000)
-        best_move = engine.getBestMove()
-        self.push_move(best_move)
+        
+
+        # if self.AI_type == "pytorch":
+        #     engine = PytorchModel()
+        #     best_move = engine.predict_move(self.board)
+        #     self.board.push_uci(best_move)
+        #     return
+
+        # if self.AI_type == "minimax":
+        #     engine = Minimaxv2.Minimax(self.board, 6, color, self.openings)
+        #     best_move = engine.getBestMove()
+        #     self.push_move(best_move)
+        #     print("MOVE:", best_move)
+        #     return
+
+        # if self.AI_type == "monte_carlo":
+        #     engine = MTCS.Engine(self.board, color, None, iterations=2000)
+        #     best_move = engine.getBestMove()
+        #     self.push_move(best_move)
+        #     return
+        # engine = Minimaxv2.Minimax(self.board, 6, color, self.openings)
+        # best_move = engine.getBestMove()
+        # self.push_move(best_move)
+        # print("MOVE:", best_move)
+        return None
 
     def start_game(self):
         logging.basicConfig(level=logging.DEBUG)
@@ -347,31 +366,40 @@ class Main:
             pygame.display.flip()
 
             ## TEST AI VS AI  ##
-            self.play_engine_move(max_depth, ai_color)
+            # self.play_engine_move(max_depth, ai_color)
 
-            self.AI_type = "monte_carlo" if self.AI_type == "minimax" else "minimax"
+            # # self.AI_type = "monte_carlo" if self.AI_type == "minimax" else "minimax"
 
-            ai_color = "w" if ai_color == "b" else "b"
+            # ai_color = "w" if ai_color == "b" else "b"
+            
 
+            # self.AI_turn = not self.AI_turn
+
+
+
+            
             # HUMAN VS AI ##
-            # if self.AI_turn:
-            #     print("The engine is thinking...")
-            #     self.play_engine_move(max_depth, ai_color)
-            #     self.AI_turn = False
-            # else:
-            #     self.play_human_move()
-            #     self.AI_turn = True
+            if self.AI_turn:
+                print("The engine is thinking...")
+                sleep(1)
+                self.play_engine_move(max_depth, ai_color)
+                self.AI_turn = False
+            else:
+                self.play_human_move()
+                self.AI_turn = True
 
         # Game over, show end game screen
         print(self.board.outcome)
         winner = "White" if self.board.turn == chess.BLACK else "Black"
         print("Looser: " + self.AI_type)
         print("Winner: " + "monte_carlo" if self.AI_type == "minimax" else "minimax")
+        print(str(chess.pgn.Game.from_board(self.board)))
         if self.end_game_screen(winner):
             return True  # Start a new game
 
         else:
             pygame.quit()
+            return False
 
         clock.tick(60)  # Limit frames per second
 
@@ -414,13 +442,10 @@ class Main:
         white_button = pygame.Rect(self.width // 4 - 75, self.height // 2, 150, 50)
         black_button = pygame.Rect(3 * self.width // 4 - 75, self.height // 2, 150, 50)
         minimax_button = pygame.Rect(
-            self.width // 4 - 75, self.height // 2 + 75, 150, 50
+            self.width // 4 - 75, self.height // 2 + 75, 170, 50
         )
         monte_carlo_button = pygame.Rect(
-            self.width // 2.5 + 75, self.height // 2 + 75, 200, 50
-        )
-        stockfish_button = pygame.Rect(
-            self.width // 4 - 75, self.height // 2 + 150, 150, 50
+            self.width // 2.5 + 75, self.height // 2 + 75, 170, 50
         )
 
         while True:
@@ -434,29 +459,34 @@ class Main:
             monte_carlo_color = (
                 (0, 255, 0) if self.AI_type == "monte_carlo" else (10, 10, 10)
             )
-            stockfish_color = (0, 255, 0) if self.stockfish else (10, 10, 10)
+
+            pytorch_color = (0, 255, 0) if self.AI_type == "pytorch" else (10, 10, 10)
 
             minimax_button = (
-                pygame.Rect(self.width // 4 - 75, self.height // 2 + 75, 170, 60)
+                pygame.Rect(self.width // 4 - 75, self.height // 2 + 75, 200, 60)
                 if self.AI_type == "minimax"
-                else pygame.Rect(self.width // 4 - 75, self.height // 2 + 75, 150, 50)
+                else pygame.Rect(self.width // 4 - 75, self.height // 2 + 75, 170, 50)
             )
             monte_carlo_button = (
-                pygame.Rect(self.width // 2.5 + 75, self.height // 2 + 75, 220, 60)
+                pygame.Rect(self.width // 2.5 + 75, self.height // 2 + 75, 200, 60)
                 if self.AI_type == "monte_carlo"
-                else pygame.Rect(self.width // 2.5 + 75, self.height // 2 + 75, 200, 50)
+                else pygame.Rect(self.width // 2.5 + 75, self.height // 2 + 75, 170, 50)
             )
-            stockfish_button = (
-                pygame.Rect(self.width // 4 - 75, self.height // 2 + 150, 420, 60)
-                if self.stockfish
-                else pygame.Rect(self.width // 4 - 75, self.height // 2 + 150, 400, 50)
+      
+
+            pytorch_button = (
+                pygame.Rect(self.width // 2.5 + 75, self.height // 2 + 150, 200, 60)
+                if self.AI_type == "pytorch"
+                else pygame.Rect(
+                    self.width // 2.5 + 75, self.height // 2 + 150, 170, 50
+                )
             )
 
             pygame.draw.rect(self.screen, (255, 255, 255), white_button)
             pygame.draw.rect(self.screen, (10, 10, 10), black_button)
             pygame.draw.rect(self.screen, minimax_color, minimax_button)
             pygame.draw.rect(self.screen, monte_carlo_color, monte_carlo_button)
-            pygame.draw.rect(self.screen, stockfish_color, stockfish_button)
+            pygame.draw.rect(self.screen, pytorch_color, pytorch_button)
 
             white_text = font.render("White", True, (0, 0, 0))
             white_text_rect = white_text.get_rect(center=white_button.center)
@@ -472,18 +502,15 @@ class Main:
                 center=monte_carlo_button.center
             )
 
-            stockfish_text = font.render(
-                "Allow Stockfish Evaluation", True, (255, 255, 255)
-            )
-            stockfish_text_rect = stockfish_text.get_rect(
-                center=stockfish_button.center
-            )
+
+            pytorch_text = font.render("Pytorch AI", True, (255, 255, 255))
+            pytorch_text_rect = pytorch_text.get_rect(center=pytorch_button.center)
 
             self.screen.blit(white_text, white_text_rect)
             self.screen.blit(black_text, black_text_rect)
             self.screen.blit(minimax_text, minimax_text_rect)
             self.screen.blit(monte_carlo_text, monte_carlo_text_rect)
-            self.screen.blit(stockfish_text, stockfish_text_rect)
+            self.screen.blit(pytorch_text, pytorch_text_rect)
 
             pygame.display.flip()
 
@@ -503,14 +530,13 @@ class Main:
                         self.AI_type = "minimax"
                     elif monte_carlo_button.collidepoint(event.pos):
                         self.AI_type = "monte_carlo"
-                    elif stockfish_button.collidepoint(event.pos):
-                        self.stockfish = not self.stockfish
+                    elif pytorch_button.collidepoint(event.pos):
+                        self.AI_type = "pytorch"
 
 
 # Create an instance and start a game
 if __name__ == "__main__":
     pygame.init()
-    game = Main()
     start_game = True
     while start_game:
         game = Main()
