@@ -1,9 +1,10 @@
+import cProfile
 from collections import OrderedDict, namedtuple
 import copy
-import hashlib
 import json
 import logging
 import os
+import pstats
 from time import sleep
 import chess
 import chess.svg
@@ -52,13 +53,15 @@ class Minimax:
         self.max_depth = depth
         self.transposition_table = OrderedDict()
         self.color = color
-        self.is_maximizing_player = True if self.color == "black" else False
+        self.is_maximizing_player = True if self.color == chess.WHITE else False
         self.cache_file = "./cache/transposition_cache_Minimaxv2.json"
         self.computed_moves_cache_file = "./cache/computed_moves_cache_Minimaxv2.json"
         self.computed_positions = {}
         self.load_cache()
         self.openings = oppenings
         self.num_of_comp_pos = 0
+        self.history_table = {}
+        self.killer_moves = {}
 
     def store_transposition_table_entry(self, board, depth, best_move):
         """
@@ -73,6 +76,7 @@ class Minimax:
         self.transposition_table[key] = {
             "depth": depth,
             "best_move": best_move,
+            
         }
 
     def calculate_board_hash(self, board):
@@ -127,7 +131,6 @@ class Minimax:
         transposition_copy = copy.deepcopy(self.computed_positions)
         with open(self.computed_moves_cache_file, "w") as file:
             json.dump(transposition_copy, file, cls=ChessEncoder)
-            print(transposition_copy, "computed positions")
 
         logging.info("done updating cache file")
 
@@ -142,12 +145,12 @@ class Minimax:
         - The updated board after playing the move.
         - The move played.
         """
-        for _, opening in self.openings.items():
+        for name, opening in self.openings.items():
             newBoard = chess.Board()
             for move in opening.mainline_moves():
                 if newBoard == board:
                     sleep(1)
-                    print(move)
+                    print(move, "-> from oppening: " + name)
                     return move
                 newBoard.push(move)
 
@@ -185,22 +188,28 @@ class Minimax:
         self.deepening_search_depth()
 
         key = self.calculate_board_hash(self.board)
-
         if key in self.transposition_table:
             entry = self.transposition_table[key]
             if entry["depth"] >= self.max_depth:
-                return chess.Move.from_uci(entry["best_move"]["san"])
+                if entry["best_move"] is not None:
+                    return chess.Move.from_uci(entry["best_move"]["san"])
+
+        profiler = cProfile.Profile()
+        profiler.enable()
 
         move = self.minimax_root()
+
+        profiler.disable()
+        stats = pstats.Stats(profiler).sort_stats("cumtime")
+        with open("./debug.txt", "w") as f:
+            stats.stream = f
+            stats.print_stats()
 
         self.store_transposition_table_entry(
             self.board,
             self.max_depth,
             move,
         )
-
-        print("Computed positions:", self.computed_positions)
-
         self.update_cache()
 
         print(self.num_of_comp_pos, "num of computed positions")
@@ -209,52 +218,61 @@ class Minimax:
 
     def minimax_root(self):
         board = copy.deepcopy(self.board)
-        newGameMoves = [
-            (move, self.score_move(move, board)) for move in board.legal_moves
-        ]
 
+        # Get all legal moves and their heuristic scores
+        newGameMoves = [(move, self.score_move(move, 1)) for move in board.legal_moves]
         newGameMoves.sort(key=lambda x: x[1], reverse=True)
+        available_cpus = max(1, cpu_count() - 1)  # Leave one CPU free for other tasks
 
-        # Create a multiprocessing pool
-        pool = Pool(processes=cpu_count())
+        # Set up multiprocessing pool with the number of CPUs available
+        with Pool(processes=available_cpus) as pool:
+            # Submit all tasks to the pool asynchronously
+            async_results = [
+                (
+                    move,
+                    pool.apply_async(
+                        self.minimax,
+                        args=(
+                            self.max_depth - 1,
+                            self.board_after_move(
+                                board, move
+                            ),  # Helper function to get board after move
+                            -10000,
+                            10000,
+                            not self.is_maximizing_player,
+                        ),
+                    ),
+                )
+                for move, _ in newGameMoves
+            ]
 
-        # Create a list to hold the results
-        results = []
+            # Wait for all processes to complete and gather results
+            results = [
+                (move, async_result.get()) for move, async_result in async_results
+            ]
 
-        for move, _ in newGameMoves:
-            # Create a new copy of the board for each move
-            board.push(move)
-            if board.is_checkmate():
-                return move
-            # Start a new process for each move
-            result = pool.apply_async(
-                self.minimax,
-                args=(
-                    self.max_depth - 1,
-                    board,
-                    -10000,
-                    10000,
-                    self.is_maximizing_player,
-                ),
-            )
-            results.append((move, result))
-            board.pop()
+        # Find the best move from the completed results
+        bestMoveFound = None
+        bestScore = -float("inf") if self.is_maximizing_player else float("inf")
 
-        # Close the pool and wait for all processes to finish
-        pool.close()
-        pool.join()
-
-        # Get the results from each process
-        results = [(move, result.get()) for move, result in results]
-
-        # Find the move with the highest value
-        bestMoveFound = max(results, key=lambda x: x[1])[0]
+        for move, score in results:
+            if self.is_maximizing_player:
+                if score > bestScore:
+                    bestScore = score
+                    bestMoveFound = move
+            else:
+                if score < bestScore:
+                    bestScore = score
+                    bestMoveFound = move
 
         return bestMoveFound
 
-    def quiescence(
-        self, board, alpha, beta, is_maximizing_player, depth=0, max_depth=5
-    ):
+    def board_after_move(self, board, move):
+        board_copy = copy.deepcopy(board)
+        board_copy.push(move)
+        return board_copy
+
+    def quiescence(self, board, alpha, beta, is_maximizing_player, depth=0, max_depth=0):
         if depth >= max_depth:
             return self.evaluateBoard(board)
 
@@ -264,19 +282,15 @@ class Minimax:
         if alpha < stand_pat:
             alpha = stand_pat
 
-        newGameMoves = [
-            move
-            for move in board.legal_moves
-            if board.is_capture(move) or board.gives_check(move)
-        ]
+        # Expand to tactical threats, not just captures
+        newGameMoves = [move for move in board.legal_moves if board.is_capture(move) or board.gives_check(move) or self.detect_threats(board, move)]
+        
         if not newGameMoves:
             return alpha
 
         for move in newGameMoves:
             board.push(move)
-            score = -self.quiescence(
-                board, -beta, -alpha, not is_maximizing_player, depth + 1
-            )
+            score = -self.quiescence(board, -beta, -alpha, not is_maximizing_player, depth + 1)
             board.pop()
 
             if score >= beta:
@@ -285,94 +299,223 @@ class Minimax:
                 alpha = score
 
         return alpha
+    
+    def detect_threats(self, board, move):
+        """
+        Detect tactical threats like forks, pins, skewers, and discovered attacks
+        for the given move.
+        
+        Parameters:
+        - board: The current board state
+        - move: The move to be checked for tactical threats
+        
+        Returns:
+        - True if the move creates or avoids a tactical threat; otherwise, False
+        """
+        board.push(move)
+
+        # Check for forks (multiple attacks after the move)
+        if self.is_fork(board, move):
+            board.pop()
+            return True
+
+        # Check for pins (pieces pinned to the king)
+        if self.is_pin(board, move):
+            board.pop()
+            return True
+
+        # Check for skewers (higher value piece behind a lower value piece)
+        if self.is_skewer(board, move):
+            board.pop()
+            return True
+
+        # Check for discovered attacks (moving a piece to expose an attack from another piece)
+        if self.is_discovered_attack(board, move):
+            board.pop()
+            return True
+
+        board.pop()
+        return False
+
+    def is_fork(self, board, move):
+        """
+        Check if a move results in a fork.
+        
+        A fork occurs when one piece attacks two or more enemy pieces simultaneously.
+        
+        Parameters:
+        - board: The current board state
+        - move: The move to check
+        
+        Returns:
+        - True if the move results in a fork, otherwise False
+        """
+        attacker = board.piece_at(move.to_square)
+        if not attacker:
+            return False
+
+        attacker_attacks = list(board.attacks(move.to_square))
+        targets = [sq for sq in attacker_attacks if board.piece_at(sq) and board.piece_at(sq).color != attacker.color]
+        
+        # Fork if there are at least two enemy pieces attacked
+        return len(targets) >= 2
+
+    def is_pin(self, board, move):
+        """
+        Check if the move results in a pin.
+        
+        A pin occurs when a piece cannot move without exposing a more valuable piece (usually the king) to attack.
+        
+        Parameters:
+        - board: The current board state
+        - move: The move to check
+        
+        Returns:
+        - True if the move results in a pin, otherwise False
+        """
+        king_square = board.king(board.turn)
+        for direction in chess.RAYS:
+            for square in chess.SquareSet(chess.ray_attack(move.to_square, king_square)):
+                piece = board.piece_at(square)
+                if piece and piece.color == board.turn and piece.piece_type != chess.KING:
+                    if any(board.piece_at(chess.ray_attack(square, king_square))):
+                        return True
+        return False
+
+    def is_skewer(self, board, move):
+        """
+        Check if the move results in a skewer.
+        
+        A skewer is like a pin, but the higher-value piece is in front of the lower-value piece on the same line of attack.
+        
+        Parameters:
+        - board: The current board state
+        - move: The move to check
+        
+        Returns:
+        - True if the move results in a skewer, otherwise False
+        """
+        attacker = board.piece_at(move.to_square)
+        if not attacker or attacker.piece_type == chess.KING:
+            return False
+
+        attack_squares = board.attacks(move.to_square)
+        for square in attack_squares:
+            piece = board.piece_at(square)
+            if piece and piece.color != attacker.color:
+                for behind_square in chess.SquareSet(chess.ray_attack(square, move.to_square)):
+                    behind_piece = board.piece_at(behind_square)
+                    if behind_piece and behind_piece.color != attacker.color:
+                        if behind_piece.piece_type < piece.piece_type:  # Lower value piece behind
+                            return True
+        return False
+
+    def is_discovered_attack(self, board, move):
+        """
+        Check if the move results in a discovered attack.
+        
+        A discovered attack occurs when a piece moves out of the way, exposing an attack from a hidden piece.
+        
+        Parameters:
+        - board: The current board state
+        - move: The move to check
+        
+        Returns:
+        - True if the move results in a discovered attack, otherwise False
+        """
+        # First, get the piece that was moved
+        piece_moved = board.piece_at(move.to_square)
+        if not piece_moved:
+            return False
+
+        # Check the line of attack before and after the move to see if a hidden attack is exposed
+        for direction in chess.RAYS:
+            ray_attack_before = chess.SquareSet(chess.ray_attack(move.from_square, board.king(not board.turn)))
+            ray_attack_after = chess.SquareSet(chess.ray_attack(move.to_square, board.king(not board.turn)))
+
+            if ray_attack_after.difference(ray_attack_before):
+                # Check if the revealed piece is attacking a valuable target
+                hidden_attacker_square = ray_attack_after.pop()
+                hidden_attacker = board.piece_at(hidden_attacker_square)
+                if hidden_attacker and hidden_attacker.color != board.turn:
+                    return True
+
+        return False
+
+
 
     def minimax(self, depth, board, alpha, beta, is_maximizing_player):
         if board.is_game_over():
-            return self.evaluateBoard(board)
-
+            if board.is_checkmate():
+                return 100000 - depth if board.turn != self.color else -100000 + depth
+            return 0
         if depth <= 0:
-            return -self.quiescence(board, beta, alpha, is_maximizing_player)
+            return self.quiescence(board, alpha, beta, is_maximizing_player)
 
-        # Null move pruning
-        if depth >= 3 and not board.is_check():
-            board.push(chess.Move.null())
-            score = -self.minimax(
-                depth - 3, board, -beta, -beta + 1, not is_maximizing_player
-            )
-            board.pop()
-            if score >= beta:
-                return beta
+        # Check for immediate mate
+        if self.is_immediate_mate(board):
+            return 99999 - depth if is_maximizing_player else -99999 + depth
 
-        newGameMoves = [
-            (move, self.score_move(move, board))
-            for i, (move) in enumerate(board.legal_moves)
-        ]
+        newGameMoves = [(move, self.score_move(move, depth)) for move in board.legal_moves]
         newGameMoves.sort(key=lambda x: x[1], reverse=True)
-        n_of_legal_moves = len(list(board.legal_moves))
 
-        bestMove = -9999 if is_maximizing_player else 9999
-        for i, (move, score) in enumerate(newGameMoves):
-            board.push(move)
-            new_depth = depth - 1
-            if i > n_of_legal_moves / 2:
-                new_depth = depth - 2  # Late Move Reductions
-
-            if i == 0 or score > alpha:  # Principal Variation Search
-                score = -self.minimax(
-                    new_depth, board, -beta, -alpha, not is_maximizing_player
-                )
-            else:
-                score = -self.minimax(
-                    new_depth, board, -alpha - 1, -alpha, not is_maximizing_player
-                )
-                if alpha < score and score < beta:
-                    score = -self.minimax(
-                        new_depth, board, -beta, -alpha, not is_maximizing_player
-                    )
-            board.pop()
-
-            if is_maximizing_player:
-                if score > bestMove:
-                    bestMove = score
+        if is_maximizing_player:
+            bestMove = -9999
+            for move, _ in newGameMoves:
+                board.push(move)
+                bestMove = max(bestMove, self.minimax(depth - 1, board, alpha, beta, not is_maximizing_player))
+                board.pop()
                 alpha = max(alpha, bestMove)
-            else:
-                if score < bestMove:
-                    bestMove = score
+                if beta <= alpha:
+                    break
+            return bestMove
+        else:
+            bestMove = 9999
+            for move, _ in newGameMoves:
+                board.push(move)
+                bestMove = min(bestMove, self.minimax(depth - 1, board, alpha, beta, not is_maximizing_player))
+                board.pop()
                 beta = min(beta, bestMove)
+                if beta <= alpha:
+                    break
+            return bestMove
+    
+    def is_immediate_mate(self, board):
+        for move in board.legal_moves:
+            board.push(move)
+            if board.is_checkmate():
+                board.pop()
+                return True
+            board.pop()
+        return False
 
-            if beta <= alpha:
-                break
+    def score_move(self, move, depth):
+        if self.board.is_capture(move):
+            return self.mvv_lva(move)  # Prioritize captures based on value
+        history_score = self.history_table.get(move, 0)
+        killer_score = 2 if move == self.killer_moves.get(depth) else 0
+        return history_score + killer_score
 
-        return bestMove
+    def mvv_lva(self, move):
+        victim_square = move.to_square
+        attacker_square = move.from_square
+        
+        # Get the victim and attacker piece coordinates (file, rank)
+        victim_file = chess.square_file(victim_square)
+        victim_rank = chess.square_rank(victim_square)
+        
+        attacker_file = chess.square_file(attacker_square)
+        attacker_rank = chess.square_rank(attacker_square)
 
-    def score_move(self, move, board):
-        # Initialize score
-        score = 0
+        # Get piece values using correct coordinates
+        victim_value = self.getPieceValue(self.board.piece_at(victim_square), victim_file, victim_rank)
+        attacker_value = self.getPieceValue(self.board.piece_at(attacker_square), attacker_file, attacker_rank)
 
-        # Evaluate captures
-        if board.is_capture(move):
-            score += 100
+        # MVV-LVA (Most Valuable Victim - Least Valuable Attacker)
+        return victim_value - attacker_value  # Higher score for better captures
 
-        # Evaluate checks
-        if board.is_check():
-            score += 30
 
-        # Evaluate castles
-        if board.is_castling(move):
-            score += 20
 
-        for i in range(8):
-            for j in range(8):
-                square = chess.square(j, 7 - i)
-                piece = board.piece_at(square)
-                if piece is not None:
-                    # Get the basic value of the piece
-                    piece_value = self.getPieceValue(piece, i, j)
-                    score += piece_value
-
-        score *= 1 if board.turn == chess.WHITE else -1
-
-        return score
 
     def evaluate_piece_development(self, board):
         # Initialize score
@@ -568,18 +711,19 @@ class Minimax:
         if board.is_game_over():
             return 0
         eval = 0
-        # for i in range(8):
-        #     for j in range(8):
-        #         square = chess.square(j, 7 - i)
-        #         piece = board.piece_at(square)
-        #         if piece is not None:
-        #             # Get the basic value of the piece
-        #             piece_value = self.getPieceValue(piece, i, j)
-        #             eval += piece_value
+        for i in range(8):
+            for j in range(8):
+                square = chess.square(j, 7 - i)
+                piece = board.piece_at(square)
+                if piece is not None:
+                    # Get the basic value of the piece
+                    piece_value = self.getPieceValue(piece, i, j)
+                    eval += piece_value
+        if len(board.move_stack) < 20:
+            eval += self.evaluate_piece_development(board)
+            eval += self.get_king_expusure(board)
+            eval += self.eval_center_control(board)
 
-        eval += self.evaluate_piece_development(board)
-        eval += self.get_king_expusure(board)
-        eval += self.eval_center_control(board)
         eval += self.evaluate_pawn_structure(board)
         eval += self.evaluate_tactics(board)
 
