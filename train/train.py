@@ -3,1219 +3,28 @@ import chess
 import chess.pgn
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, ConcatDataset
+from torch.utils.data import DataLoader
 import os
 import glob
 import json
 import signal
 import sys
-import itertools
-import csv
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.cuda.amp import autocast, GradScaler
 import gc
-import pickle
-import hashlib
-from scipy.stats import dirichlet
 import random
 
-
-
-def get_optimal_batch_size(starting_size=32, min_size=8):
-    """Find the largest batch size that fits in memory"""
-    batch_size = starting_size
-    
-    while batch_size >= min_size:
-        try:
-            # Try to create a batch of random data
-            dummy_input = torch.randn(batch_size, 20, 8, 8, device=device)
-            model(dummy_input)
-            dummy_input = None
-            clear_memory()
-            return batch_size
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                batch_size //= 2
-                clear_memory()
-            else:
-                raise e
-    
-    return min_size  # Fallback to minimum size
-
-# Dictionary of tactical test positions with categories
-TACTICAL_TEST_POSITIONS = {
-    # Checkmate patterns
-    "mate_in_one": [
-        ("r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 0 1", "h5f7"),
-        ("r1bq2r1/ppp1bpkp/2np1np1/4p3/2B1P3/2NP1N2/PPPBQPPP/R3K2R w KQ - 0 1", "d2h6"),
-        ("r3k2r/ppp2p1p/2n1bN2/2b1P1p1/2p1q3/2P5/PP1Q1PPP/RNB1K2R w KQkq - 0 1", "d2d8"),
-    ],
-    
-    # Knight forks
-    "knight_fork": [
-        ("r3k2r/ppp2ppp/2n5/3Nn3/8/8/PPP2PPP/R3K2R w KQkq - 0 1", "d5f6"),
-        ("rnbqk2r/ppp1bppp/3p1n2/4p3/2B1P3/2N2N2/PPPP1PPP/R1BQ1RK1 w kq - 0 1", "f3e5"),
-        ("r1bqkbnr/ppp2ppp/2np4/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 1", "f3e5"),
-    ],
-    
-    # Pin patterns
-    "pin": [
-        ("rnbqk2r/pppp1ppp/5n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 1", "c4f7"),
-        ("rnbqkb1r/pp3ppp/2p1pn2/3p4/3P4/2NBPN2/PPP2PPP/R1BQK2R w KQkq - 0 1", "c3e5"),
-        ("r1bqk2r/ppp2ppp/2n2n2/1B1pp3/1b2P3/2N2N2/PPPP1PPP/R1BQ1RK1 w kq - 0 1", "b5e8"),
-    ],
-    
-    # Discovered attacks/checks
-    "discovered": [
-        ("rnbqkbnr/pppp1ppp/8/4p3/3P4/2N5/PPP1PPPP/R1BQKBNR b KQkq - 0 1", "e5d4"),
-        ("r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 1", "c4d5"),
-        ("r1bqk2r/ppp1bppp/2n2n2/3pp3/2BP4/2N1PN2/PP3PPP/R1BQK2R w KQkq - 0 1", "d4e5"),
-    ],
-    
-    # Skewers
-    "skewer": [
-        ("r1bqk1nr/ppp2ppp/2n5/3p4/1bBP4/2N5/PPP2PPP/R1BQK1NR w KQkq - 0 1", "c1g5"),
-        ("r3k2r/pp3ppp/2p1bn2/q2p4/3P4/2PBP3/PP1N1PPP/R2QK2R b KQkq - 0 1", "e6a2"),
-        ("r1b1kb1r/pp3ppp/2nqpn2/3p4/3P4/2N1PN2/PP3PPP/R1BQK2R w KQkq - 0 1", "f1b5"),
-    ],
-    
-    # Endgame tactics
-    "endgame": [
-        ("8/8/1KP5/3r4/8/8/8/k7 w - - 0 1", "c6c7"),
-        ("8/4kp2/2p3p1/1p2P1P1/8/2P3K1/8/8 w - - 0 1", "g3f4"),
-        ("8/5p2/5k2/p1p2P2/Pp6/1P4K1/8/8 w - - 0 1", "g3f4"),
-    ]
-}
-
-def clear_memory():
-    """Force garbage collection and clear CUDA cache"""
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-
-
-# Modify the run_self_play_training function to include progressive value weight
-def run_self_play_training(model, save_path, state_file, num_games=500, num_iterations=5):
-    """Run self-play training to improve the model through reinforcement learning"""
-    print(f"\n=== STARTING SELF-PLAY REINFORCEMENT LEARNING ===")
-    print(f"Training for {num_iterations} iterations with {num_games} games per iteration")
-    
-    # Initialize optimizer and loss functions
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0005, weight_decay=1e-5)
-    policy_loss_fn = nn.CrossEntropyLoss()
-    value_loss_fn = nn.MSELoss()
-    scaler = GradScaler()
-    
-    # Create a simple batch size finder function specific to self-play
-    batch_size = get_optimal_batch_size(starting_size=32, min_size=8) // 2  # Smaller for RL
-    
-    # Track progress across iterations
-    total_positions = 0
-    best_accuracy = 0
-    
-    # Progressive weight adjustment - start with policy focus, gradually increase value focus
-    initial_policy_weight = 2.0
-    initial_value_weight = 1.0
-    final_value_weight = 2.5  # Increased importance of value over time
-    
-    for iteration in range(num_iterations):
-        print(f"\nIteration {iteration+1}/{num_iterations}")
-        
-        # Calculate current weights - increase value weight as training progresses
-        progress_factor = iteration / num_iterations
-        policy_weight = initial_policy_weight
-        value_weight = initial_value_weight + progress_factor * (final_value_weight - initial_value_weight)
-        
-        print(f"Current weights: policy={policy_weight:.2f}, value={value_weight:.2f}")
-        
-        # Phase 1: Generate self-play games with reward shaping for checkmate
-        print(f"Generating {num_games} self-play games...")
-        self_play_samples = generate_reinforcement_learning_samples(
-            model, 
-            num_games=num_games, 
-            reward_shaping=True,
-            iteration=iteration,
-            total_iterations=num_iterations
-        )
-        
-        if not self_play_samples:
-            print("Failed to generate valid self-play samples. Skipping iteration.")
-            continue
-            
-        print(f"Generated {len(self_play_samples)} training positions from self-play")
-        
-        # Phase 2: Train on the generated positions
-        print("Training on self-play positions...")
-        rl_dataset = SelfPlayDataset(self_play_samples)
-        rl_dataloader = DataLoader(
-            rl_dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=2,
-            pin_memory=True
-        )
-        
-        # Training loop for this iteration
-        model.train()
-        total_rl_loss = 0
-        batch_count = 0
-        
-        for batch in rl_dataloader:
-            inputs, policy_targets, value_targets = batch
-            inputs = inputs.to(device)
-            policy_targets = policy_targets.to(device)
-            value_targets = value_targets.to(device)
-            
-            optimizer.zero_grad()
-            
-            with torch.amp.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu"):
-                policy_logits, value_pred = model(inputs)
-                policy_loss = policy_loss_fn(policy_logits, policy_targets)
-                value_loss = value_loss_fn(value_pred.squeeze(), value_targets)
-                
-                # Use the progressive weights from above
-                loss = policy_weight * policy_loss + value_weight * value_loss
-            
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            
-            total_rl_loss += loss.item()
-            batch_count += 1
-            
-            if batch_count % 10 == 0:
-                print(f"  Batch {batch_count}, Loss: {loss.item():.4f}")
-        
-        if batch_count > 0:
-            avg_loss = total_rl_loss / batch_count
-            print(f"Avg training loss: {avg_loss:.4f}")
-        
-        # Save checkpoint after each iteration
-        torch.save(model.state_dict(), save_path)
-        print(f"Model checkpoint saved after iteration {iteration+1}")
-        
-        # Test tactical recognition after each iteration
-        print("Testing tactical recognition...")
-        test_accuracy = test_tactical_recognition(model, device)
-        print(f"Tactical recognition accuracy: {test_accuracy:.2%}")
-        
-        if test_accuracy > best_accuracy:
-            best_accuracy = test_accuracy
-            # Save best model separately
-            torch.save(model.state_dict(), save_path.replace('.pth', '_best.pth'))
-            print(f"New best model saved with accuracy: {best_accuracy:.2%}")
-        
-        # Clean up between iterations
-        del self_play_samples
-        del rl_dataset
-        del rl_dataloader
-        clear_memory()
-        
-        total_positions += len(self_play_samples)
-    
-    print(f"\n=== SELF-PLAY TRAINING COMPLETED ===")
-    print(f"Processed {total_positions} positions across {num_iterations} iterations")
-    print(f"Best tactical accuracy: {best_accuracy:.2%}")
-    return model
-
-# Update the generate_reinforcement_learning_samples function to include Dirichlet noise and improved MCTS
-def generate_reinforcement_learning_samples(model, num_games=100, reward_shaping=True, iteration=0, total_iterations=5):
-    """Generate self-play games with reinforcement learning objectives and MCTS-inspired search
-    
-    Args:
-        model: The neural network model
-        num_games: Number of self-play games to generate
-        reward_shaping: Whether to enhance rewards for checkmate/near-checkmate positions
-        iteration: Current iteration number (for adjusting exploration parameters)
-        total_iterations: Total number of iterations planned
-        
-    Returns:
-        List of (board_tensor, policy_target, value_target) tuples for training
-    """
-    samples = []
-    model.eval()
-    
-    # Parallel game generation
-    batch_size = min(16, num_games)
-    active_games = [chess.Board() for _ in range(batch_size)]
-    move_histories = [[] for _ in range(batch_size)]
-    board_histories = [[] for _ in range(batch_size)]
-    move_numbers = [1 for _ in range(batch_size)]
-    active_mask = [True for _ in range(batch_size)]
-    completed_games = 0
-    
-    # MCTS simulation parameters
-    num_simulations = 10  # Number of simulations per move - keep relatively low for speed
-    
-    # Adaptive temperature - start high for exploration, decrease for exploitation
-    progress_factor = iteration / max(1, total_iterations - 1)
-    base_temp = 1.0
-    final_temp = 0.5
-    temperature = base_temp - progress_factor * (base_temp - final_temp)
-    
-    # Dirichlet noise parameters - higher alpha = more uniform noise
-    dirichlet_alpha = 0.3
-    dirichlet_weight = 0.25  # How much to weight the noise vs policy at root
-    
-    # Some games may go very long - limit total moves to avoid infinite games
-    max_moves_per_game = 200
-    moves_played = [0 for _ in range(batch_size)]
-    
-    print(f"Generating self-play games with MCTS (temp={temperature:.2f}, noise_weight={dirichlet_weight:.2f})...")
-    
-    while any(active_mask) and completed_games < num_games:
-        # Get all active boards
-        active_indices = [i for i, active in enumerate(active_mask) if active]
-        
-        if not active_indices:
-            break
-            
-        # Batch process all active boards for initial policy and value
-        input_tensors = torch.stack([
-            torch.tensor(board_to_tensor(active_games[i], move_numbers[i]), dtype=torch.float32)
-            for i in active_indices
-        ]).to(device)
-        
-        with torch.no_grad():
-            policy_logits, value_preds = model(input_tensors)
-        
-        # Get initial policy and values
-        initial_policies = F.softmax(policy_logits, dim=1).cpu().numpy()
-        initial_values = value_preds.squeeze(-1).cpu().numpy()
-        
-        # Process each active game
-        for idx, i in enumerate(active_indices):
-            board = active_games[i]
-            legal_moves = list(board.legal_moves)
-            
-            # Check for game over conditions or move limit reached
-            if not legal_moves or board.is_game_over() or moves_played[i] >= max_moves_per_game:
-                # Save result and create training samples with appropriate rewards
-                if board.is_checkmate():
-                    # Checkmate is highest reward/penalty
-                    result_value = 1.0 if not board.turn else -1.0
-                elif board.is_stalemate() or board.is_insufficient_material():
-                    # Stalemate and insufficient material are draws
-                    result_value = 0.0
-                elif moves_played[i] >= max_moves_per_game:
-                    # Truncated games are treated as slightly negative for both sides
-                    result_value = -0.1
-                else:
-                    # Other game terminations (50-move rule, repetition) are draws
-                    result_value = 0.0
-                
-                # Generate training samples from this game with updated rewards
-                game_samples = create_training_samples_from_game(
-                    board_histories[i], 
-                    move_histories[i], 
-                    result_value,
-                    reward_shaping
-                )
-                samples.extend(game_samples)
-                
-                # Track completed games
-                completed_games += 1
-                
-                # Start a new game if needed
-                if completed_games < num_games:
-                    active_games[i] = chess.Board()
-                    move_histories[i] = []
-                    board_histories[i] = []
-                    move_numbers[i] = 1
-                    moves_played[i] = 0
-                else:
-                    active_mask[i] = False
-                
-                continue
-            
-            # Get initial move probabilities from policy network
-            policy = initial_policies[idx]
-            move_probs = np.zeros(len(legal_moves))
-            
-            for move_idx, move in enumerate(legal_moves):
-                move_index = get_move_index(move)
-                move_probs[move_idx] = policy[move_index]
-            
-            # Handle case of all zero probabilities
-            if np.sum(move_probs) <= 1e-10:
-                move_probs = np.ones(len(legal_moves)) / len(legal_moves)
-            else:
-                # Normalize (ensure probabilities sum to 1)
-                move_probs = move_probs / np.sum(move_probs)
-            
-            # Add Dirichlet noise to root node for exploration (AlphaZero style)
-            if len(legal_moves) > 0:
-                noise = np.random.dirichlet([dirichlet_alpha] * len(legal_moves))
-                move_probs = (1 - dirichlet_weight) * move_probs + dirichlet_weight * noise
-            
-            # MCTS-inspired simulations - simple version that avoids full tree search
-            visit_counts = np.zeros(len(legal_moves))
-            q_values = np.zeros(len(legal_moves))
-            
-            # Run multiple simulations to improve move selection
-            for _ in range(num_simulations):
-                # Select move for simulation based on UCB formula
-                ucb_scores = np.zeros(len(legal_moves))
-                total_visits = np.sum(visit_counts) + 1e-8
-                
-                for move_idx in range(len(legal_moves)):
-                    if visit_counts[move_idx] > 0:
-                        # UCB score balances exploitation (Q-value) with exploration (log term)
-                        ucb_scores[move_idx] = q_values[move_idx] + 2.0 * np.sqrt(np.log(total_visits) / visit_counts[move_idx]) * move_probs[move_idx]
-                    else:
-                        # For unvisited nodes, prioritize by prior probability
-                        ucb_scores[move_idx] = 1.0 + move_probs[move_idx]
-                
-                # Select move with highest UCB score
-                sim_move_idx = np.argmax(ucb_scores)
-                sim_move = legal_moves[sim_move_idx]
-                
-                # Simulate this move and get a value estimate
-                sim_board = board.copy()
-                sim_board.push(sim_move)
-                
-                # For efficiency, just use the model's direct evaluation 
-                # A full MCTS would simulate to the end, but that's expensive
-                sim_tensor = torch.tensor(board_to_tensor(sim_board, move_numbers[i] + 1), dtype=torch.float32).unsqueeze(0).to(device)
-                
-                with torch.no_grad():
-                    _, sim_value = model(sim_tensor)
-                    
-                # Convert value to current player's perspective
-                sim_value = -float(sim_value.item())  # Negative because we're evaluating from opponent's view
-                
-                # Update statistics
-                visit_counts[sim_move_idx] += 1
-                q_values[sim_move_idx] = (q_values[sim_move_idx] * (visit_counts[sim_move_idx] - 1) + sim_value) / visit_counts[sim_move_idx]
-            
-            # After simulations, select move based on visit counts (not raw policy)
-            # Apply temperature to visit count distribution
-            if np.sum(visit_counts) > 0:
-                visit_counts_temp = np.power(visit_counts, 1.0 / temperature)
-                visit_policy = visit_counts_temp / np.sum(visit_counts_temp)
-            else:
-                visit_policy = move_probs
-            
-            # Store current position for later training
-            board_histories[i].append(board_to_tensor(board, move_numbers[i]))
-            
-            # Select move - early in training, explore more. Later, be more greedy.
-            exploration_threshold = 0.8 + 0.1 * (1 - progress_factor)  # Decreases from 0.9 to 0.8 over time
-            
-            if np.random.random() < exploration_threshold:  # Mostly select best move
-                selected_idx = np.argmax(visit_policy)
-                move = legal_moves[selected_idx]
-            else:  # Sometimes explore other moves
-                selected_idx = np.random.choice(len(legal_moves), p=visit_policy)
-                move = legal_moves[selected_idx]
-            
-            # Store selected move
-            move_histories[i].append(get_move_index(move))
-            
-            # Make the move
-            board.push(move)
-            moves_played[i] += 1
-            move_numbers[i] += 1
-        
-        # Show progress
-        if completed_games > 0 and completed_games % 10 == 0:
-            print(f"Completed {completed_games}/{num_games} self-play games")
-    
-    print(f"Generated {len(samples)} training samples from {completed_games} games")
-    return samples
-
-class SelfPlayDataset(Dataset):
-    """Dataset for self-play reinforcement learning samples"""
-    def __init__(self, samples):
-        self.samples = samples
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        board_tensor, policy_target, value_target = self.samples[idx]
-        return (torch.tensor(board_tensor, dtype=torch.float32),
-                torch.tensor(policy_target, dtype=torch.long),
-                torch.tensor(value_target, dtype=torch.float32))
-
-
-def create_training_samples_from_game(board_history, move_history, final_result, reward_shaping=True):
-    """Create training samples from a completed self-play game
-    
-    This function applies reward shaping to emphasize learning from checkmate sequences
-    """
-    samples = []
-    game_length = len(move_history)
-    
-    # Skip very short games
-    if game_length < 5:
-        return []
-        
-    for i in range(game_length):
-        # The board state
-        board_tensor = board_history[i]
-        
-        # The move that was actually played
-        move_idx = move_history[i]
-        
-        # Calculate shaped reward based on position in game 
-        if reward_shaping:
-            # Positions closer to the end get rewards closer to the final result
-            # This creates a smoother reward gradient for learning
-            progress_factor = i / game_length
-            
-            if final_result > 0:  # Winning position
-                # Reward increases exponentially toward the end
-                shaped_value = final_result * min(1.0, progress_factor * 2)
-            elif final_result < 0:  # Losing position
-                # Penalty increases toward the end
-                shaped_value = final_result * min(1.0, progress_factor * 2)
-            else:  # Draw
-                shaped_value = final_result * progress_factor
-        else:
-            # Without reward shaping, all positions get the game's final result
-            shaped_value = final_result
-            
-        # Flip value target for black's perspective
-        is_white_to_move = np.sum(board_tensor[17]) > 0  # Check the turn channel
-        if not is_white_to_move:
-            shaped_value = -shaped_value
-        
-        samples.append((board_tensor, move_idx, shaped_value))
-    
-    return samples
-
-
-
-def load_tactical_test_positions():
-    """Returns a flattened list of all tactical test positions"""
-    all_positions = []
-    for category, positions in TACTICAL_TEST_POSITIONS.items():
-        for fen, best_move in positions:
-            all_positions.append((fen, best_move, category))
-    return all_positions
-
-
-def test_tactical_recognition(model, device):
-    """Test if model can recognize basic tactical patterns with batch processing"""
-    model.eval()
-    
-    test_positions = load_tactical_test_positions()
-    batch_size = 8  # Process multiple positions at once
-    correct = 0
-    
-    for i in range(0, len(test_positions), batch_size):
-        batch_positions = test_positions[i:i+batch_size]
-        boards = [chess.Board(fen) for fen, _, _ in batch_positions]
-        best_moves = [move_uci for _, move_uci, _ in batch_positions]
-        
-        # Batch process the input tensors
-        input_tensors = torch.stack([
-            torch.tensor(board_to_tensor(board, 0), dtype=torch.float32)
-            for board in boards
-        ]).to(device)
-        
-        with torch.no_grad():
-            policy_logits, _ = model(input_tensors)
-        
-        policies = F.softmax(policy_logits, dim=1).cpu().numpy()
-        
-        for j, (board, best_move_uci, policy) in enumerate(zip(boards, best_moves, policies)):
-            legal_moves = list(board.legal_moves)
-            move_probs = np.zeros(len(legal_moves))
-            best_move_idx = -1
-            
-            for idx, move in enumerate(legal_moves):
-                move_idx = get_move_index(move)
-                move_probs[idx] = policy[move_idx]
-                if move.uci() == best_move_uci:
-                    best_move_idx = idx
-            
-            if legal_moves:
-                top_move_idx = np.argmax(move_probs)
-                if top_move_idx == best_move_idx:
-                    correct += 1
-                    print(f"✓ Correct: {best_move_uci}")
-                else:
-                    print(f"✗ Expected: {best_move_uci}, Got: {legal_moves[top_move_idx].uci()}")
-    
-    print(f"Tactical test results: {correct}/{len(test_positions)} correct")
-    return correct / len(test_positions)
-
-
-def filter_and_prioritize_puzzles_cached(puzzles, cache_dir="./cache"):
-    """Filter puzzles with caching to avoid repeated work"""
-    # Create cache directory if it doesn't exist
-    os.makedirs(cache_dir, exist_ok=True)
-    
-    # Generate a hash based on the puzzles to use as cache key
-    puzzles_hash = hashlib.md5(str(len(puzzles)).encode()).hexdigest()[:10]
-    cache_file = os.path.join(cache_dir, f"puzzle_cache_{puzzles_hash}.pkl")
-    
-    # If cache exists, load from it
-    if os.path.exists(cache_file):
-        print(f"Loading {len(puzzles)} prioritized puzzles from cache...")
-        try:
-            with open(cache_file, 'rb') as f:
-                prioritized_puzzles = pickle.load(f)
-            
-            print(f"Loaded prioritized puzzles from cache: {len(prioritized_puzzles)} puzzles")
-            # Return early if we successfully loaded from cache
-            return prioritized_puzzles
-        except Exception as e:
-            print(f"Error loading cache: {e}. Rebuilding...")
-    
-    # If we get here, we need to prioritize puzzles
-    print(f"Prioritizing {len(puzzles)} puzzles (this may take a while)...")
-    
-    # Continue with your existing prioritization code
-    mate_puzzles = []
-    fork_puzzles = []
-    pin_puzzles = []
-    other_puzzles = []
-    
-    # Process puzzles in batches to avoid memory issues
-    batch_size = 10000
-    for i in range(0, len(puzzles), batch_size):
-        batch = puzzles[i:i+batch_size]
-        
-        for fen, move_uci, value_target in batch:
-            # Try to identify puzzle type from FEN or other properties
-            board = chess.Board(fen)
-            
-            # Check if this is a checkmate puzzle
-            future_board = board.copy()
-            try:
-                move = chess.Move.from_uci(move_uci)
-                future_board.push(move)
-                
-                if future_board.is_checkmate():
-                    mate_puzzles.append((fen, move_uci, 1.0))  # Higher value for mate puzzles
-                elif "fork" in fen.lower() or detect_fork(board, move):
-                    fork_puzzles.append((fen, move_uci, 0.9))
-                elif "pin" in fen.lower() or detect_pin(board, move):
-                    pin_puzzles.append((fen, move_uci, 0.8))
-                else:
-                    other_puzzles.append((fen, move_uci, value_target))
-            except Exception:
-                # Skip invalid puzzles
-                continue
-        
-        # Show progress
-        if (i + batch_size) % 100000 == 0 or (i + batch_size) >= len(puzzles):
-            print(f"Processed {min(i + batch_size, len(puzzles))}/{len(puzzles)} puzzles...")
-    
-    # Combine with priority - duplicate tactical puzzles to increase their frequency  
-    prioritized_puzzles = (
-        mate_puzzles * 5 +  # Repeat mate puzzles 5x
-        fork_puzzles * 3 +  # Repeat fork puzzles 3x
-        pin_puzzles * 3 +   # Repeat pin puzzles 3x
-        other_puzzles
-    )
-    
-    # Store only a reasonable subset for training if there are too many
-    max_puzzles = 200000  # Set a reasonable limit
-    if len(prioritized_puzzles) > max_puzzles:
-        print(f"Too many puzzles ({len(prioritized_puzzles)}), randomly sampling {max_puzzles}")
-        import random
-        random.shuffle(prioritized_puzzles)
-        prioritized_puzzles = prioritized_puzzles[:max_puzzles]
-    
-    print(f"Prioritized puzzles: {len(prioritized_puzzles)} (from {len(puzzles)} original puzzles)")
-    print(f"  - Mate puzzles: {len(mate_puzzles)}")
-    print(f"  - Fork puzzles: {len(fork_puzzles)}")
-    print(f"  - Pin puzzles: {len(pin_puzzles)}")
-    
-    # Cache the results
-    try:
-        with open(cache_file, 'wb') as f:
-            pickle.dump(prioritized_puzzles, f)
-        print(f"Cached prioritized puzzles to {cache_file}")
-    except Exception as e:
-        print(f"Error caching results: {e}")
-    
-    return prioritized_puzzles
-# Simple detectors for fork and pin
-def detect_fork(board, move):
-    """Simple heuristic to detect if a move creates a fork"""
-    # This is a simplified version - a real implementation would be more complex
-    attacker_piece = board.piece_at(move.from_square)
-    if not attacker_piece:
-        return False
-        
-    # Knights are common forking pieces
-    if attacker_piece.piece_type == chess.KNIGHT:
-        future_board = board.copy()
-        future_board.push(move)
-        
-        # Count how many pieces the knight attacks after the move
-        attacked_pieces = 0
-        for square in chess.SQUARES:
-            piece = future_board.piece_at(square)
-            if piece and piece.color != attacker_piece.color:
-                if future_board.is_attacked_by(attacker_piece.color, square):
-                    attacked_pieces += 1
-        
-        # If attacking 2+ pieces, likely a fork
-        return attacked_pieces >= 2
-    
-    return False
-
-def detect_pin(board, move):
-    """Simple heuristic to detect if a move creates or exploits a pin"""
-    # This is a simplified version - a real implementation would be more complex
-    attacker_piece = board.piece_at(move.from_square)
-    if not attacker_piece:
-        return False
-        
-    # Bishops, rooks, and queens commonly create pins
-    if attacker_piece.piece_type in [chess.BISHOP, chess.ROOK, chess.QUEEN]:
-        future_board = board.copy()
-        future_board.push(move)
-        
-        # Check for aligned pieces that might indicate a pin
-        for direction in [1, -1, 8, -8, 7, -7, 9, -9]:  # All 8 directions
-            target_square = move.to_square
-            pieces_in_line = []
-            
-            # Look along the line
-            while True:
-                target_square += direction
-                if target_square < 0 or target_square > 63:
-                    break
-                    
-                # Check if we've moved off the logical board line/diagonal
-                if (direction in [1, -1] and chess.square_file(target_square) != 
-                    chess.square_file(target_square - direction)):
-                    break
-                
-                piece = future_board.piece_at(target_square)
-                if piece:
-                    pieces_in_line.append((target_square, piece))
-                    if len(pieces_in_line) >= 2:
-                        # If we found two pieces and the second is a king, it might be a pin
-                        if pieces_in_line[1][1].piece_type == chess.KING:
-                            return True
-                    break
-        
-    return False
+# Import from our refactored modules
+from models import ChessNet
+from data import (ChessDataset, PuzzleDataset, load_puzzles, load_lichess_puzzles, 
+                 filter_and_prioritize_puzzles_cached, load_professional_games, 
+                 load_games_in_batches)
+from utils import clear_memory, test_tactical_recognition
+from self_play import generate_self_play_games, run_self_play_training
+from training import train_batch, train_tactical, get_optimal_batch_size
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Residual Block
-class ResidualBlock(nn.Module):
-    def __init__(self, channels):
-        super(ResidualBlock, self).__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(channels)
-
-    def forward(self, x):
-        residual = x
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = self.bn2(self.conv2(x))
-        x += residual
-        x = F.relu(x)
-        return x
-
-# Chess Neural Network with adjustable blocks and channels
-class ChessNet(nn.Module):
-    def __init__(self, num_blocks=10, channels=256):  # Increased to 10 blocks
-        super(ChessNet, self).__init__()
-        self.conv1 = nn.Conv2d(20, channels, kernel_size=3, padding=1)  # 20 channels for added features
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.blocks = nn.ModuleList([ResidualBlock(channels) for _ in range(num_blocks)])
-        self.policy_conv = nn.Conv2d(channels, 73, kernel_size=1)
-        self.policy_bn = nn.BatchNorm2d(73)
-        self.value_conv = nn.Conv2d(channels, 1, kernel_size=1)
-        self.value_bn = nn.BatchNorm2d(1)
-        self.value_fc1 = nn.Linear(64, 256)
-        self.value_fc2 = nn.Linear(256, 1)
-
-    def forward(self, x):
-        x = F.relu(self.bn1(self.conv1(x)))
-        for block in self.blocks:
-            x = block(x)
-        policy = self.policy_bn(self.policy_conv(x))  
-        policy = policy.view(-1, 73 * 8 * 8)
-        value = F.relu(self.value_bn(self.value_conv(x)))
-        value = value.view(-1, 64)
-        value = F.relu(self.value_fc1(value))
-        value = torch.tanh(self.value_fc2(value))
-        return policy, value
-
-# Updated board_to_tensor with repetition counter and move number
-def board_to_tensor(board, move_number):
-    tensor = np.zeros((20, 8, 8), dtype=np.float32)  # Increased to 20 channels
-    for piece_type in chess.PIECE_TYPES:
-        for color in chess.COLORS:
-            for square in board.pieces(piece_type, color):
-                row, col = divmod(square, 8)
-                channel = piece_type - 1 if color == chess.WHITE else piece_type + 5
-                tensor[channel, row, col] = 1
-    tensor[12, :, :] = board.has_kingside_castling_rights(chess.WHITE)
-    tensor[13, :, :] = board.has_queenside_castling_rights(chess.WHITE)
-    tensor[14, :, :] = board.has_kingside_castling_rights(chess.BLACK)
-    tensor[15, :, :] = board.has_queenside_castling_rights(chess.BLACK)
-    if board.ep_square is not None:
-        row, col = divmod(board.ep_square, 8)
-        tensor[16, row, col] = 1
-    tensor[17, :, :] = 1 if board.turn == chess.WHITE else 0
-    tensor[18, :, :] = board.halfmove_clock / 50.0  # Normalized repetition counter (fifty-move rule)
-    tensor[19, :, :] = move_number / 200.0  # Normalized move number (assuming max 200 moves)
-    return tensor
-
-# Move Index Mapping (unchanged)
-promotion_moves = {}
-promotion_idx = 4096
-for rank in [6, 1]:
-    for col in range(8):
-        from_square = chess.square(col, rank)
-        to_square = chess.square(col, rank + (1 if rank == 6 else -1))
-        for piece in [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]:
-            promotion_moves[(from_square, to_square, piece)] = promotion_idx
-            promotion_idx += 1
-        if col > 0:
-            to_square = chess.square(col - 1, rank + (1 if rank == 6 else -1))
-            for piece in [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]:
-                promotion_moves[(from_square, to_square, piece)] = promotion_idx
-                promotion_idx += 1
-        if col < 7:
-            to_square = chess.square(col + 1, rank + (1 if rank == 6 else -1))
-            for piece in [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]:
-                promotion_moves[(from_square, to_square, piece)] = promotion_idx
-                promotion_idx += 1
-
-def get_move_index(move):
-    if move.promotion:
-        return promotion_moves[(move.from_square, move.to_square, move.promotion)]
-    return move.from_square * 64 + move.to_square
-
-# Chess Dataset with Symmetry Augmentation
-class ChessDataset(Dataset):
-    def __init__(self, games, augment=True):
-        self.positions = []
-        self.augment = augment
-        
-        for game in games:
-            result_str = game.headers.get("Result", "*")
-            if result_str not in ["1-0", "0-1", "1/2-1/2"]:
-                continue
-                
-            result = {'1-0': 1, '0-1': -1, '1/2-1/2': 0}[result_str]
-            board = game.board()
-            move_number = 1
-            
-            # Store positions as compact data
-            for move in game.mainline_moves():
-                # Store compressed representation instead of full tensor
-                fen = board.fen()
-                policy_target = get_move_index(move)
-                value_target = result if board.turn == chess.WHITE else -result
-                self.positions.append((fen, move_number, policy_target, value_target))
-                
-                if self.augment:
-                    mirrored_board = board.mirror()
-                    mirrored_move = chess.Move(
-                        chess.square_mirror(move.from_square),
-                        chess.square_mirror(move.to_square),
-                        move.promotion
-                    )
-                    mirrored_policy = get_move_index(mirrored_move)
-                    self.positions.append((mirrored_board.fen(), move_number, mirrored_policy, value_target))
-                    
-                board.push(move)
-                move_number += 1
-                
-    def __len__(self):
-        return len(self.positions)
-
-    def __getitem__(self, idx):
-        fen, move_number, policy_target, value_target = self.positions[idx]
-        board = chess.Board(fen)
-        input_tensor = board_to_tensor(board, move_number)
-        
-        return (torch.tensor(input_tensor, dtype=torch.float32),
-                torch.tensor(policy_target, dtype=torch.long),
-                torch.tensor(value_target, dtype=torch.float32))
-    
-
-# Puzzle Dataset (unchanged for now)
-class PuzzleDataset(Dataset):
-    def __init__(self, puzzles):
-        self.puzzles = puzzles
-
-    def __len__(self):
-        return len(self.puzzles)
-
-    def __getitem__(self, idx):
-        fen, move_uci, value_target = self.puzzles[idx]
-        board = chess.Board(fen)
-        move = chess.Move.from_uci(move_uci)
-        input_tensor = board_to_tensor(board, 0)  # Move number not tracked in puzzles
-        policy_target = get_move_index(move)
-        return (torch.tensor(input_tensor, dtype=torch.float32),
-                torch.tensor(policy_target, dtype=torch.long),
-                torch.tensor(value_target, dtype=torch.float32))
-
-# Load puzzles (unchanged)
-def load_puzzles(pgn_file):
-    puzzles = []
-    with open(pgn_file, encoding='ISO-8859-1') as pgn:
-        while True:
-            game = chess.pgn.read_game(pgn)
-            if game is None:
-                break
-            board = game.board()
-            try:
-                best_move = list(game.mainline_moves())[0]
-                fen = board.fen()
-                move_uci = best_move.uci()
-                puzzles.append((fen, move_uci, 1.0))
-            except IndexError:
-                continue
-    return puzzles
-
-def load_lichess_puzzles(csv_file):
-    puzzles = []
-    with open(csv_file, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            fen = row['FEN']
-            moves = row['Moves'].split()
-            if moves:
-                move_uci = moves[0]
-                value_target = 1.0 if 'mate' in row['Themes'].lower() else 0.5
-                puzzles.append((fen, move_uci, value_target))
-    return puzzles
-
-# Add this new loader function after your existing load_games_in_batches function
-def load_professional_games(state_file, batch_size=1500, max_games=1500):
-    """Load professional games more efficiently - one file at a time"""
-    pro_pgn_directory = "./chess_pgns/pros"
-    pro_pgn_files = glob.glob(os.path.join(pro_pgn_directory, "*.pgn"))
-    
-    if not pro_pgn_files:
-        print("No professional games found in ./chess_pgns/pros/")
-        return []
-    
-    # Track processed games and files
-    if os.path.exists(state_file):
-        with open(state_file, 'r') as f:
-            state = json.load(f)
-            processed_pro_games = state.get("processed_pro_games", 0)
-            current_file_idx = state.get("current_pro_file_idx", 0)
-            current_file_pos = state.get("current_pro_file_pos", 0)
-        print(f"Resuming from {processed_pro_games} processed professional games")
-    else:
-        processed_pro_games = 0
-        current_file_idx = 0
-        current_file_pos = 0
-    
-    # Only process files that we need for this batch
-    games = []
-    
-    while len(games) < batch_size and current_file_idx < len(pro_pgn_files):
-        file = pro_pgn_files[current_file_idx]
-        print(f"Loading professional games from {file}")
-        
-        with open(file) as pgn:
-            # Seek to the previous position if continuing from last run
-            if current_file_pos > 0:
-                pgn.seek(current_file_pos)
-            
-            while len(games) < batch_size:
-                # Save position before reading game
-                pos = pgn.tell()
-                game = chess.pgn.read_game(pgn)
-                
-                if game is None:
-                    # End of file, move to next file
-                    current_file_idx += 1
-                    current_file_pos = 0
-                    break
-                
-                # Save current position for next run
-                current_file_pos = pgn.tell()
-                games.append(game)
-    
-    # Save progress
-    new_processed = processed_pro_games + len(games)
-    
-    if os.path.exists(state_file):
-        with open(state_file, 'r') as f:
-            state = json.load(f)
-    else:
-        state = {}
-    
-    state["processed_pro_games"] = new_processed
-    state["current_pro_file_idx"] = current_file_idx
-    state["current_pro_file_pos"] = current_file_pos
-    
-    with open(state_file, 'w') as f:
-        json.dump(state, f)
-    
-    return games
-
-
-# Improved load_games_in_batches function with position tracking
-def load_games_in_batches(pgn_files, state_file, batch_size=1500):
-    """Load regular games more efficiently - file position tracking"""
-    if os.path.exists(state_file):
-        with open(state_file, 'r') as f:
-            state = json.load(f)
-            processed_games = state.get("processed_games", 0)
-            current_file_idx = state.get("current_file_idx", 0)
-            current_file_pos = state.get("current_file_pos", 0)
-        print(f"Resuming from {processed_games} processed games")
-    else:
-        processed_games = 0
-        current_file_idx = 0
-        current_file_pos = 0
-    
-    if current_file_idx >= len(pgn_files):
-        print("All files processed. Starting over.")
-        current_file_idx = 0
-        current_file_pos = 0
-
-    games = []
-    
-    while len(games) < batch_size and current_file_idx < len(pgn_files):
-        file = pgn_files[current_file_idx]
-        print(f"Loading games from {file}")
-        
-        with open(file) as pgn:
-            # Seek to the previous position if continuing from last run
-            if current_file_pos > 0:
-                pgn.seek(current_file_pos)
-            
-            while len(games) < batch_size:
-                # Save position before reading game
-                pos = pgn.tell()
-                game = chess.pgn.read_game(pgn)
-                
-                if game is None:
-                    # End of file, move to next file
-                    current_file_idx += 1
-                    current_file_pos = 0
-                    break
-                
-                # Save current position for next run
-                current_file_pos = pgn.tell()
-                games.append(game)
-    
-    # If we finished all files, wrap around
-    if current_file_idx >= len(pgn_files) and len(games) < batch_size:
-        current_file_idx = 0
-        current_file_pos = 0
-    
-    new_processed = processed_games + len(games)
-    
-    state = {
-        "processed_games": new_processed,
-        "current_file_idx": current_file_idx,
-        "current_file_pos": current_file_pos
-    }
-    
-    with open(state_file, 'w') as f:
-        json.dump(state, f)
-    
-    return games
-
-# Self-play game generation (basic implementation)
-def generate_self_play_games(model, num_games=100):
-    games = []
-    model.eval()
-    
-    # Pre-allocate tensor memory
-    batch_size = min(16, num_games)  # Process up to 16 games in parallel
-    active_games = [chess.Board() for _ in range(batch_size)]
-    game_nodes = [chess.pgn.Game() for _ in range(batch_size)]
-    current_nodes = [game for game in game_nodes]
-    move_numbers = [1 for _ in range(batch_size)]
-    active_mask = [True for _ in range(batch_size)]
-    
-    # Set headers
-    for game in game_nodes:
-        game.headers["Result"] = "*"
-    
-    while any(active_mask):
-        # Get all active boards that aren't in terminal state
-        active_indices = [i for i, active in enumerate(active_mask) if active]
-        
-        if not active_indices:
-            break
-            
-        # Batch process all active boards
-        input_tensors = torch.stack([
-            torch.tensor(board_to_tensor(active_games[i], move_numbers[i]), dtype=torch.float32)
-            for i in active_indices
-        ]).to(device)
-        
-        with torch.no_grad():
-            with torch.amp.autocast(device_type="cuda"):
-                policy_logits, _ = model(input_tensors)
-        
-        policies = F.softmax(policy_logits, dim=1).cpu().numpy()
-        
-        # Process each active game
-        for idx, i in enumerate(active_indices):
-            board = active_games[i]
-            legal_moves = list(board.legal_moves)
-            
-            if not legal_moves or board.is_game_over():
-                # Game is over
-                result = board.result()
-                game_nodes[i].headers["Result"] = result
-                games.append(game_nodes[i])
-                
-                # If we still need more games, start a new one
-                if len(games) < num_games:
-                    active_games[i] = chess.Board()
-                    game_nodes[i] = chess.pgn.Game()
-                    game_nodes[i].headers["Result"] = "*"
-                    current_nodes[i] = game_nodes[i]
-                    move_numbers[i] = 1
-                else:
-                    active_mask[i] = False
-                continue
-            
-            # Get move probabilities
-            policy = policies[idx]
-            move_probs = np.zeros(len(legal_moves))
-            
-            for move_idx, move in enumerate(legal_moves):
-                move_index = get_move_index(move)
-                move_probs[move_idx] = policy[move_index]
-            
-            # Fix: Ensure we don't have all zeros by adding a small constant
-            # and handle zero sums properly
-            if np.sum(move_probs) <= 1e-10:
-                # If all moves have essentially zero probability, use uniform distribution
-                move_probs = np.ones(len(legal_moves)) / len(legal_moves)
-            else:
-                # Normalize and handle potential division by zero
-                move_probs = move_probs / np.sum(move_probs)
-            
-            # Select move
-            move = np.random.choice(legal_moves, p=move_probs)
-            
-            # Apply move
-            board.push(move)
-            current_nodes[i] = current_nodes[i].add_variation(move)
-            move_numbers[i] += 1
-    
-    # Add any remaining active games
-    for i, active in enumerate(active_mask):
-        if active:
-            result = active_games[i].result()
-            game_nodes[i].headers["Result"] = result
-            games.append(game_nodes[i])
-    
-    return games[:num_games]  # Ensure we only return the requested number
-
-# Update the train_batch function
-def train_batch(model, game_dataloader, puzzle_dataloader, save_path, state_file, epochs=5, processed_games=0):
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
-    policy_loss_fn = nn.CrossEntropyLoss()
-    value_loss_fn = nn.MSELoss()
-    
-    # Initialize gradient scaler for mixed precision
-    scaler = GradScaler()
-    
-    # Use the provided dataloaders directly
-    puzzle_iter = itertools.cycle(puzzle_dataloader)
-    
-    # State loading
-    if os.path.exists(state_file):
-        with open(state_file, 'r') as f:
-            state = json.load(f)
-            start_epoch = state.get("last_epoch", 0)
-            print(f"Resuming training from epoch {start_epoch + 1}")
-    else:
-        state = {"processed_games": processed_games, "last_epoch": 0}
-        start_epoch = 0
-
-    puzzle_frequency = 1
-    puzzle_batch_multiplier = 10  
-    policy_weight = 1.5
-    value_weight = 1.0
-    puzzle_policy_weight = 3.0  
-    puzzle_value_weight = 2
-
-    for epoch in range(start_epoch, epochs + start_epoch):
-        model.train()
-        total_loss = 0
-        game_batch_count = 0
-        
-        for game_batch in game_dataloader:
-            inputs, policy_targets, value_targets = game_batch
-            inputs = inputs.to(device)
-            policy_targets = policy_targets.to(device)
-            value_targets = value_targets.to(device)
-            
-            optimizer.zero_grad()
-            
-            # Use autocast for mixed precision
-            with torch.amp.autocast(device_type="cuda"):
-                policy_logits, value_pred = model(inputs)
-                policy_loss = policy_loss_fn(policy_logits, policy_targets)
-                value_loss = value_loss_fn(value_pred.squeeze(), value_targets)
-                loss = policy_weight * policy_loss + value_weight * value_loss
-            
-            # Scale gradients and optimize
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            
-            total_loss += loss.item()
-            game_batch_count += 1
-
-            if game_batch_count % puzzle_frequency == 0:
-                for _ in range(puzzle_batch_multiplier):
-                    puzzle_batch = next(puzzle_iter)
-                    inputs, policy_targets, value_targets = puzzle_batch
-                    inputs = inputs.to(device)
-                    policy_targets = policy_targets.to(device)
-                    value_targets = value_targets.to(device)
-                    
-                    optimizer.zero_grad()
-                    
-                    # Use autocast for puzzles too
-                    with torch.amp.autocast(device_type="cuda"):
-                        policy_logits, value_pred = model(inputs)
-                        policy_loss = policy_loss_fn(policy_logits, policy_targets)
-                        value_loss = value_loss_fn(value_pred.squeeze(), value_targets)
-                        loss = puzzle_policy_weight * policy_loss + puzzle_value_weight * value_loss
-                    
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
-                    
-                    total_loss += loss.item()
-
-        # Rest of the epoch code (scheduler, saving) remains the same
-        scheduler.step()
-        num_puzzle_batches = len(game_dataloader) // puzzle_frequency * puzzle_batch_multiplier
-        avg_loss = total_loss / (len(game_dataloader) + num_puzzle_batches)
-        print(f"Epoch {epoch + 1}/{epochs}, Loss: {avg_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
-
-        state["last_epoch"] = epoch + 1
-        state["processed_games"] = processed_games
-        
-        torch.save(model.state_dict(), save_path)
-        with open(state_file, 'w') as f:
-            json.dump(state, f)
-        print(f"Checkpoint saved at epoch {epoch + 1}")
-
-
-# Signal handler (updated)
+# Signal handler 
 def signal_handler(sig, frame, model, save_path, state_file, processed_games, current_epoch):
     print("\nTraining interrupted! Saving model and state...")
     torch.save(model.state_dict(), save_path)
@@ -1225,52 +34,16 @@ def signal_handler(sig, frame, model, save_path, state_file, processed_games, cu
     print(f"Model saved to {save_path}, state saved to {state_file}")
     sys.exit(0)
 
-def train_tactical(model, optimizer, dataloader, device, epochs=3):
-    """Train on tactical puzzles for a specific number of epochs"""
-    policy_loss_fn = nn.CrossEntropyLoss()
-    value_loss_fn = nn.MSELoss()
-    model.train()
-    
-    for epoch in range(epochs):
-        batch_count = 0
-        total_loss = 0
-        
-        for batch in dataloader:
-            inputs, policy_targets, value_targets = batch
-            inputs = inputs.to(device)
-            policy_targets = policy_targets.to(device)
-            value_targets = value_targets.to(device)
-            
-            optimizer.zero_grad()
-            policy_logits, value_pred = model(inputs)
-            policy_loss = policy_loss_fn(policy_logits, policy_targets)
-            value_loss = value_loss_fn(value_pred.squeeze(), value_targets)
-            
-            # Higher policy weight for tactical training
-            loss = 3.0 * policy_loss + value_loss
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item()
-            batch_count += 1
-            if batch_count >= 10:  # Limit number of batches for speed
-                break
-        
-        if batch_count > 0:
-            avg_loss = total_loss / batch_count
-            print(f"Tactical training epoch {epoch+1}, avg loss: {avg_loss:.4f}")
-    
-    return total_loss / batch_count if batch_count > 0 else 0
-
-
-# Main execution with self-play integration
-# Main execution with professional games first, then regular games
-if __name__ == "__main__":
-    # Initialize model and basic setup - unchanged
+# Main execution function
+def main():
+    # Initialize model and basic setup
     model = ChessNet(num_blocks=10, channels=256).to(device)  
     save_path = "./chess_model/chess_model.pth"
     state_file = "./chess_model/training_state.json"
     pro_state_file = "./chess_model/pro_training_state.json"
+    
+    # Create directory if it doesn't exist
+    os.makedirs("./chess_model", exist_ok=True)
     
     if os.path.exists(save_path):
         model.load_state_dict(torch.load(save_path))
@@ -1301,6 +74,7 @@ if __name__ == "__main__":
                 current_phase = "professional"
     else:
         current_phase = "professional"  # Start with professional games by default
+        pro_state = {}
         pro_game_count = 0
 
     # Set up signal handlers
@@ -1334,7 +108,7 @@ if __name__ == "__main__":
     # Find optimal batch size
     print("Determining optimal batch size...")
     model.eval()
-    optimal_batch_size = get_optimal_batch_size(starting_size=64)
+    optimal_batch_size = get_optimal_batch_size(model, device, starting_size=64)
     model.train()
     print(f"Using optimal batch size: {optimal_batch_size}")
     
@@ -1359,7 +133,6 @@ if __name__ == "__main__":
             current_phase = sys.argv[1]
             print(f"Command-line override: Using {current_phase} training mode")
     
-
     # Set batch sizes - smaller batch sizes for faster processing
     pro_batch_size = 1000
     regular_batch_size = 1000
@@ -1371,6 +144,7 @@ if __name__ == "__main__":
     while iterations < max_iterations:
         iterations += 1
         print(f"\n--- Training Iteration {iterations} ---")
+        
         if current_phase == "self-play":
             print("\n=== SELF-PLAY REINFORCEMENT LEARNING MODE ===")
             num_games = 500  # Default number of self-play games per iteration
@@ -1392,6 +166,7 @@ if __name__ == "__main__":
             # Run self-play training
             model = run_self_play_training(
                 model, 
+                device,
                 save_path, 
                 state_file, 
                 num_games=num_games,
@@ -1417,7 +192,6 @@ if __name__ == "__main__":
                 current_phase = "regular"
                 continue
 
-            
             batch_size = len(pro_games)
             print(f"Processing professional batch with {batch_size} games")
             
@@ -1433,7 +207,7 @@ if __name__ == "__main__":
             
             # Train on this batch
             train_batch(model, game_dataloader, puzzle_dataloader, save_path, state_file, 
-                    epochs=5, processed_games=processed_games)
+                    epochs=5, processed_games=processed_games, device=device)
             
             # Clean up to free memory before next phase
             del pro_games
@@ -1451,7 +225,7 @@ if __name__ == "__main__":
             # Generate a few self-play games after each pro batch
             self_play_count = min(iterations, 5)
             print(f"Generating {self_play_count} self-play games...")
-            self_play_games = generate_self_play_games(model, num_games=self_play_count)
+            self_play_games = generate_self_play_games(model, device, num_games=self_play_count)
             
             if self_play_games:
                 self_play_dataset = ChessDataset(self_play_games, augment=True)
@@ -1463,7 +237,7 @@ if __name__ == "__main__":
                     pin_memory=True
                 )
                 train_batch(model, self_play_dataloader, puzzle_dataloader, save_path, pro_state_file, 
-                        epochs=1, processed_games=processed_games)
+                        epochs=1, processed_games=processed_games, device=device)
                 
                 del self_play_games
                 del self_play_dataset
@@ -1501,7 +275,7 @@ if __name__ == "__main__":
             
             # Train on regular games
             train_batch(model, game_dataloader, puzzle_dataloader, save_path, state_file, 
-                    epochs=5, processed_games=processed_games)
+                    epochs=5, processed_games=processed_games, device=device)
             
             # Clean up
             del regular_games
@@ -1513,7 +287,7 @@ if __name__ == "__main__":
             # Generate some self-play games after regular batch
             self_play_count = min(5 + iterations // 2, 10)
             print(f"Generating {self_play_count} self-play games...")
-            self_play_games = generate_self_play_games(model, num_games=self_play_count)
+            self_play_games = generate_self_play_games(model, device, num_games=self_play_count)
             
             if self_play_games:
                 self_play_dataset = ChessDataset(self_play_games, augment=True)
@@ -1525,7 +299,7 @@ if __name__ == "__main__":
                     pin_memory=True
                 )
                 train_batch(model, self_play_dataloader, puzzle_dataloader, save_path, state_file, 
-                        epochs=1, processed_games=processed_games)
+                        epochs=1, processed_games=processed_games, device=device)
                 
                 del self_play_games
                 del self_play_dataset
@@ -1547,13 +321,15 @@ if __name__ == "__main__":
         print(f"Saved model checkpoint (iteration {iterations})")
         
         # Update tracking
-        with open(state_file, 'r') as f:
-            state = json.load(f)
-            processed_games = state.get("processed_games", 0)
+        if os.path.exists(state_file):
+            with open(state_file, 'r') as f:
+                state = json.load(f)
+                processed_games = state.get("processed_games", 0)
         
-        with open(pro_state_file, 'r') as f:
-            pro_state = json.load(f)
-            pro_game_count = pro_state.get("processed_pro_games", 0)
+        if os.path.exists(pro_state_file):
+            with open(pro_state_file, 'r') as f:
+                pro_state = json.load(f)
+                pro_game_count = pro_state.get("processed_pro_games", 0)
         
         print(f"Progress: {pro_game_count} professional games, {processed_games} regular games")
         
@@ -1566,3 +342,7 @@ if __name__ == "__main__":
             break
     
     print(f"\nTraining completed with {processed_games} regular games and {pro_game_count} professional games!")
+
+
+if __name__ == "__main__":
+    main()
