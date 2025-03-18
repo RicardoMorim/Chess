@@ -18,6 +18,8 @@ from torch.cuda.amp import autocast, GradScaler
 import gc
 import pickle
 import hashlib
+from scipy.stats import dirichlet
+import random
 
 
 
@@ -94,7 +96,8 @@ def clear_memory():
         torch.cuda.empty_cache()
 
 
-# Add after the clear_memory function
+
+# Modify the run_self_play_training function to include progressive value weight
 def run_self_play_training(model, save_path, state_file, num_games=500, num_iterations=5):
     """Run self-play training to improve the model through reinforcement learning"""
     print(f"\n=== STARTING SELF-PLAY REINFORCEMENT LEARNING ===")
@@ -113,15 +116,29 @@ def run_self_play_training(model, save_path, state_file, num_games=500, num_iter
     total_positions = 0
     best_accuracy = 0
     
+    # Progressive weight adjustment - start with policy focus, gradually increase value focus
+    initial_policy_weight = 2.0
+    initial_value_weight = 1.0
+    final_value_weight = 2.5  # Increased importance of value over time
+    
     for iteration in range(num_iterations):
         print(f"\nIteration {iteration+1}/{num_iterations}")
+        
+        # Calculate current weights - increase value weight as training progresses
+        progress_factor = iteration / num_iterations
+        policy_weight = initial_policy_weight
+        value_weight = initial_value_weight + progress_factor * (final_value_weight - initial_value_weight)
+        
+        print(f"Current weights: policy={policy_weight:.2f}, value={value_weight:.2f}")
         
         # Phase 1: Generate self-play games with reward shaping for checkmate
         print(f"Generating {num_games} self-play games...")
         self_play_samples = generate_reinforcement_learning_samples(
             model, 
             num_games=num_games, 
-            reward_shaping=True
+            reward_shaping=True,
+            iteration=iteration,
+            total_iterations=num_iterations
         )
         
         if not self_play_samples:
@@ -159,10 +176,7 @@ def run_self_play_training(model, save_path, state_file, num_games=500, num_iter
                 policy_loss = policy_loss_fn(policy_logits, policy_targets)
                 value_loss = value_loss_fn(value_pred.squeeze(), value_targets)
                 
-                # Weight policy updates higher for winning lines
-                policy_weight = 2.0
-                value_weight = 1.0
-                
+                # Use the progressive weights from above
                 loss = policy_weight * policy_loss + value_weight * value_loss
             
             scaler.scale(loss).backward()
@@ -207,27 +221,16 @@ def run_self_play_training(model, save_path, state_file, num_games=500, num_iter
     print(f"Best tactical accuracy: {best_accuracy:.2%}")
     return model
 
-class SelfPlayDataset(Dataset):
-    """Dataset for self-play reinforcement learning samples"""
-    def __init__(self, samples):
-        self.samples = samples
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        board_tensor, policy_target, value_target = self.samples[idx]
-        return (torch.tensor(board_tensor, dtype=torch.float32),
-                torch.tensor(policy_target, dtype=torch.long),
-                torch.tensor(value_target, dtype=torch.float32))
-
-def generate_reinforcement_learning_samples(model, num_games=100, reward_shaping=True):
-    """Generate self-play games with reinforcement learning objectives
+# Update the generate_reinforcement_learning_samples function to include Dirichlet noise and improved MCTS
+def generate_reinforcement_learning_samples(model, num_games=100, reward_shaping=True, iteration=0, total_iterations=5):
+    """Generate self-play games with reinforcement learning objectives and MCTS-inspired search
     
     Args:
         model: The neural network model
         num_games: Number of self-play games to generate
         reward_shaping: Whether to enhance rewards for checkmate/near-checkmate positions
+        iteration: Current iteration number (for adjusting exploration parameters)
+        total_iterations: Total number of iterations planned
         
     Returns:
         List of (board_tensor, policy_target, value_target) tuples for training
@@ -244,14 +247,24 @@ def generate_reinforcement_learning_samples(model, num_games=100, reward_shaping
     active_mask = [True for _ in range(batch_size)]
     completed_games = 0
     
-    # Temperature parameter for move selection (higher = more exploration)
-    temperature = 1.0
+    # MCTS simulation parameters
+    num_simulations = 10  # Number of simulations per move - keep relatively low for speed
+    
+    # Adaptive temperature - start high for exploration, decrease for exploitation
+    progress_factor = iteration / max(1, total_iterations - 1)
+    base_temp = 1.0
+    final_temp = 0.5
+    temperature = base_temp - progress_factor * (base_temp - final_temp)
+    
+    # Dirichlet noise parameters - higher alpha = more uniform noise
+    dirichlet_alpha = 0.3
+    dirichlet_weight = 0.25  # How much to weight the noise vs policy at root
     
     # Some games may go very long - limit total moves to avoid infinite games
     max_moves_per_game = 200
     moves_played = [0 for _ in range(batch_size)]
     
-    print("Generating self-play games with MCTS-inspired policy improvement...")
+    print(f"Generating self-play games with MCTS (temp={temperature:.2f}, noise_weight={dirichlet_weight:.2f})...")
     
     while any(active_mask) and completed_games < num_games:
         # Get all active boards
@@ -260,7 +273,7 @@ def generate_reinforcement_learning_samples(model, num_games=100, reward_shaping
         if not active_indices:
             break
             
-        # Batch process all active boards
+        # Batch process all active boards for initial policy and value
         input_tensors = torch.stack([
             torch.tensor(board_to_tensor(active_games[i], move_numbers[i]), dtype=torch.float32)
             for i in active_indices
@@ -269,8 +282,9 @@ def generate_reinforcement_learning_samples(model, num_games=100, reward_shaping
         with torch.no_grad():
             policy_logits, value_preds = model(input_tensors)
         
-        policies = F.softmax(policy_logits, dim=1).cpu().numpy()
-        values = value_preds.squeeze(-1).cpu().numpy()
+        # Get initial policy and values
+        initial_policies = F.softmax(policy_logits, dim=1).cpu().numpy()
+        initial_values = value_preds.squeeze(-1).cpu().numpy()
         
         # Process each active game
         for idx, i in enumerate(active_indices):
@@ -317,8 +331,8 @@ def generate_reinforcement_learning_samples(model, num_games=100, reward_shaping
                 
                 continue
             
-            # Get move probabilities
-            policy = policies[idx]
+            # Get initial move probabilities from policy network
+            policy = initial_policies[idx]
             move_probs = np.zeros(len(legal_moves))
             
             for move_idx, move in enumerate(legal_moves):
@@ -329,19 +343,73 @@ def generate_reinforcement_learning_samples(model, num_games=100, reward_shaping
             if np.sum(move_probs) <= 1e-10:
                 move_probs = np.ones(len(legal_moves)) / len(legal_moves)
             else:
-                # Apply temperature and normalize
-                move_probs = np.power(move_probs, 1.0 / temperature)
+                # Normalize (ensure probabilities sum to 1)
                 move_probs = move_probs / np.sum(move_probs)
+            
+            # Add Dirichlet noise to root node for exploration (AlphaZero style)
+            if len(legal_moves) > 0:
+                noise = np.random.dirichlet([dirichlet_alpha] * len(legal_moves))
+                move_probs = (1 - dirichlet_weight) * move_probs + dirichlet_weight * noise
+            
+            # MCTS-inspired simulations - simple version that avoids full tree search
+            visit_counts = np.zeros(len(legal_moves))
+            q_values = np.zeros(len(legal_moves))
+            
+            # Run multiple simulations to improve move selection
+            for _ in range(num_simulations):
+                # Select move for simulation based on UCB formula
+                ucb_scores = np.zeros(len(legal_moves))
+                total_visits = np.sum(visit_counts) + 1e-8
+                
+                for move_idx in range(len(legal_moves)):
+                    if visit_counts[move_idx] > 0:
+                        # UCB score balances exploitation (Q-value) with exploration (log term)
+                        ucb_scores[move_idx] = q_values[move_idx] + 2.0 * np.sqrt(np.log(total_visits) / visit_counts[move_idx]) * move_probs[move_idx]
+                    else:
+                        # For unvisited nodes, prioritize by prior probability
+                        ucb_scores[move_idx] = 1.0 + move_probs[move_idx]
+                
+                # Select move with highest UCB score
+                sim_move_idx = np.argmax(ucb_scores)
+                sim_move = legal_moves[sim_move_idx]
+                
+                # Simulate this move and get a value estimate
+                sim_board = board.copy()
+                sim_board.push(sim_move)
+                
+                # For efficiency, just use the model's direct evaluation 
+                # A full MCTS would simulate to the end, but that's expensive
+                sim_tensor = torch.tensor(board_to_tensor(sim_board, move_numbers[i] + 1), dtype=torch.float32).unsqueeze(0).to(device)
+                
+                with torch.no_grad():
+                    _, sim_value = model(sim_tensor)
+                    
+                # Convert value to current player's perspective
+                sim_value = -float(sim_value.item())  # Negative because we're evaluating from opponent's view
+                
+                # Update statistics
+                visit_counts[sim_move_idx] += 1
+                q_values[sim_move_idx] = (q_values[sim_move_idx] * (visit_counts[sim_move_idx] - 1) + sim_value) / visit_counts[sim_move_idx]
+            
+            # After simulations, select move based on visit counts (not raw policy)
+            # Apply temperature to visit count distribution
+            if np.sum(visit_counts) > 0:
+                visit_counts_temp = np.power(visit_counts, 1.0 / temperature)
+                visit_policy = visit_counts_temp / np.sum(visit_counts_temp)
+            else:
+                visit_policy = move_probs
             
             # Store current position for later training
             board_histories[i].append(board_to_tensor(board, move_numbers[i]))
             
-            # Select move - slightly greedier for self-play training
-            if np.random.random() < 0.8:  # 80% choose best move
-                selected_idx = np.argmax(move_probs)
+            # Select move - early in training, explore more. Later, be more greedy.
+            exploration_threshold = 0.8 + 0.1 * (1 - progress_factor)  # Decreases from 0.9 to 0.8 over time
+            
+            if np.random.random() < exploration_threshold:  # Mostly select best move
+                selected_idx = np.argmax(visit_policy)
                 move = legal_moves[selected_idx]
-            else:  # 20% explore other moves
-                selected_idx = np.random.choice(len(legal_moves), p=move_probs)
+            else:  # Sometimes explore other moves
+                selected_idx = np.random.choice(len(legal_moves), p=visit_policy)
                 move = legal_moves[selected_idx]
             
             # Store selected move
@@ -358,6 +426,21 @@ def generate_reinforcement_learning_samples(model, num_games=100, reward_shaping
     
     print(f"Generated {len(samples)} training samples from {completed_games} games")
     return samples
+
+class SelfPlayDataset(Dataset):
+    """Dataset for self-play reinforcement learning samples"""
+    def __init__(self, samples):
+        self.samples = samples
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        board_tensor, policy_target, value_target = self.samples[idx]
+        return (torch.tensor(board_tensor, dtype=torch.float32),
+                torch.tensor(policy_target, dtype=torch.long),
+                torch.tensor(value_target, dtype=torch.float32))
+
 
 def create_training_samples_from_game(board_history, move_history, final_result, reward_shaping=True):
     """Create training samples from a completed self-play game
