@@ -181,7 +181,12 @@ def generate_mcts_game(model, device, temperature=1.0, num_simulations=500,
     node = game
     move_number = 1
     tree = None
-    
+
+    piece_count = sum(1 for _ in board.piece_map())
+    if piece_count < 10:  # Endgame
+        num_simulations = min(1000, num_simulations * 2)  # Double simulations for endgame
+    if piece_count < 5:  # Endgame
+        num_simulations = min(1000, num_simulations * 2)  # Double again simulations for 5 pieces or less
     while not board.is_game_over():
         if board.fullmove_number > 100:  # Avoid extremely long games
             game.headers["Result"] = "1/2-1/2"

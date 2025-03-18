@@ -49,8 +49,8 @@ def generate_reinforcement_learning_samples(model, device, num_games=100, reward
     temperature = base_temp - progress_factor * (base_temp - final_temp)
     
     # Dirichlet noise parameters - higher alpha = more uniform noise
-    dirichlet_alpha = 0.3
-    dirichlet_weight = 0.25  # How much to weight the noise vs policy at root
+    dirichlet_alpha = 0.3 * (1 - 0.5 * progress_factor)  # Decrease from 0.3 to 0.15 as training progresses
+    dirichlet_weight = 0.25 * (1 - 0.5 * progress_factor)  # Decrease from 0.25 to 0.125 as training progresses
     
     # Some games may go very long - limit total moves to avoid infinite games
     max_moves_per_game = 200

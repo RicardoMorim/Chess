@@ -188,7 +188,8 @@ def main():
             # Run tactical training after self-play to maintain tactical awareness
             print("Running tactical training phase...")
             tactical_optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
-            train_tactical(model, tactical_optimizer, puzzle_dataloader, device, epochs=3)
+            tactical_epochs = min(3 + iterations // 5, 10)  # Start with 3, gradually increase
+            train_tactical(model, tactical_optimizer, puzzle_dataloader, device, epochs=tactical_epochs)
             
             # Test tactical recognition occasionally
             if iterations % 3 == 0:
@@ -348,6 +349,7 @@ def main():
                 del self_play_dataloader
                 gc.collect()
                 clear_memory()
+
             
             # Run tactical test occasionally
             if iterations % 3 == 0:
