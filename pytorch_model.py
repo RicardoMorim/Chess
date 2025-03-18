@@ -34,11 +34,11 @@ class ResidualBlock(nn.Module):
         x = F.relu(x)
         return x
 
-# Chess Neural Network
+# Chess Neural Network with updated architecture
 class ChessNet(nn.Module):
-    def __init__(self, num_blocks=5, channels=256):
+    def __init__(self, num_blocks=10, channels=256):
         super(ChessNet, self).__init__()
-        self.conv1 = nn.Conv2d(18, channels, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(20, channels, kernel_size=3, padding=1)  # 20 channels for added features
         self.bn1 = nn.BatchNorm2d(channels)
         self.blocks = nn.ModuleList([ResidualBlock(channels) for _ in range(num_blocks)])
         self.policy_conv = nn.Conv2d(channels, 73, kernel_size=1)
@@ -60,9 +60,13 @@ class ChessNet(nn.Module):
         value = torch.tanh(self.value_fc2(value))
         return policy, value
 
-# Convert chess board to input tensor
-def board_to_tensor(board):
-    tensor = np.zeros((18, 8, 8), dtype=np.float32)
+# Convert chess board to input tensor with enhanced features
+def board_to_tensor(board, move_number=None):
+    if move_number is None:
+        # Estimate move number from board state if not provided
+        move_number = (board.fullmove_number * 2) - (2 if board.turn == chess.WHITE else 1)
+    
+    tensor = np.zeros((20, 8, 8), dtype=np.float32)  # Increased to 20 channels
     for piece_type in chess.PIECE_TYPES:
         for color in chess.COLORS:
             for square in board.pieces(piece_type, color):
@@ -77,6 +81,8 @@ def board_to_tensor(board):
         row, col = divmod(board.ep_square, 8)
         tensor[16, row, col] = 1
     tensor[17, :, :] = 1 if board.turn == chess.WHITE else 0
+    tensor[18, :, :] = board.halfmove_clock / 50.0  # Normalized repetition counter 
+    tensor[19, :, :] = move_number / 200.0  # Normalized move number (assuming max 200 moves)
     return tensor
 
 # Move Index Mapping with Promotions
@@ -203,7 +209,9 @@ class MCTSNode:
 def direct_select_move(board, model, temperature=1.2):
     model.eval()
     with torch.no_grad():
-        input_tensor = torch.tensor(board_to_tensor(board)).unsqueeze(0).to(device)
+        # Get the move number for the enhanced features
+        move_number = (board.fullmove_number * 2) - (2 if board.turn == chess.WHITE else 1)
+        input_tensor = torch.tensor(board_to_tensor(board, move_number)).unsqueeze(0).to(device)
         policy_logits, _ = model(input_tensor)
         policy_probs = F.softmax(policy_logits / temperature, dim=1).cpu().numpy()[0]
         legal_moves = list(board.legal_moves)
@@ -221,8 +229,9 @@ def direct_select_move(board, model, temperature=1.2):
         return best_move
 
 class PytorchModel:
-    def __init__(self, model_path="./models/model.pth"):
-        self.model = ChessNet().to(device)
+    def __init__(self, model_path="./chess_model/chess_model.pth"):
+        # Updated to use the enhanced model with 10 blocks
+        self.model = ChessNet(num_blocks=10, channels=256).to(device)
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model not found at {model_path}")
         self.model.load_state_dict(torch.load(model_path, map_location=device))
@@ -241,7 +250,9 @@ class PytorchModel:
         root = MCTSNode(board)
         self.model.eval()
 
-        input_tensor = torch.tensor(board_to_tensor(board)).unsqueeze(0).to(device)
+        # Get the move number for enhanced features
+        move_number = (board.fullmove_number * 2) - (2 if board.turn == chess.WHITE else 1)
+        input_tensor = torch.tensor(board_to_tensor(board, move_number)).unsqueeze(0).to(device)
         with torch.no_grad():
             policy_logits, _ = self.model(input_tensor)
             policy_probs = F.softmax(policy_logits, dim=1).cpu().numpy()[0]
@@ -274,13 +285,16 @@ class PytorchModel:
                 if child:
                     batch.append(child)
             if len(batch) >= batch_size or i == iterations - 1 and batch:
-                        # Convert list of arrays to a single numpy array first
-                        batch_arrays = np.array([board_to_tensor(node.board) for node in batch])
-                        inputs = torch.from_numpy(batch_arrays).to(device)
-                        with torch.no_grad():
-                            _, values = self.model(inputs)
-                        for node, value in zip(batch, values):
-                            node.backpropagate(value.item())
-                        batch = []
+                # Add the move number for each board in the batch
+                batch_arrays = np.array([board_to_tensor(
+                    node.board, 
+                    (node.board.fullmove_number * 2) - (2 if node.board.turn == chess.WHITE else 1)
+                ) for node in batch])
+                inputs = torch.from_numpy(batch_arrays).to(device)
+                with torch.no_grad():
+                    _, values = self.model(inputs)
+                for node, value in zip(batch, values):
+                    node.backpropagate(value.item())
+                batch = []
 
         return max(root.children, key=lambda m: root.children[m].visits)
