@@ -1,0 +1,40 @@
+This is a collection of lichess.org games from https://database.lichess.org/
+
+I filtered all (standard) games from https://database.lichess.org/ to only keep games by players 
+rated 2400+ against players rated 2200+, excluding bullet games.
+
+I believe that it might be useful for players who want to be up to date on the latest theoretical 
+novelties as strong players test their discoveries online. Another potential use for this database 
+is to see how strong opponents would face your openings in practice.
+
+********** FAQ **********
+
+Q: How to use these files?
+A: Import them into the database software of your choice such as chessbase or scid. I have tested 
+the files with scid but not with any other software.
+
+Q: Why aren't the clock times included?
+A: To save space.
+
+Q: Why aren't the URLs of the games included?
+A: lichess stores the URLs of the games in the "Site" tag. Unfortunately scid has a limit on the 
+number of different sites which can be stored in a database which is reached pretty fast if each 
+game has its own site. I decided to delete the URLs to be able to use the files in scid.
+
+Q: Why would I need to download this database if the lichess explorer has the same games?
+A: The lichess explorer is great for ad-hoc checking where you went wrong in a game but its inherent 
+restrictions (currently you can only see the top 4 games in a particular position) doesn't make it 
+as useful as a downloadable database for in-depth opening and middlegame preparation.
+
+Q: I have a comment or suggestion - how do I contact you?
+A: Feel free to message me at https://lichess.org/@/nikonoel
+
+Q: These files only go to May 2020. How do I get the following months/years?
+A: I will makes sure to include a link to the latest files on my lichess profile.
+
+********** Copyleft notice **********
+
+All games played on lichess.org are in the public domain.
+These collections of games are in the public domain, with no rights reserved.
+Use them in any way you like, for data mining, research, commercial purpose, publication, anything.
+You can download, modify and redistribute them at will, without asking for permission.

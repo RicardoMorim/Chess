@@ -1,0 +1,1 @@
+All regular game pgn files belong here.

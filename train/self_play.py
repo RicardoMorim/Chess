@@ -9,6 +9,9 @@ from typing import List, Tuple, Optional
 from data import board_to_tensor, get_move_index, SelfPlayDataset
 from utils import clear_memory, test_tactical_recognition
 
+# Add import for MCTS functionality
+from mcts import generate_mcts_game
+
 
 def generate_reinforcement_learning_samples(model, device, num_games=100, reward_shaping=True, iteration=0, total_iterations=5):
     """Generate self-play games with reinforcement learning objectives and MCTS-inspired search
@@ -264,10 +267,21 @@ def create_training_samples_from_game(board_history, move_history, final_result,
     return samples
 
 
-def generate_self_play_games(model, device, num_games=100):
-    """Generate self-play games without reinforcement learning"""
+def generate_self_play_games(model, device, num_games=100, use_mcts=True):
+    """Generate self-play games without reinforcement learning, now using MCTS by default"""
     games = []
     model.eval()
+    
+    if use_mcts:
+        # Use MCTS for higher quality games (but slower generation)
+        for i in range(num_games):
+            if i % 5 == 0:
+                print(f"Generating MCTS game {i+1}/{num_games}")
+            game = generate_mcts_game(model, device, temperature=1.0, 
+                                    num_simulations=500, c_puct=1.0, 
+                                    parallel_workers=4)
+            games.append(game)
+        return games
     
     # Pre-allocate tensor memory
     batch_size = min(16, num_games)  # Process up to 16 games in parallel
@@ -357,10 +371,11 @@ def generate_self_play_games(model, device, num_games=100):
     return games[:num_games]  # Ensure we only return the requested number
 
 
-def run_self_play_training(model, device, save_path, state_file, num_games=500, num_iterations=5):
+def run_self_play_training(model, device, save_path, state_file, num_games=500, num_iterations=5, use_mcts=False):
     """Run self-play training to improve the model through reinforcement learning"""
     print(f"\n=== STARTING SELF-PLAY REINFORCEMENT LEARNING ===")
     print(f"Training for {num_iterations} iterations with {num_games} games per iteration")
+    print(f"MCTS for move selection: {'Enabled' if use_mcts else 'Disabled'}")
     
     # Initialize optimizer and loss functions
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0005, weight_decay=1e-5)
@@ -391,16 +406,56 @@ def run_self_play_training(model, device, save_path, state_file, num_games=500, 
         
         print(f"Current weights: policy={policy_weight:.2f}, value={value_weight:.2f}")
         
-        # Phase 1: Generate self-play games with reward shaping for checkmate
-        print(f"Generating {num_games} self-play games...")
-        self_play_samples = generate_reinforcement_learning_samples(
-            model,
-            device, 
-            num_games=num_games, 
-            reward_shaping=True,
-            iteration=iteration,
-            total_iterations=num_iterations
-        )
+        if use_mcts:
+            # Generate games using MCTS if enabled (higher quality but slower)
+            print(f"Generating {num_games} self-play games using MCTS...")
+            
+            # Adjust num_games if using MCTS as it's much slower
+            adjusted_games = max(20, num_games // 5)
+            games = generate_self_play_games(model, device, num_games=adjusted_games, use_mcts=True)
+            if games:
+                # Convert games to training samples
+                self_play_samples = []
+                for game in games:
+                    board = chess.Board()
+                    result_str = game.headers.get("Result", "*")
+                    result_value = 0.0  # Default for unfinished games
+                    if result_str == "1-0":
+                        result_value = 1.0
+                    elif result_str == "0-1":
+                        result_value = -1.0
+                    
+                    move_history = []
+                    board_history = []
+                    move_number = 1
+                    
+                    for move in game.mainline_moves():
+                        board_history.append(board_to_tensor(board, move_number))
+                        move_history.append(get_move_index(move))
+                        board.push(move)
+                        move_number += 1
+                    
+                    game_samples = create_training_samples_from_game(
+                        board_history, 
+                        move_history, 
+                        result_value,
+                        True  # Always use reward shaping for MCTS games
+                    )
+                    self_play_samples.extend(game_samples)
+            else:
+                print("Failed to generate valid self-play games with MCTS. Skipping iteration.")
+                continue
+        else:
+            # Phase 1: Generate self-play games with reward shaping for checkmate
+            print(f"Generating {num_games} self-play games...")
+            self_play_samples = generate_reinforcement_learning_samples(
+                model,
+                device, 
+                num_games=num_games, 
+                reward_shaping=True,
+                iteration=iteration,
+                total_iterations=num_iterations
+            )
         
         if not self_play_samples:
             print("Failed to generate valid self-play samples. Skipping iteration.")

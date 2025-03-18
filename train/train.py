@@ -1,7 +1,4 @@
 import time
-import chess
-import chess.pgn
-import numpy as np
 import torch
 from torch.utils.data import DataLoader
 import os
@@ -12,7 +9,7 @@ import sys
 import gc
 import random
 
-# Import from our refactored modules
+
 from models import ChessNet
 from data import (ChessDataset, PuzzleDataset, load_puzzles, load_lichess_puzzles, 
                  filter_and_prioritize_puzzles_cached, load_professional_games, 
@@ -121,61 +118,90 @@ def main():
         pin_memory=True
     )
     
-    # Get current training phase from state file or determine by counts
-    if pro_game_count < 1000000:  # Arbitrary threshold for switching to regular games
-        current_phase = "pro"
-    else:
-        current_phase = "regular"
-    
+    # Default training mode and MCTS settings
     current_phase = "regular"  # Default mode
+    use_mcts = True  # Default is now to use MCTS for better quality
+    is_mode_locked = False  # Track if mode is locked by command line
+    
+    # Check if mode is specified via command line
     if len(sys.argv) > 1:
         if sys.argv[1] in ["pro", "regular", "self-play"]:
             current_phase = sys.argv[1]
-            print(f"Command-line override: Using {current_phase} training mode")
+            is_mode_locked = True  # Lock the mode when specified via command line
+            print(f"Command-line override: Using {current_phase} training mode (locked)")
+            
+        # Check for no-MCTS flag
+        if "--no-mcts" in sys.argv:
+            use_mcts = False
+            print("MCTS disabled for self-play (faster but lower quality)")
+        else:
+            print("MCTS enabled for self-play (higher quality games)")
     
     # Set batch sizes - smaller batch sizes for faster processing
     pro_batch_size = 1000
     regular_batch_size = 1000
     
     # Main training loop
-    max_iterations = 1000  # Safety limit
+    max_iterations = 1000000  # Very high limit (essentially unlimited)
     iterations = 0
     
     while iterations < max_iterations:
         iterations += 1
         print(f"\n--- Training Iteration {iterations} ---")
         
+        # Self-play mode
         if current_phase == "self-play":
             print("\n=== SELF-PLAY REINFORCEMENT LEARNING MODE ===")
-            num_games = 500  # Default number of self-play games per iteration
-            num_iterations = 10  # Default number of iterations
+            
+            # Default number of self-play games and iterations for continuous mode
+            games_per_batch = 50  # Lower default for continuous mode
+            iterations_per_cycle = 2  # Fewer iterations per cycle for faster feedback
             
             # Check if user specified number of games and iterations
-            if len(sys.argv) > 2:
+            if len(sys.argv) > 2 and sys.argv[2] not in ["--mcts"]:
                 try:
-                    num_games = int(sys.argv[2])
+                    # In continuous mode, this is games per batch
+                    games_per_batch = int(sys.argv[2])
                 except ValueError:
-                    print(f"Invalid number of games: {sys.argv[2]}. Using default: {num_games}")
+                    print(f"Invalid number of games: {sys.argv[2]}. Using default: {games_per_batch}")
                     
-            if len(sys.argv) > 3:
+            if len(sys.argv) > 3 and sys.argv[3] not in ["--mcts"]:
                 try:
-                    num_iterations = int(sys.argv[3])
+                    # In continuous mode, this is iterations per cycle
+                    iterations_per_cycle = int(sys.argv[3])
                 except ValueError:
-                    print(f"Invalid number of iterations: {sys.argv[3]}. Using default: {num_iterations}")
+                    print(f"Invalid iterations per cycle: {sys.argv[3]}. Using default: {iterations_per_cycle}")
             
-            # Run self-play training
+            print(f"Running {iterations_per_cycle} iterations with {games_per_batch} games per iteration")
+            
+            # Run self-play training for this batch
             model = run_self_play_training(
                 model, 
                 device,
                 save_path, 
                 state_file, 
-                num_games=num_games,
-                num_iterations=num_iterations
+                num_games=games_per_batch,
+                num_iterations=iterations_per_cycle,
+                use_mcts=use_mcts
             )
             
-            print("\nSelf-play training completed!")
-            sys.exit(0)
-
+            # Run tactical training after self-play to maintain tactical awareness
+            print("Running tactical training phase...")
+            tactical_optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
+            train_tactical(model, tactical_optimizer, puzzle_dataloader, device, epochs=3)
+            
+            # Test tactical recognition occasionally
+            if iterations % 3 == 0:
+                test_accuracy = test_tactical_recognition(model, device)
+                print(f"Tactical recognition accuracy: {test_accuracy:.2%}")
+            
+            # Continue with self-play mode if locked, otherwise potentially switch
+            if not is_mode_locked and iterations % 10 == 0:
+                # Occasionally switch to other modes for variety
+                current_phase = random.choice(["regular", "pro", "self-play"])
+                print(f"Switching to {current_phase} mode for variety")
+                
+        # Professional games mode
         elif current_phase == "pro":
             print("\n=== PROFESSIONAL GAMES TRAINING ===")
             
@@ -183,15 +209,17 @@ def main():
             pro_games = load_professional_games(pro_state_file, batch_size=pro_batch_size)
             
             if not pro_games:
-                print("No more professional games to process. Permanently switching to regular games.")
-                # Mark in the state file that we've processed all pro games
-                with open(pro_state_file, 'w') as f:
-                    pro_state = {"processed_pro_games": pro_game_count,
-                                "all_pro_games_processed": True}
-                    json.dump(pro_state, f)
-                current_phase = "regular"
-                continue
-
+                print("No more professional games to process.")
+                if is_mode_locked:
+                    print("Mode is locked to 'pro' but no more pro games available.")
+                    print("Will attempt to reload pro games in the next iteration.")
+                    time.sleep(5)  # Wait before trying again
+                    continue
+                else:
+                    print("Switching to regular games mode temporarily.")
+                    current_phase = "regular"
+                    continue
+            
             batch_size = len(pro_games)
             print(f"Processing professional batch with {batch_size} games")
             
@@ -219,13 +247,12 @@ def main():
             # Tactical training after professional batch
             print("Running quick tactical training phase...")
             tactical_optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
-            
             train_tactical(model, tactical_optimizer, puzzle_dataloader, device, epochs=3)
             
             # Generate a few self-play games after each pro batch
             self_play_count = min(iterations, 5)
             print(f"Generating {self_play_count} self-play games...")
-            self_play_games = generate_self_play_games(model, device, num_games=self_play_count)
+            self_play_games = generate_self_play_games(model, device, num_games=self_play_count, use_mcts=use_mcts)
             
             if self_play_games:
                 self_play_dataset = ChessDataset(self_play_games, augment=True)
@@ -245,10 +272,17 @@ def main():
                 gc.collect()
                 clear_memory()
             
-            # Determine if we should move to regular phase (this can be tuned)
-            if pro_game_count > 10000 or iterations % 5 == 0:
+            # Test tactical recognition occasionally
+            if iterations % 3 == 0:
+                test_accuracy = test_tactical_recognition(model, device)
+                print(f"Tactical recognition accuracy: {test_accuracy:.2%}")
+            
+            # Only switch modes if not locked
+            if not is_mode_locked and iterations % 5 == 0:
                 current_phase = "regular"
+                print("Switching to regular games mode for variety")
                 
+        # Regular games mode
         else:  # Regular games phase
             print("\n=== REGULAR GAMES TRAINING ===")
             
@@ -257,8 +291,15 @@ def main():
             
             if not regular_games:
                 print("No regular games available or error loading games.")
-                current_phase = "professional"  # Switch back to pro games if issues with regular games
-                continue
+                if is_mode_locked:
+                    print("Mode is locked to 'regular' but having trouble loading games.")
+                    print("Will attempt to reload games in the next iteration.")
+                    time.sleep(5)  # Wait before trying again
+                    continue
+                else:
+                    print("Switching to professional games mode temporarily.")
+                    current_phase = "pro"
+                    continue
                 
             batch_size = len(regular_games)
             print(f"Processing regular batch with {batch_size} games")
@@ -287,7 +328,8 @@ def main():
             # Generate some self-play games after regular batch
             self_play_count = min(5 + iterations // 2, 10)
             print(f"Generating {self_play_count} self-play games...")
-            self_play_games = generate_self_play_games(model, device, num_games=self_play_count)
+            # Use MCTS by default now
+            self_play_games = generate_self_play_games(model, device, num_games=self_play_count, use_mcts=use_mcts)
             
             if self_play_games:
                 self_play_dataset = ChessDataset(self_play_games, augment=True)
@@ -312,9 +354,10 @@ def main():
                 test_accuracy = test_tactical_recognition(model, device)
                 print(f"Tactical recognition accuracy: {test_accuracy:.2%}")
             
-            # Switch back to pro games every few iterations
-            if iterations % 3 == 0 and not pro_state.get("all_pro_games_processed", False):
-                current_phase = "professional"
+            # Only switch modes if not locked
+            if not is_mode_locked and iterations % 3 == 0 and not pro_state.get("all_pro_games_processed", False):
+                current_phase = "pro"
+                print("Switching to professional games mode for variety")
         
         # Save checkpoint every iteration
         torch.save(model.state_dict(), save_path)
