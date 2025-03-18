@@ -94,11 +94,316 @@ def clear_memory():
         torch.cuda.empty_cache()
 
 
+# Add after the clear_memory function
+def run_self_play_training(model, save_path, state_file, num_games=500, num_iterations=5):
+    """Run self-play training to improve the model through reinforcement learning"""
+    print(f"\n=== STARTING SELF-PLAY REINFORCEMENT LEARNING ===")
+    print(f"Training for {num_iterations} iterations with {num_games} games per iteration")
+    
+    # Initialize optimizer and loss functions
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0005, weight_decay=1e-5)
+    policy_loss_fn = nn.CrossEntropyLoss()
+    value_loss_fn = nn.MSELoss()
+    scaler = GradScaler()
+    
+    # Create a simple batch size finder function specific to self-play
+    batch_size = get_optimal_batch_size(starting_size=32, min_size=8) // 2  # Smaller for RL
+    
+    # Track progress across iterations
+    total_positions = 0
+    best_accuracy = 0
+    
+    for iteration in range(num_iterations):
+        print(f"\nIteration {iteration+1}/{num_iterations}")
+        
+        # Phase 1: Generate self-play games with reward shaping for checkmate
+        print(f"Generating {num_games} self-play games...")
+        self_play_samples = generate_reinforcement_learning_samples(
+            model, 
+            num_games=num_games, 
+            reward_shaping=True
+        )
+        
+        if not self_play_samples:
+            print("Failed to generate valid self-play samples. Skipping iteration.")
+            continue
+            
+        print(f"Generated {len(self_play_samples)} training positions from self-play")
+        
+        # Phase 2: Train on the generated positions
+        print("Training on self-play positions...")
+        rl_dataset = SelfPlayDataset(self_play_samples)
+        rl_dataloader = DataLoader(
+            rl_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=2,
+            pin_memory=True
+        )
+        
+        # Training loop for this iteration
+        model.train()
+        total_rl_loss = 0
+        batch_count = 0
+        
+        for batch in rl_dataloader:
+            inputs, policy_targets, value_targets = batch
+            inputs = inputs.to(device)
+            policy_targets = policy_targets.to(device)
+            value_targets = value_targets.to(device)
+            
+            optimizer.zero_grad()
+            
+            with torch.amp.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu"):
+                policy_logits, value_pred = model(inputs)
+                policy_loss = policy_loss_fn(policy_logits, policy_targets)
+                value_loss = value_loss_fn(value_pred.squeeze(), value_targets)
+                
+                # Weight policy updates higher for winning lines
+                policy_weight = 2.0
+                value_weight = 1.0
+                
+                loss = policy_weight * policy_loss + value_weight * value_loss
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
+            total_rl_loss += loss.item()
+            batch_count += 1
+            
+            if batch_count % 10 == 0:
+                print(f"  Batch {batch_count}, Loss: {loss.item():.4f}")
+        
+        if batch_count > 0:
+            avg_loss = total_rl_loss / batch_count
+            print(f"Avg training loss: {avg_loss:.4f}")
+        
+        # Save checkpoint after each iteration
+        torch.save(model.state_dict(), save_path)
+        print(f"Model checkpoint saved after iteration {iteration+1}")
+        
+        # Test tactical recognition after each iteration
+        print("Testing tactical recognition...")
+        test_accuracy = test_tactical_recognition(model, device)
+        print(f"Tactical recognition accuracy: {test_accuracy:.2%}")
+        
+        if test_accuracy > best_accuracy:
+            best_accuracy = test_accuracy
+            # Save best model separately
+            torch.save(model.state_dict(), save_path.replace('.pth', '_best.pth'))
+            print(f"New best model saved with accuracy: {best_accuracy:.2%}")
+        
+        # Clean up between iterations
+        del self_play_samples
+        del rl_dataset
+        del rl_dataloader
+        clear_memory()
+        
+        total_positions += len(self_play_samples)
+    
+    print(f"\n=== SELF-PLAY TRAINING COMPLETED ===")
+    print(f"Processed {total_positions} positions across {num_iterations} iterations")
+    print(f"Best tactical accuracy: {best_accuracy:.2%}")
+    return model
 
+class SelfPlayDataset(Dataset):
+    """Dataset for self-play reinforcement learning samples"""
+    def __init__(self, samples):
+        self.samples = samples
 
+    def __len__(self):
+        return len(self.samples)
 
+    def __getitem__(self, idx):
+        board_tensor, policy_target, value_target = self.samples[idx]
+        return (torch.tensor(board_tensor, dtype=torch.float32),
+                torch.tensor(policy_target, dtype=torch.long),
+                torch.tensor(value_target, dtype=torch.float32))
 
+def generate_reinforcement_learning_samples(model, num_games=100, reward_shaping=True):
+    """Generate self-play games with reinforcement learning objectives
+    
+    Args:
+        model: The neural network model
+        num_games: Number of self-play games to generate
+        reward_shaping: Whether to enhance rewards for checkmate/near-checkmate positions
+        
+    Returns:
+        List of (board_tensor, policy_target, value_target) tuples for training
+    """
+    samples = []
+    model.eval()
+    
+    # Parallel game generation
+    batch_size = min(16, num_games)
+    active_games = [chess.Board() for _ in range(batch_size)]
+    move_histories = [[] for _ in range(batch_size)]
+    board_histories = [[] for _ in range(batch_size)]
+    move_numbers = [1 for _ in range(batch_size)]
+    active_mask = [True for _ in range(batch_size)]
+    completed_games = 0
+    
+    # Temperature parameter for move selection (higher = more exploration)
+    temperature = 1.0
+    
+    # Some games may go very long - limit total moves to avoid infinite games
+    max_moves_per_game = 200
+    moves_played = [0 for _ in range(batch_size)]
+    
+    print("Generating self-play games with MCTS-inspired policy improvement...")
+    
+    while any(active_mask) and completed_games < num_games:
+        # Get all active boards
+        active_indices = [i for i, active in enumerate(active_mask) if active]
+        
+        if not active_indices:
+            break
+            
+        # Batch process all active boards
+        input_tensors = torch.stack([
+            torch.tensor(board_to_tensor(active_games[i], move_numbers[i]), dtype=torch.float32)
+            for i in active_indices
+        ]).to(device)
+        
+        with torch.no_grad():
+            policy_logits, value_preds = model(input_tensors)
+        
+        policies = F.softmax(policy_logits, dim=1).cpu().numpy()
+        values = value_preds.squeeze(-1).cpu().numpy()
+        
+        # Process each active game
+        for idx, i in enumerate(active_indices):
+            board = active_games[i]
+            legal_moves = list(board.legal_moves)
+            
+            # Check for game over conditions or move limit reached
+            if not legal_moves or board.is_game_over() or moves_played[i] >= max_moves_per_game:
+                # Save result and create training samples with appropriate rewards
+                if board.is_checkmate():
+                    # Checkmate is highest reward/penalty
+                    result_value = 1.0 if not board.turn else -1.0
+                elif board.is_stalemate() or board.is_insufficient_material():
+                    # Stalemate and insufficient material are draws
+                    result_value = 0.0
+                elif moves_played[i] >= max_moves_per_game:
+                    # Truncated games are treated as slightly negative for both sides
+                    result_value = -0.1
+                else:
+                    # Other game terminations (50-move rule, repetition) are draws
+                    result_value = 0.0
+                
+                # Generate training samples from this game with updated rewards
+                game_samples = create_training_samples_from_game(
+                    board_histories[i], 
+                    move_histories[i], 
+                    result_value,
+                    reward_shaping
+                )
+                samples.extend(game_samples)
+                
+                # Track completed games
+                completed_games += 1
+                
+                # Start a new game if needed
+                if completed_games < num_games:
+                    active_games[i] = chess.Board()
+                    move_histories[i] = []
+                    board_histories[i] = []
+                    move_numbers[i] = 1
+                    moves_played[i] = 0
+                else:
+                    active_mask[i] = False
+                
+                continue
+            
+            # Get move probabilities
+            policy = policies[idx]
+            move_probs = np.zeros(len(legal_moves))
+            
+            for move_idx, move in enumerate(legal_moves):
+                move_index = get_move_index(move)
+                move_probs[move_idx] = policy[move_index]
+            
+            # Handle case of all zero probabilities
+            if np.sum(move_probs) <= 1e-10:
+                move_probs = np.ones(len(legal_moves)) / len(legal_moves)
+            else:
+                # Apply temperature and normalize
+                move_probs = np.power(move_probs, 1.0 / temperature)
+                move_probs = move_probs / np.sum(move_probs)
+            
+            # Store current position for later training
+            board_histories[i].append(board_to_tensor(board, move_numbers[i]))
+            
+            # Select move - slightly greedier for self-play training
+            if np.random.random() < 0.8:  # 80% choose best move
+                selected_idx = np.argmax(move_probs)
+                move = legal_moves[selected_idx]
+            else:  # 20% explore other moves
+                selected_idx = np.random.choice(len(legal_moves), p=move_probs)
+                move = legal_moves[selected_idx]
+            
+            # Store selected move
+            move_histories[i].append(get_move_index(move))
+            
+            # Make the move
+            board.push(move)
+            moves_played[i] += 1
+            move_numbers[i] += 1
+        
+        # Show progress
+        if completed_games > 0 and completed_games % 10 == 0:
+            print(f"Completed {completed_games}/{num_games} self-play games")
+    
+    print(f"Generated {len(samples)} training samples from {completed_games} games")
+    return samples
 
+def create_training_samples_from_game(board_history, move_history, final_result, reward_shaping=True):
+    """Create training samples from a completed self-play game
+    
+    This function applies reward shaping to emphasize learning from checkmate sequences
+    """
+    samples = []
+    game_length = len(move_history)
+    
+    # Skip very short games
+    if game_length < 5:
+        return []
+        
+    for i in range(game_length):
+        # The board state
+        board_tensor = board_history[i]
+        
+        # The move that was actually played
+        move_idx = move_history[i]
+        
+        # Calculate shaped reward based on position in game 
+        if reward_shaping:
+            # Positions closer to the end get rewards closer to the final result
+            # This creates a smoother reward gradient for learning
+            progress_factor = i / game_length
+            
+            if final_result > 0:  # Winning position
+                # Reward increases exponentially toward the end
+                shaped_value = final_result * min(1.0, progress_factor * 2)
+            elif final_result < 0:  # Losing position
+                # Penalty increases toward the end
+                shaped_value = final_result * min(1.0, progress_factor * 2)
+            else:  # Draw
+                shaped_value = final_result * progress_factor
+        else:
+            # Without reward shaping, all positions get the game's final result
+            shaped_value = final_result
+            
+        # Flip value target for black's perspective
+        is_white_to_move = np.sum(board_tensor[17]) > 0  # Check the turn channel
+        if not is_white_to_move:
+            shaped_value = -shaped_value
+        
+        samples.append((board_tensor, move_idx, shaped_value))
+    
+    return samples
 
 
 
@@ -961,15 +1266,17 @@ if __name__ == "__main__":
     
     # Get current training phase from state file or determine by counts
     if pro_game_count < 1000000:  # Arbitrary threshold for switching to regular games
-        current_phase = "professional"
+        current_phase = "pro"
     else:
         current_phase = "regular"
     
-    # Command-line override option for phase
-    if len(sys.argv) > 1 and sys.argv[1] in ["pro", "regular"]:
-        current_phase = "professional" if sys.argv[1] == "pro" else "regular"
-        print(f"Command-line override: Using {current_phase} phase")
+    current_phase = "regular"  # Default mode
+    if len(sys.argv) > 1:
+        if sys.argv[1] in ["pro", "regular", "self-play"]:
+            current_phase = sys.argv[1]
+            print(f"Command-line override: Using {current_phase} training mode")
     
+
     # Set batch sizes - smaller batch sizes for faster processing
     pro_batch_size = 1000
     regular_batch_size = 1000
@@ -981,8 +1288,37 @@ if __name__ == "__main__":
     while iterations < max_iterations:
         iterations += 1
         print(f"\n--- Training Iteration {iterations} ---")
-        
-        if current_phase == "professional":
+        if current_phase == "self-play":
+            print("\n=== SELF-PLAY REINFORCEMENT LEARNING MODE ===")
+            num_games = 500  # Default number of self-play games per iteration
+            num_iterations = 10  # Default number of iterations
+            
+            # Check if user specified number of games and iterations
+            if len(sys.argv) > 2:
+                try:
+                    num_games = int(sys.argv[2])
+                except ValueError:
+                    print(f"Invalid number of games: {sys.argv[2]}. Using default: {num_games}")
+                    
+            if len(sys.argv) > 3:
+                try:
+                    num_iterations = int(sys.argv[3])
+                except ValueError:
+                    print(f"Invalid number of iterations: {sys.argv[3]}. Using default: {num_iterations}")
+            
+            # Run self-play training
+            model = run_self_play_training(
+                model, 
+                save_path, 
+                state_file, 
+                num_games=num_games,
+                num_iterations=num_iterations
+            )
+            
+            print("\nSelf-play training completed!")
+            sys.exit(0)
+
+        elif current_phase == "pro":
             print("\n=== PROFESSIONAL GAMES TRAINING ===")
             
             # Load one batch of professional games
