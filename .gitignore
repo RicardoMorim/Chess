@@ -1,5 +1,7 @@
 *__pycache__*
 cache*
-openings*
 
-chess_pgns*
+/openings/*
+
+/train/chess_pgns/**/*.pgn
+/train/chess_pgns/**/*.csv

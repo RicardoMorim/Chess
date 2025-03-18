@@ -308,7 +308,15 @@ class Main:
             # return
         
             print("The engine is thinking MTCS for color: " + self.color)
-            best_move = self.pytorch_engine.get_best_move_mtcs(self.board, iterations=2000) 
+            best_move = self.pytorch_engine.get_best_move_mcts(
+                self.board, 
+                iterations=3000,  # Adjust based on time constraints
+                c_puct=1.5,       # Exploration constant
+                dirichlet_alpha=0.3,  # Noise for exploration
+                temperature=1.0,  # For training, use 1.0; for strong play use 0.5 or lower
+                parallel_workers=4,  # For your i5 with 8 threads
+                reuse_tree=True   # Reuse tree between moves for faster play
+            )
             self.push_move(best_move)
             print("MOVE BY MTCS:", best_move)
             return

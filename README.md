@@ -1,6 +1,6 @@
 # Chess Game with AI
 
-This is a simple chess game implemented in Python using the Pygame library. The game includes a basic graphical user interface and allows the player to play against an AI opponent. The project also features two AI models built with PyTorch and TensorFlow, developed as part of the chess-engine project. URL: https://github.com/RicardoMorim/Chess-Engine
+This is a simple chess game implemented in Python using the Pygame library. The game includes a basic graphical user interface and allows the player to play against an AI opponent. The project also features two AI models built with Pytorch. One of them smaller and the other one bigger.
 
 ## Table of Contents
 
@@ -38,8 +38,6 @@ Before running the chess game, ensure you have the following dependencies instal
 
 -> numpy: A fundamental package for scientific computing with Python.
 
--> tensorflow: A library for numerical computation using data flow graphs, used for one of the AI models.
-
 -> torch: An open-source machine learning library used for the other AI model.
 
 
@@ -56,9 +54,47 @@ These libraries are specified in the requirements.txt file and will be installed
 3. Install the required dependencies:
 -> pip install -r requirements.txt
 
+4. (Optional) Add openings pgn files to the folder `/openings`.
+-> I used PGN Mentor to find the files.
+
 # Usage
 1. Run the main.py script to start the chess game:
--> python main.py
+-> python main.py 
+
+# Training
+1. Change directory to the train folder
+```bash
+cd train
+```
+
+2. Download pgn files. I used Lichess and PGN mentor. Place puzzles (both pgn and csv as lichess outputs in csv, but the code handles both) in `/train/chess_pgns/puzzles`. Place high elo games in `/train/chess_pgns` and place professional games in `/train/chess_pgn/pros`.
+
+3. Start training by choosing one of following commands:
+- Default usage (will train with all modes, switching mode every 5 iterations)
+```bash
+python train.py
+```
+- Pro game training
+```bash
+python train.py pro
+```
+
+- Self play training
+```bash
+python train.py self-play [games_per_batch] [iterations_per_cycle]
+```
+
+- Regular games training
+```bash
+python train.py regular
+```
+
+- Lower quality but faster self play training:
+```bash
+python train.py self-play --no-mcts
+```
+
+> **NOTE:** All training modes will use the puzzles in the training and do a simple tactical training. 
 
 # Note
 There are different code snippets in the start_game_function and in the play_engine_move in the main.py file, allowing you to play against various AI models or observe AI vs AI matches.
@@ -76,7 +112,6 @@ The AI engine uses a basic evaluation function and the minimax algorithm with al
 Additionally, two neural AI models are included:
 
 -> PyTorch Model: A neural network model trained with PyTorch for enhanced decision-making.
--> TensorFlow Model: Another neural network model trained with TensorFlow, providing a different gameplay experience.
 You can choose between these AI models in the game settings.
 
 # Contributing
