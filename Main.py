@@ -26,6 +26,7 @@ import chess.engine
 import mtcs
 import newAI
 from pytorch_model import PytorchModel
+from old_model import OldPytorchModel
 
 
 class Main:
@@ -57,6 +58,7 @@ class Main:
         self.openings = {}
         self.load_openings()
         self.pytorch_engine = PytorchModel()
+        self.old_pytorch_engine = OldPytorchModel()
 
     @classmethod
     def load_piece_images(cls):
@@ -311,6 +313,11 @@ class Main:
             print("MOVE BY MTCS:", best_move)
             return
         
+        print("The engine is thinking OLD with MTCS for color: " + self.color)
+        best_move = self.old_pytorch_engine.get_best_move_mtcs(self.board)
+        self.push_move(best_move)
+        print("MOVE BY OLD:", best_move)
+        return
 
         # if self.AI_type == "pytorch":
         #     engine = PytorchModel()
@@ -366,27 +373,28 @@ class Main:
             pygame.display.flip()
 
             ## TEST AI VS AI  ##
-            # self.play_engine_move(max_depth, ai_color)
+            self.play_engine_move(max_depth, ai_color)
 
-            # # self.AI_type = "monte_carlo" if self.AI_type == "minimax" else "minimax"
+            # self.AI_type = "monte_carlo" if self.AI_type == "minimax" else "minimax"
 
-            # ai_color = "w" if ai_color == "b" else "b"
+            ai_color = "w" if ai_color == "b" else "b"
             
+            self.AI_turn = not self.AI_turn
 
-            # self.AI_turn = not self.AI_turn
+            self.color = "w" if self.color == "b" else "b"
 
 
 
             
             # HUMAN VS AI ##
-            if self.AI_turn:
-                print("The engine is thinking...")
-                sleep(1)
-                self.play_engine_move(max_depth, ai_color)
-                self.AI_turn = False
-            else:
-                self.play_human_move()
-                self.AI_turn = True
+            # if self.AI_turn:
+            #     print("The engine is thinking...")
+            #     sleep(1)
+            #     self.play_engine_move(max_depth, ai_color)
+            #     self.AI_turn = False
+            # else:
+            #     self.play_human_move()
+            #     self.AI_turn = True
 
         # Game over, show end game screen
         print(self.board.outcome)
