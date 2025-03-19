@@ -89,6 +89,11 @@ python train.py self-play [games_per_batch] [iterations_per_cycle]
 python train.py regular
 ```
 
+- Medium quality and speed self play training
+```bash
+python train.py self-play --fast-mtcs
+```
+
 - Lower quality but faster self play training:
 ```bash
 python train.py self-play --no-mcts

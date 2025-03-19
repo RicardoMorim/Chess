@@ -134,23 +134,52 @@ def train_tactical(model, optimizer, dataloader, device, epochs=3):
     value_loss_fn = nn.MSELoss()
     model.train()
     
+    # Add position filtering to focus on most valuable positions
+    
+    # Track loss by category
+    category_losses = {}
+    category_counts = {}
+    
     for epoch in range(epochs):
         batch_count = 0
         total_loss = 0
         
         for batch in dataloader:
-            inputs, policy_targets, value_targets = batch
-            inputs = inputs.to(device)
-            policy_targets = policy_targets.to(device)
-            value_targets = value_targets.to(device)
+            inputs, policy_targets, value_targets, categories = batch  # Add category tracking
+            
+            # Calculate loss with category-based weighting
+            loss = 0
+            for i, category in enumerate(categories):
+                # Get a single example
+                input_i = inputs[i:i+1]
+                policy_target_i = policy_targets[i:i+1]
+                value_target_i = value_targets[i:i+1]
+                
+                # Forward pass
+                policy_logits, value_pred = model(input_i)
+                
+                # Weight losses by category
+                if category == "mate_in_one":
+                    category_weight = 5.0  # High priority
+                elif category == "endgame":
+                    category_weight = 3.0  # Medium-high priority
+                else:
+                    category_weight = 1.0
+                    
+                policy_loss = policy_loss_fn(policy_logits, policy_target_i) * category_weight
+                value_loss = value_loss_fn(value_pred.squeeze(), value_target_i) * category_weight
+                
+                sample_loss = 3.0 * policy_loss + value_loss
+                loss += sample_loss
+                
+                # Track loss by category
+                if category not in category_losses:
+                    category_losses[category] = 0
+                    category_counts[category] = 0
+                category_losses[category] += sample_loss.item()
+                category_counts[category] += 1
             
             optimizer.zero_grad()
-            policy_logits, value_pred = model(inputs)
-            policy_loss = policy_loss_fn(policy_logits, policy_targets)
-            value_loss = value_loss_fn(value_pred.squeeze(), value_targets)
-            
-            # Higher policy weight for tactical training
-            loss = 3.0 * policy_loss + value_loss
             loss.backward()
             optimizer.step()
             

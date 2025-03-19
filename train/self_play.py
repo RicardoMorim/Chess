@@ -5,12 +5,18 @@ import chess.pgn
 import numpy as np
 import time
 from typing import List, Tuple, Optional
+import gc
+import psutil
+import os
+import random
 
 from data import board_to_tensor, get_move_index, SelfPlayDataset
 from utils import clear_memory, test_tactical_recognition
 
 # Add import for MCTS functionality
 from mcts import generate_mcts_game
+
+from utils import get_optimal_batch_size, clear_memory
 
 
 def generate_reinforcement_learning_samples(model, device, num_games=100, reward_shaping=True, iteration=0, total_iterations=5):
@@ -58,6 +64,12 @@ def generate_reinforcement_learning_samples(model, device, num_games=100, reward
     
     print(f"Generating self-play games with MCTS (temp={temperature:.2f}, noise_weight={dirichlet_weight:.2f})...")
     
+    # Dynamic batch sizing - start with smaller batches and increase
+    # This avoids OOM errors while maximizing throughput
+    current_batch_size = 4
+    max_batch_size = 16
+    batch_success_count = 0
+    
     while any(active_mask) and completed_games < num_games:
         # Get all active boards
         active_indices = [i for i, active in enumerate(active_mask) if active]
@@ -65,14 +77,30 @@ def generate_reinforcement_learning_samples(model, device, num_games=100, reward
         if not active_indices:
             break
             
-        # Batch process all active boards for initial policy and value
-        input_tensors = torch.stack([
-            torch.tensor(board_to_tensor(active_games[i], move_numbers[i]), dtype=torch.float32)
-            for i in active_indices
-        ]).to(device)
-        
-        with torch.no_grad():
-            policy_logits, value_preds = model(input_tensors)
+        # Process in dynamic batches
+        try:
+            # Try current batch size
+            input_tensors = torch.stack([
+                torch.tensor(board_to_tensor(active_games[i], move_numbers[i]), dtype=torch.float32)
+                for i in active_indices[:current_batch_size]
+            ]).to(device)
+            
+            with torch.no_grad():
+                policy_logits, value_preds = model(input_tensors)
+                
+            # Success - consider increasing batch size
+            batch_success_count += 1
+            if batch_success_count >= 3 and current_batch_size < max_batch_size:
+                current_batch_size = min(current_batch_size * 2, max_batch_size)
+                print(f"Increased batch size to {current_batch_size}")
+                
+        except RuntimeError as e:  # Usually OOM
+            # Reduce batch size and try again
+            current_batch_size = max(current_batch_size // 2, 1)
+            batch_success_count = 0
+            print(f"Reduced batch size to {current_batch_size} due to error")
+            clear_memory()
+            continue
         
         # Get initial policy and values
         initial_policies = F.softmax(policy_logits, dim=1).cpu().numpy()
@@ -278,7 +306,7 @@ def generate_self_play_games(model, device, num_games=100, use_mcts=True):
             if i % 5 == 0:
                 print(f"Generating MCTS game {i+1}/{num_games}")
             game = generate_mcts_game(model, device, temperature=1.0, 
-                                    num_simulations=500, c_puct=1.0, 
+                                    num_simulations=100, c_puct=1.0, 
                                     parallel_workers=4)
             games.append(game)
         return games
@@ -371,11 +399,17 @@ def generate_self_play_games(model, device, num_games=100, use_mcts=True):
     return games[:num_games]  # Ensure we only return the requested number
 
 
-def run_self_play_training(model, device, save_path, state_file, num_games=500, num_iterations=5, use_mcts=False):
+def run_self_play_training(model, device, save_path, state_file, num_games=50, num_iterations=5, use_mcts=False, fast_mcts=False):
     """Run self-play training to improve the model through reinforcement learning"""
     print(f"\n=== STARTING SELF-PLAY REINFORCEMENT LEARNING ===")
     print(f"Training for {num_iterations} iterations with {num_games} games per iteration")
-    print(f"MCTS for move selection: {'Enabled' if use_mcts else 'Disabled'}")
+    
+    if use_mcts and fast_mcts:
+        print("MCTS: Fast mode (balanced speed/quality)")
+    elif use_mcts:
+        print("MCTS: Full mode (highest quality)")
+    else:
+        print("MCTS: Disabled (fastest training)")
     
     # Initialize optimizer and loss functions
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0005, weight_decay=1e-5)
@@ -383,9 +417,9 @@ def run_self_play_training(model, device, save_path, state_file, num_games=500, 
     value_loss_fn = torch.nn.MSELoss()
     scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
     
-    # Get optimal batch size for this hardware
-    from utils import get_optimal_batch_size
-    batch_size = get_optimal_batch_size(model, device, starting_size=32, min_size=8) // 2  # Smaller for RL
+    # Lower batch size to reduce memory pressure
+    batch_size = min(16, get_optimal_batch_size(model, device, starting_size=32, min_size=8) // 4)
+    print(f"Using conservative batch size: {batch_size}")
     
     # Track progress across iterations
     total_positions = 0
@@ -406,15 +440,77 @@ def run_self_play_training(model, device, save_path, state_file, num_games=500, 
         
         print(f"Current weights: policy={policy_weight:.2f}, value={value_weight:.2f}")
         
+        # Monitor memory usage before generation
+        process = psutil.Process(os.getpid())
+        mem_before = process.memory_info().rss / 1024 / 1024
+        print(f"Memory usage before game generation: {mem_before:.1f} MB")
+        
+        # Generate games using MCTS with conservative settings
         if use_mcts:
-            # Generate games using MCTS if enabled (higher quality but slower)
+            # Generate games using MCTS if enabled
             print(f"Generating {num_games} self-play games using MCTS...")
             
-            # Adjust num_games if using MCTS as it's much slower
-            adjusted_games = max(20, num_games // 5)
-            games = generate_self_play_games(model, device, num_games=adjusted_games, use_mcts=True)
+            # Adjust parameters based on mode
+            if fast_mcts:
+                # Fast MCTS settings - use simplified MCTS algorithm
+                print("Using simplified MCTS for faster training")
+                num_simulations = 30
+                adjusted_games = max(10, min(20, num_games // 5))
+                
+                games = []
+                # Generate games one at a time with memory cleanup between each
+                for i in range(adjusted_games):
+                    print(f"Generating simple MCTS game {i+1}/{adjusted_games}")
+                    try:
+                        # Use simplified MCTS with moderate simulation count
+                        game = generate_simple_mcts_game(
+                            model, 
+                            device, 
+                            temperature=1.0,
+                            num_simulations=num_simulations
+                        )
+                        games.append(game)
+                        
+                        # Force cleanup between games
+                        if i % 2 == 1:  # Every other game
+                            clear_memory()
+                    except Exception as e:
+                        print(f"Error generating game: {e}")
+                        clear_memory()
+                        continue
+            else:
+                # Full MCTS settings - more thorough but slower
+                num_simulations = 50
+                parallel_workers = 3
+                adjusted_games = max(5, min(10, num_games // 10))
+                
+                games = []
+                
+                # Generate games one at a time with memory cleanup between each
+                for i in range(adjusted_games):
+                    print(f"Generating MCTS game {i+1}/{adjusted_games}")
+                    try:
+                        # Use full MCTS with higher simulation count
+                        game = generate_mcts_game(
+                            model, 
+                            device, 
+                            temperature=1.0,
+                            num_simulations=num_simulations,
+                            c_puct=1.0,
+                            parallel_workers=parallel_workers
+                        )
+                        games.append(game)
+                        
+                        # Force cleanup between games
+                        if i % 2 == 1:  # Every other game
+                            clear_memory()
+                    except Exception as e:
+                        print(f"Error generating game: {e}")
+                        clear_memory()
+                        continue
+            
+            # Convert games to training samples with memory management
             if games:
-                # Convert games to training samples
                 self_play_samples = []
                 for game in games:
                     board = chess.Board()
@@ -442,35 +538,64 @@ def run_self_play_training(model, device, save_path, state_file, num_games=500, 
                         True  # Always use reward shaping for MCTS games
                     )
                     self_play_samples.extend(game_samples)
+                    
+                    # Clear references to help with memory
+                    del board_history
+                    del move_history
+                    if len(self_play_samples) > 10000:  # Limit to reasonable number
+                        break
             else:
-                print("Failed to generate valid self-play games with MCTS. Skipping iteration.")
-                continue
+                print("Failed to generate valid self-play games with MCTS. Falling back to non-MCTS.")
+                # Fall back to non-MCTS
+                self_play_samples = generate_reinforcement_learning_samples(
+                    model,
+                    device, 
+                    num_games=max(10, num_games // 5),  # Generate fewer games as a fallback
+                    reward_shaping=True,
+                    iteration=iteration,
+                    total_iterations=num_iterations
+                )
         else:
             # Phase 1: Generate self-play games with reward shaping for checkmate
-            print(f"Generating {num_games} self-play games...")
+            # Use fewer games to avoid crashes
+            adjusted_games = max(10, num_games // 5)  # Generate fewer games
+            print(f"Generating {adjusted_games} self-play games...")
             self_play_samples = generate_reinforcement_learning_samples(
                 model,
                 device, 
-                num_games=num_games, 
+                num_games=adjusted_games,
                 reward_shaping=True,
                 iteration=iteration,
                 total_iterations=num_iterations
             )
         
-        if not self_play_samples:
-            print("Failed to generate valid self-play samples. Skipping iteration.")
+        # Check memory after generation
+        mem_after = process.memory_info().rss / 1024 / 1024
+        print(f"Memory usage after game generation: {mem_after:.1f} MB (change: {mem_after-mem_before:.1f} MB)")
+        
+        # Force cleanup
+        clear_memory()
+        
+        if not self_play_samples or len(self_play_samples) < 100:
+            print("Failed to generate enough valid self-play samples. Skipping iteration.")
             continue
+            
+        # Limit samples to avoid memory issues
+        if len(self_play_samples) > 50000:
+            print(f"Too many samples ({len(self_play_samples)}), limiting to 50000")
+            random.shuffle(self_play_samples)
+            self_play_samples = self_play_samples[:50000]
             
         print(f"Generated {len(self_play_samples)} training positions from self-play")
         
-        # Phase 2: Train on the generated positions
+        # Phase 2: Train on the generated positions with smaller batch size and more frequent cleanup
         print("Training on self-play positions...")
         rl_dataset = SelfPlayDataset(self_play_samples)
         rl_dataloader = torch.utils.data.DataLoader(
             rl_dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=2,
+            num_workers=1,  # Reduce workers to 1
             pin_memory=True
         )
         
@@ -511,6 +636,12 @@ def run_self_play_training(model, device, save_path, state_file, num_games=500, 
             
             if batch_count % 10 == 0:
                 print(f"  Batch {batch_count}, Loss: {loss.item():.4f}")
+                
+            # More frequent cleanup
+            if batch_count % 50 == 0:
+                # Force garbage collection more aggressively 
+                del inputs, policy_targets, value_targets, policy_logits, value_pred
+                clear_memory()
         
         if batch_count > 0:
             avg_loss = total_rl_loss / batch_count
@@ -537,9 +668,176 @@ def run_self_play_training(model, device, save_path, state_file, num_games=500, 
         del rl_dataloader
         clear_memory()
         
+        # Add a brief pause to let system cool down
+        print("Pausing for 5 seconds to allow system recovery...")
+        time.sleep(5)
+        
         total_positions += len(self_play_samples)
     
     print(f"\n=== SELF-PLAY TRAINING COMPLETED ===")
     print(f"Processed {total_positions} positions across {num_iterations} iterations")
     print(f"Best tactical accuracy: {best_accuracy:.2%}")
     return model
+
+
+
+def simple_mcts_for_training(board, model, device, num_simulations=50, temperature=1.0):
+    """Simplified MCTS designed for stability during training"""
+    # Get initial policy from model
+    input_tensor = torch.tensor(board_to_tensor(board, board.fullmove_number), 
+                              dtype=torch.float32).unsqueeze(0).to(device)
+    with torch.no_grad():
+        policy_logits, _ = model(input_tensor)
+    policy = F.softmax(policy_logits, dim=1).cpu().numpy().flatten()
+    
+    # Get move probabilities for legal moves
+    legal_moves = list(board.legal_moves)
+    move_probs = np.zeros(len(legal_moves))
+    
+    for i, move in enumerate(legal_moves):
+        move_index = get_move_index(move)
+        if move_index < len(policy):
+            move_probs[i] = policy[move_index]
+    
+    # Normalize probabilities
+    if np.sum(move_probs) > 1e-8:
+        move_probs = move_probs / np.sum(move_probs)
+    else:
+        move_probs = np.ones(len(legal_moves)) / len(legal_moves)
+    
+    # Add Dirichlet noise to root
+    noise = np.random.dirichlet([0.3] * len(legal_moves))
+    move_probs = 0.75 * move_probs + 0.25 * noise
+    
+    # Track visit counts and values for each move
+    visits = np.zeros(len(legal_moves))
+    values = np.zeros(len(legal_moves))
+    
+    # Simplified simulation loop - no threading
+    for _ in range(num_simulations):
+        # Select move using UCB
+        best_score = -float('inf')
+        best_move_idx = -1
+        
+        for i in range(len(legal_moves)):
+            if visits[i] == 0:
+                score = move_probs[i] * 1000  # High priority for unexplored
+            else:
+                exploit = values[i] / visits[i]
+                explore = np.sqrt(np.log(np.sum(visits) + 1) / (visits[i] + 1e-8))
+                score = exploit + 2.0 * move_probs[i] * explore
+                
+            if score > best_score:
+                best_score = score
+                best_move_idx = i
+        
+        # Simulate selected move
+        move = legal_moves[best_move_idx]
+        next_board = board.copy()
+        next_board.push(move)
+        
+        # Get value from neural network
+        next_tensor = torch.tensor(board_to_tensor(next_board, next_board.fullmove_number), 
+                              dtype=torch.float32).unsqueeze(0).to(device)
+        with torch.no_grad():
+            _, value_tensor = model(next_tensor)
+        sim_value = -float(value_tensor.item())  # Negate for opponent's perspective
+        
+        # Update statistics
+        visits[best_move_idx] += 1
+        values[best_move_idx] += sim_value
+    
+    # Apply temperature to visit distribution
+    if temperature == 0:  # Deterministic
+        best_move_idx = np.argmax(visits)
+        probs = np.zeros_like(visits)
+        probs[best_move_idx] = 1.0
+    else:
+        # Apply temperature
+        visits_temp = np.power(visits, 1.0 / temperature)
+        if np.sum(visits_temp) > 0:
+            probs = visits_temp / np.sum(visits_temp)
+        else:
+            probs = move_probs  # Fall back to policy network
+    
+    # Return both selected move and full distribution for training
+    selected_idx = np.random.choice(len(legal_moves), p=probs)
+    selected_move = legal_moves[selected_idx]
+    
+    return selected_move, probs
+
+
+def generate_simple_mcts_game(model, device, temperature=1.0, num_simulations=50):
+    """Generate a self-play game using the simplified MCTS (faster for training)"""
+    game = chess.pgn.Game()
+    board = chess.Board()
+    node = game
+    move_number = 1
+    
+    # Apply early termination for very long games
+    max_moves = 80  # Limit to reasonable game length
+    
+    while not board.is_game_over() and move_number <= max_moves:
+        # Temperature annealing - reduce temperature as game progresses  
+        if board.fullmove_number < 10:
+            current_temp = temperature
+        elif board.fullmove_number < 30:
+            current_temp = temperature * 0.75
+        else:
+            current_temp = temperature * 0.5
+            
+        # Select move using simplified MCTS
+        try:
+            move, _ = simple_mcts_for_training(
+                board, 
+                model, 
+                device,
+                num_simulations=num_simulations,
+                temperature=current_temp
+            )
+        except Exception as e:
+            print(f"MCTS error: {e}. Falling back to direct move selection.")
+            # Fallback to direct move selection if MCTS fails
+            input_tensor = torch.tensor(board_to_tensor(board, move_number), dtype=torch.float32).unsqueeze(0).to(device)
+            with torch.no_grad():
+                policy_logits, _ = model(input_tensor)
+            policy = F.softmax(policy_logits, dim=1).squeeze().cpu().numpy()
+            
+            legal_moves = list(board.legal_moves)
+            move_probs = np.zeros(len(legal_moves))
+            
+            for move_idx, move in enumerate(legal_moves):
+                move_index = get_move_index(move)
+                if move_index < len(policy):
+                    move_probs[move_idx] = policy[move_index]
+                    
+            if np.sum(move_probs) <= 1e-10:
+                move_probs = np.ones(len(legal_moves)) / len(legal_moves)
+            else:
+                move_probs = move_probs / np.sum(move_probs)
+                
+            move = np.random.choice(legal_moves, p=move_probs)
+            
+        if move is None:
+            break
+            
+        # Add move to game
+        board.push(move)
+        node = node.add_variation(move)
+        move_number += 1
+        
+        # Periodic memory cleanup during game generation
+        if move_number % 20 == 0:
+            clear_memory()
+    
+    # Set result header based on game outcome
+    if board.is_checkmate():
+        game.headers["Result"] = "0-1" if board.turn == chess.WHITE else "1-0"
+    elif board.is_stalemate() or board.is_insufficient_material():
+        game.headers["Result"] = "1/2-1/2"
+    elif board.is_fifty_moves() or board.is_repetition(3) or move_number > max_moves:
+        game.headers["Result"] = "1/2-1/2"
+    else:
+        game.headers["Result"] = "*"  # Unfinished
+        
+    return game
