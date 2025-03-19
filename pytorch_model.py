@@ -57,6 +57,24 @@ class ChessNet(nn.Module):
         value = torch.tanh(self.value_fc2(value))
         return policy, value
 
+    def quantize(self):
+        """Quantize the model for faster inference"""
+        if not hasattr(torch, 'quantization'):
+            print("PyTorch quantization not available")
+            return self
+        
+        # Specify which layers to not quantize (BatchNorm)
+        quantize_config = torch.quantization.get_default_qconfig('fbgemm')
+        self.qconfig = quantize_config
+        
+        # Prepare the model for quantization
+        torch.quantization.prepare(self, inplace=True)
+        
+        # Convert to quantized model
+        torch.quantization.convert(self, inplace=True)
+        print("Model quantized for faster inference")
+        return self
+
 # Convert chess board to input tensor with enhanced features
 def board_to_tensor(board, move_number=None):
     if move_number is None:
@@ -255,6 +273,9 @@ class PytorchModel:
     def __init__(self, model_path="./chess_model/chess_model.pth"):
         # Updated to use the enhanced model with 10 blocks
         self.model = ChessNet(num_blocks=10, channels=256).to(device)
+
+        self.model.quantize()
+
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model not found at {model_path}")
         self.model.load_state_dict(torch.load(model_path, map_location=device))

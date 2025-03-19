@@ -130,12 +130,19 @@ def main():
             is_mode_locked = True  # Lock the mode when specified via command line
             print(f"Command-line override: Using {current_phase} training mode (locked)")
             
-        # Check for no-MCTS flag
+        # Check for MCTS flags
         if "--no-mcts" in sys.argv:
             use_mcts = False
+            fast_mcts = False
             print("MCTS disabled for self-play (faster but lower quality)")
+        elif "--fast-mtcs" in sys.argv:
+            use_mcts = True
+            fast_mcts = True
+            print("Using fast MCTS for self-play (balanced speed/quality)")
         else:
-            print("MCTS enabled for self-play (higher quality games)")
+            use_mcts = True
+            fast_mcts = False
+            print("Full MCTS enabled for self-play (highest quality games)")
     
     # Set batch sizes - smaller batch sizes for faster processing
     pro_batch_size = 1000
@@ -154,8 +161,8 @@ def main():
             print("\n=== SELF-PLAY REINFORCEMENT LEARNING MODE ===")
             
             # Default number of self-play games and iterations for continuous mode
-            games_per_batch = 50  # Lower default for continuous mode
-            iterations_per_cycle = 2  # Fewer iterations per cycle for faster feedback
+            games_per_batch = 10  # Lower default for continuous mode
+            iterations_per_cycle = 1  # Fewer iterations per cycle for faster feedback
             
             # Check if user specified number of games and iterations
             if len(sys.argv) > 2 and sys.argv[2] not in ["--mcts"]:
@@ -182,7 +189,8 @@ def main():
                 state_file, 
                 num_games=games_per_batch,
                 num_iterations=iterations_per_cycle,
-                use_mcts=use_mcts
+                use_mcts=use_mcts,
+                fast_mcts=fast_mcts
             )
             
             # Run tactical training after self-play to maintain tactical awareness

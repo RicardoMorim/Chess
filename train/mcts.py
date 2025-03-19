@@ -9,6 +9,8 @@ from typing import Dict, Tuple, Optional, List, Any
 
 from data import board_to_tensor, get_move_index
 
+from utils import clear_memory
+
 # Define a node class for MCTS.
 class MCTSNode:
     def __init__(self, board: chess.Board, prior: float, parent=None):
@@ -100,6 +102,11 @@ def run_mcts(root_board: chess.Board, model, device, num_simulations: int = None
              c_puct: float = 1.0, virtual_loss: float = 1.0, parallel_workers: int = 4):
     root = MCTSNode(root_board, prior=1.0)
     expand_node(root, model, device)
+
+    early_stopping_threshold = 0.9  # Stop if one move has 90% of visits
+    minimum_visits = 100  # But only after this many visits
+    visits_without_improvement = 0  # Track non-improving iterations
+    best_move_visits = 0
     
     simulations_done = 0
     start_time = time.time()
@@ -113,14 +120,35 @@ def run_mcts(root_board: chess.Board, model, device, num_simulations: int = None
     total_simulations = num_simulations if num_simulations is not None else float('inf')
     
     with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
-        futures = []
-        while simulations_done < total_simulations:
-            if time_limit is not None and (time.time() - start_time) > time_limit:
-                break
-            futures.append(executor.submit(run_one_simulation))
-        for future in futures:
-            future.result()
-    
+            while simulations_done < total_simulations:
+                # Add batched simulation - this is faster than one-by-one
+                batch_size = parallel_workers * 2
+                futures = [executor.submit(run_one_simulation) for _ in range(min(batch_size, total_simulations - simulations_done))]
+                
+                for future in futures:
+                    future.result()
+                    
+                # Early stopping check (periodically)
+                if simulations_done >= minimum_visits and simulations_done % 20 == 0:
+                    visits = {move: child.visit_count for move, child in root.children.items()}
+                    if visits:
+                        top_move = max(visits.items(), key=lambda x: x[1])[0]
+                        top_visits = visits[top_move]
+                        total = sum(visits.values())
+                        
+                        if top_visits > early_stopping_threshold * total:
+                            # One move is dominating, stop early
+                            break
+                            
+                        # Detect when search is not improving
+                        if top_visits <= best_move_visits:
+                            visits_without_improvement += 1
+                            if visits_without_improvement >= 10:  # Multiple non-improving iterations
+                                break
+                        else:
+                            best_move_visits = top_visits
+                            visits_without_improvement = 0
+        
     # Gather visit counts for all legal moves at the root.
     visit_counts = {}
     for move, child in root.children.items():
@@ -173,25 +201,19 @@ def select_move_with_mcts(board: chess.Board, model, device, num_simulations: in
     return best_move, pi, new_tree
 
 # Function to enhance self-play by using MCTS instead of simpler search
-def generate_mcts_game(model, device, temperature=1.0, num_simulations=500, 
-                      c_puct=1.5, parallel_workers=4):
-    """Generate a self-play game using MCTS for move selection with optimized parameters"""
+def generate_mcts_game(model, device, temperature=1.0, num_simulations=50, 
+                      c_puct=1.5, parallel_workers=2):
+    """Generate a self-play game using MCTS for move selection with more stable settings"""
     game = chess.pgn.Game()
     board = chess.Board()
     node = game
     move_number = 1
     tree = None
 
-    piece_count = sum(1 for _ in board.piece_map())
-    if piece_count < 10:  # Endgame
-        num_simulations = min(1000, num_simulations * 2)  # Double simulations for endgame
-    if piece_count < 5:  # Endgame
-        num_simulations = min(1000, num_simulations * 2)  # Double again simulations for 5 pieces or less
-    while not board.is_game_over():
-        if board.fullmove_number > 100:  # Avoid extremely long games
-            game.headers["Result"] = "1/2-1/2"
-            break
-            
+    # Apply early termination for very long games
+    max_moves = 80  # Limit to reasonable game length
+    
+    while not board.is_game_over() and move_number <= max_moves:
         # Temperature annealing - reduce temperature as game progresses
         if board.fullmove_number < 10:
             current_temp = temperature
@@ -201,17 +223,41 @@ def generate_mcts_game(model, device, temperature=1.0, num_simulations=500,
             current_temp = temperature * 0.5
             
         # Select move using MCTS
-        move, _, tree = select_move_with_mcts(
-            board, 
-            model, 
-            device,
-            num_simulations=num_simulations,
-            temperature=current_temp,
-            c_puct=c_puct,
-            parallel_workers=parallel_workers,
-            tree=tree
-        )
-        
+        try:
+            move, _, tree = select_move_with_mcts(
+                board, 
+                model, 
+                device,
+                num_simulations=num_simulations,
+                temperature=current_temp,
+                c_puct=c_puct,
+                parallel_workers=parallel_workers, 
+                tree=tree,
+                time_limit=5.0  # Add time limit to avoid hangs
+            )
+        except Exception as e:
+            print(f"MCTS error: {e}. Falling back to direct move selection.")
+            # Fallback to direct move selection if MCTS fails
+            input_tensor = torch.tensor(board_to_tensor(board, move_number), dtype=torch.float32).unsqueeze(0).to(device)
+            with torch.no_grad():
+                policy_logits, _ = model(input_tensor)
+            policy = F.softmax(policy_logits, dim=1).squeeze().cpu().numpy()
+            
+            legal_moves = list(board.legal_moves)
+            move_probs = np.zeros(len(legal_moves))
+            
+            for move_idx, move in enumerate(legal_moves):
+                move_index = get_move_index(move)
+                if move_index < len(policy):
+                    move_probs[move_idx] = policy[move_index]
+                    
+            if np.sum(move_probs) <= 1e-10:
+                move_probs = np.ones(len(legal_moves)) / len(legal_moves)
+            else:
+                move_probs = move_probs / np.sum(move_probs)
+                
+            move = np.random.choice(legal_moves, p=move_probs)
+            
         if move is None:
             break
             
@@ -219,13 +265,17 @@ def generate_mcts_game(model, device, temperature=1.0, num_simulations=500,
         board.push(move)
         node = node.add_variation(move)
         move_number += 1
+        
+        # Periodic memory cleanup during game generation
+        if move_number % 20 == 0:
+            clear_memory()
     
     # Set result header based on game outcome
     if board.is_checkmate():
         game.headers["Result"] = "0-1" if board.turn == chess.WHITE else "1-0"
     elif board.is_stalemate() or board.is_insufficient_material():
         game.headers["Result"] = "1/2-1/2"
-    elif board.is_fifty_moves() or board.is_repetition(3):
+    elif board.is_fifty_moves() or board.is_repetition(3) or move_number > max_moves:
         game.headers["Result"] = "1/2-1/2"
     else:
         game.headers["Result"] = "*"  # Unfinished
