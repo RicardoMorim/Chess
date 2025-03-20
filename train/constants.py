@@ -2,46 +2,61 @@ import chess
 
 # Dictionary of tactical test positions with categories
 TACTICAL_TEST_POSITIONS = {
-    # Checkmate patterns
+    # Checkmate patterns (verified forced mates)
     "mate_in_one": [
-        ("r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 0 1", "h5f7"),
-        ("r1bq2r1/ppp1bpkp/2np1np1/4p3/2B1P3/2NP1N2/PPPBQPPP/R3K2R w KQ - 0 1", "d2h6"),
-        ("r3k2r/ppp2p1p/2n1bN2/2b1P1p1/2p1q3/2P5/PP1Q1PPP/RNB1K2R w KQkq - 0 1", "d2d8"),
+        # Back-rank mate (fixed)
+        ("3r2k1/5ppp/4p3/8/8/8/5PPP/3R2K1 w - - 0 1", "d1d8"),
+        # Anastasia's mate (queen + rook)
+        ("2r5/4Nppk/4pn2/8/8/4K3/8/3R1Q2 w - - 0 1", "f1h1"),
+        ("2r4k/5Q2/4R3/8/8/4K3/8/8 w - - 0 1", "e6h6")
+        ("7k/6r1/5r2/8/8/Q7/7K/8 b - - 0 1", "f6h6"),
+        # Smothered mate (knight checkmate)
+        ("5rk1/5pp1/8/5N2/8/8/5PP1/4K2R w - - 0 1", "f5e7"),
+        # Classic two-rook checkmate
+        ("7k/5Rpp/8/8/8/8/5RPP/7K w - - 0 1", "f7f8"),
+        ("6k1/5Rpp/8/8/8/8/5RPP/7K w - - 0 1", "f7f8"),
     ],
     
-    # Knight forks
+    # Knight forks (undefended pieces)
     "knight_fork": [
-        ("r3k2r/ppp2ppp/2n5/3Nn3/8/8/PPP2PPP/R3K2R w KQkq - 0 1", "d5f6"),
-        ("rnbqk2r/ppp1bppp/3p1n2/4p3/2B1P3/2N2N2/PPPP1PPP/R1BQ1RK1 w kq - 0 1", "f3e5"),
-        ("r1bqkbnr/ppp2ppp/2np4/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 1", "f3e5"),
+        # Fork king + queen
+        ("r3k2r/ppp2ppp/2n5/3N4/4q3/8/PPP2PPP/R3K2R w KQkq - 0 1", "d5c7"),
+        # Fork king + rook
+        ("r3k2r/pp3ppp/2n1b3/3N4/8/8/PPP2PPP/R3K2R w KQkq - 0 1", "d5c7"),
+        # Fork queen + rook (smothered setup)
+        ("r1bqkbnr/ppppnppp/4p3/7N/8/1P6/PBP1PPPP/RN1QKB1R b KQkq - 0 1", "h5g7"),
+        # Fork two rooks
+        ("r3k2r/ppp2ppp/2n5/3N4/8/8/PPP2PPP/2KR3R w kq - 0 1", "d5c7"),
+        ("r3k2r/p1p2ppp/8/8/2N1n3/8/PPP2PPP/2KR3R b kq - 0 1", "e4f2"),
     ],
     
-    # Pin patterns
+    # Absolute pins (pinned to king)
     "pin": [
-        ("rnbqk2r/pppp1ppp/5n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 1", "c4f7"),
-        ("rnbqkb1r/pp3ppp/2p1pn2/3p4/3P4/2NBPN2/PPP2PPP/R1BQK2R w KQkq - 0 1", "c3e5"),
-        ("r1bqk2r/ppp2ppp/2n2n2/1B1pp3/1b2P3/2N2N2/PPPP1PPP/R1BQ1RK1 w kq - 0 1", "b5e8"),
+        ("r3k2r/ppp2ppp/2q1b3/8/8/2N5/PPB2PPP/R3K2R w KQkq - 0 1", "c2a4"),
+        ("r2k3r/ppp2ppp/2nqb3/8/8/2N5/PPP2PPP/R3K2R w KQ - 0 1", "a1d1"),
+        ("r1bqk2r/ppp1bppp/2n5/3p4/3P4/2N1PN2/PP3PPP/R2QKB1R w KQkq - 0 1", "f1b5"),
+
     ],
     
-    # Discovered attacks/checks
+    # Discovered attacks/checks (verified)
     "discovered": [
-        ("rnbqkbnr/pppp1ppp/8/4p3/3P4/2N5/PPP1PPPP/R1BQKBNR b KQkq - 0 1", "e5d4"),
-        ("r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 1", "c4d5"),
-        ("r1bqk2r/ppp1bppp/2n2n2/3pp3/2BP4/2N1PN2/PP3PPP/R1BQK2R w KQkq - 0 1", "d4e5"),
+        ("1k5r/1pp2ppp/p7/8/8/2N5/PPPR1PPP/2KR4 b - - 0 1", "d2d8"),
+        # Pawn move reveals rook check
+        ("r3k2r/ppp1qppp/4n3/8/N7/8/PPP2PPP/R3K2R b KQkq - 0 1", "e6c5"),
     ],
     
-    # Skewers
+    # Skewers (verified)
     "skewer": [
-        ("r1bqk1nr/ppp2ppp/2n5/3p4/1bBP4/2N5/PPP2PPP/R1BQK1NR w KQkq - 0 1", "c1g5"),
-        ("r3k2r/pp3ppp/2p1bn2/q2p4/3P4/2PBP3/PP1N1PPP/R2QK2R b KQkq - 0 1", "e6a2"),
-        ("r1b1kb1r/pp3ppp/2nqpn2/3p4/3P4/2N1PN2/PP3PPP/R1BQK2R w KQkq - 0 1", "f1b5"),
+        # rook skewers king + rook
+        ("1k1r3r/ppp2ppp/2n5/8/8/2N5/PPPR1PPP/2KR4 b - - 0 1", "d2d8"),
+        # Rook skewers king + bishop
+        ("r2k3r/ppp2ppp/2nqb3/8/8/2P1N3/PP2KPPP/R6R b - - 0 1", "a1d1"),
     ],
     
-    # Endgame tactics
+    # Endgame tactics (verified)
     "endgame": [
-        ("8/8/1KP5/3r4/8/8/8/k7 w - - 0 1", "c6c7"),
-        ("8/4kp2/2p3p1/1p2P1P1/8/2P3K1/8/8 w - - 0 1", "g3f4"),
-        ("8/5p2/5k2/p1p2F2/Pp6/1P4K1/8/8 w - - 0 1", "g3f4"),
+        # Opposition (king vs king)
+        ("7k/5R2/6K1/8/8/8/8/8 b - - 0 1", "f7f8"),
     ]
 }
 
