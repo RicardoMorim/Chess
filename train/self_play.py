@@ -661,6 +661,7 @@ def run_self_play_training(model, device, save_path, state_file, num_games=50, n
             # Save best model separately
             torch.save(model.state_dict(), save_path.replace('.pth', '_best.pth'))
             print(f"New best model saved with accuracy: {best_accuracy:.2%}")
+        total_positions += len(self_play_samples)
         
         # Clean up between iterations
         del self_play_samples
@@ -672,7 +673,6 @@ def run_self_play_training(model, device, save_path, state_file, num_games=50, n
         print("Pausing for 5 seconds to allow system recovery...")
         time.sleep(5)
         
-        total_positions += len(self_play_samples)
     
     print(f"\n=== SELF-PLAY TRAINING COMPLETED ===")
     print(f"Processed {total_positions} positions across {num_iterations} iterations")

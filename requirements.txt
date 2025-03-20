@@ -2,3 +2,4 @@ chess
 pygame
 numpy
 torch
+psutil

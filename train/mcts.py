@@ -183,6 +183,23 @@ def select_move_with_mcts(board: chess.Board, model, device, num_simulations: in
     moves = list(visit_counts.keys())
     if not moves:  # No legal moves
         return None, np.array([]), None
+            
+    counts = np.array([visit_counts[m] for m in moves], dtype=np.float32)
+    if temperature == 0:
+        best_idx = np.argmax(counts)
+        best_move = moves[best_idx]
+        pi = np.zeros_like(counts)
+        pi[best_idx] = 1.0
+    else:
+        counts = np.power(counts, 1.0 / temperature)
+        # Add this check to prevent division by zero
+        if np.sum(counts) > 0:
+            pi = counts / np.sum(counts)
+        else:
+            # If all counts are zero, use uniform distribution
+            pi = np.ones_like(counts) / len(counts) if len(counts) > 0 else np.array([])
+            
+        best_move = np.random.choice(moves, p=pi) if len(moves) > 0 else None
         
     counts = np.array([visit_counts[m] for m in moves], dtype=np.float32)
     if temperature == 0:
