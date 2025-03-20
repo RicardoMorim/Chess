@@ -8,7 +8,7 @@ TACTICAL_TEST_POSITIONS = {
         ("3r2k1/5ppp/4p3/8/8/8/5PPP/3R2K1 w - - 0 1", "d1d8"),
         # Anastasia's mate (queen + rook)
         ("2r5/4Nppk/4pn2/8/8/4K3/8/3R1Q2 w - - 0 1", "f1h1"),
-        ("2r4k/5Q2/4R3/8/8/4K3/8/8 w - - 0 1", "e6h6")
+        ("2r4k/5Q2/4R3/8/8/4K3/8/8 w - - 0 1", "e6h6"),
         ("7k/6r1/5r2/8/8/Q7/7K/8 b - - 0 1", "f6h6"),
         # Smothered mate (knight checkmate)
         ("5rk1/5pp1/8/5N2/8/8/5PP1/4K2R w - - 0 1", "f5e7"),
