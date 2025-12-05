@@ -1,6 +1,6 @@
-# Chess Game with AI
+# Chess AI Training System
 
-This is a simple chess game implemented in Python using the Pygame library. The game includes a basic graphical user interface and allows the player to play against an AI opponent. The project also features two AI models built with Pytorch. One of them smaller and the other one bigger.
+A comprehensive deep learning system for training a neural network chess AI, featuring both a playable interface and a sophisticated training pipeline with multiple training approaches.
 
 ## Table of Contents
 
@@ -8,6 +8,7 @@ This is a simple chess game implemented in Python using the Pygame library. The 
 - [Dependencies](#dependencies)
 - [Installation](#installation)
 - [Usage](#usage)
+- [Training](#training)
 - [Game Controls](#game-controls)
 - [AI Engine](#ai-engine)
 - [Contributing](#contributing)
@@ -15,10 +16,15 @@ This is a simple chess game implemented in Python using the Pygame library. The 
 
 ## Features
 
-- Graphical chessboard with a user-friendly interface.
-- Ability to play against an AI opponent.
-- AI engine with basic evaluation function and minimax algorithm with alpha-beta pruning.
-- Two neural AI models created with PyTorch and TensorFlow.
+- **Graphical chessboard** with a user-friendly interface for playing games
+- **Multi-mode training system** that alternates between professional games, regular games, and self-play
+- **Reinforcement learning** through self-play with Monte Carlo Tree Search (MCTS)
+- **Tactical pattern recognition** via puzzle training
+- **Dynamic batch sizing** to optimize GPU memory usage
+- **Mixed precision training** for faster computation
+- **Two neural network architectures**:
+  - Big model: 10 residual blocks (20 input channels)
+  - Small model: 5 residual blocks (18 input channels)
 
 ## Dependencies
 
@@ -33,18 +39,14 @@ Before running the chess game, ensure you have the following dependencies instal
    pip install -r requirements.txt
 
 -> chess: A chess library for Python.
-
 -> pygame: A set of Python modules designed for writing video games.
-
 -> numpy: A fundamental package for scientific computing with Python.
-
--> torch: An open-source machine learning library used for the other AI model.
-
-
+-> torch: An open-source machine learning library for neural networks.
+-> psutil: For monitoring memory usage during training.
 
 These libraries are specified in the requirements.txt file and will be installed automatically during the setup process.
 
-# Instalation
+# Installation
 1. Clone the repository:
 -> git clone https://github.com/your-username/chess-game.git
 
@@ -70,10 +72,11 @@ cd train
 2. Download pgn files. I used Lichess and PGN mentor. Place puzzles (both pgn and csv as lichess outputs in csv, but the code handles both) in `/train/chess_pgns/puzzles`. Place high elo games in `/train/chess_pgns` and place professional games in `/train/chess_pgn/pros`.
 
 3. Start training by choosing one of following commands:
-- Default usage (will train with all modes, switching mode every 5 iterations)
+- Default usage (will train with all modes, switching mode every few iterations)
 ```bash
 python train.py
 ```
+
 - Pro game training
 ```bash
 python train.py pro
@@ -99,25 +102,43 @@ python train.py self-play --fast-mtcs
 python train.py self-play --no-mcts
 ```
 
-> **NOTE:** All training modes will use the puzzles in the training and do a simple tactical training. 
+- Choose model size:
+```bash
+python train.py --model small
+```
 
-# Note
-There are different code snippets in the start_game_function and in the play_engine_move in the main.py file, allowing you to play against various AI models or observe AI vs AI matches.
+4. Training features:
+- **Dynamic batch sizing**: Automatically determines optimal batch size for your GPU
+- **Category-based puzzle training**: Weights different tactical patterns differently (mates, forks, pins)
+- **Memory management**: Periodically cleans up memory to avoid OOM errors
+- **Progressive training parameters**: Weights adjust as training progresses
+- **Checkpoint saving**: Save progress between training sessions
+- **Tactical recognition testing**: Periodically tests model on tactical positions
 
 # Game Controls
 -> Click on a piece to select it.
-
 -> Drag the selected piece to the desired square to make a move.
-
 -> Release the mouse button to complete the move.
 
 # AI Engine
-The AI engine uses a basic evaluation function and the minimax algorithm with alpha-beta pruning to make decisions. The depth of the search tree is configurable in the main.py file.
+The AI engine features two approaches:
 
-Additionally, two neural AI models are included:
+1. **Neural Network Models**:
+   - **Big Model**: 20 input channels, 10 residual blocks with dual policy/value head
+   - **Small Model**: 18 input channels, 5 residual blocks with dual policy/value head
 
--> PyTorch Model: A neural network model trained with PyTorch for enhanced decision-making.
-You can choose between these AI models in the game settings.
+2. **Monte Carlo Tree Search (MCTS)**:
+   - Policy-guided tree search with UCB formula
+   - Parallel MCTS for faster move selection
+   - Dirichlet noise at root for exploration (AlphaZero style)
+   - Tree reuse between moves
+
+3. **Tactical Recognition**:
+   - Specialized training on chess puzzles
+   - Category-based learning (checkmates, forks, pins)
+   - Periodic verification of tactical ability
+
+You can choose between these AI modes in the game settings or training parameters.
 
 # Contributing
 Contributions are welcome! Feel free to open issues or pull requests for any improvements or new features.

@@ -4,11 +4,11 @@ import chess
 import chess.pgn
 import numpy as np
 import time
-from typing import List, Tuple, Optional
-import gc
+import math
 import psutil
 import os
 import random
+import multiprocessing  # Add import for CPU core detection
 
 from data import board_to_tensor, get_move_index, SelfPlayDataset
 from utils import clear_memory, test_tactical_recognition
@@ -35,6 +35,9 @@ def generate_reinforcement_learning_samples(model, device, num_games=100, reward
     """
     samples = []
     model.eval()
+    
+    # Determine input channels from model
+    input_channels = model.input_channels if hasattr(model, 'input_channels') else 20
     
     # Parallel game generation
     batch_size = min(16, num_games)
@@ -69,6 +72,7 @@ def generate_reinforcement_learning_samples(model, device, num_games=100, reward
     current_batch_size = 4
     max_batch_size = 16
     batch_success_count = 0
+    input_channels = model.input_channels if hasattr(model, 'input_channels') else 20
     
     while any(active_mask) and completed_games < num_games:
         # Get all active boards
@@ -76,12 +80,13 @@ def generate_reinforcement_learning_samples(model, device, num_games=100, reward
         
         if not active_indices:
             break
+        
             
         # Process in dynamic batches
         try:
             # Try current batch size
             input_tensors = torch.stack([
-                torch.tensor(board_to_tensor(active_games[i], move_numbers[i]), dtype=torch.float32)
+                torch.tensor(board_to_tensor(active_games[i], move_numbers[i], input_channels), dtype=torch.float32)
                 for i in active_indices[:current_batch_size]
             ]).to(device)
             
@@ -198,8 +203,7 @@ def generate_reinforcement_learning_samples(model, device, num_games=100, reward
                 sim_board.push(sim_move)
                 
                 # For efficiency, just use the model's direct evaluation 
-                # A full MCTS would simulate to the end, but that's expensive
-                sim_tensor = torch.tensor(board_to_tensor(sim_board, move_numbers[i] + 1), dtype=torch.float32).unsqueeze(0).to(device)
+                sim_tensor = torch.tensor(board_to_tensor(sim_board, move_numbers[i] + 1, input_channels), dtype=torch.float32).unsqueeze(0).to(device)
                 
                 with torch.no_grad():
                     _, sim_value = model(sim_tensor)
@@ -220,7 +224,7 @@ def generate_reinforcement_learning_samples(model, device, num_games=100, reward
                 visit_policy = move_probs
             
             # Store current position for later training
-            board_histories[i].append(board_to_tensor(board, move_numbers[i]))
+            board_histories[i].append(board_to_tensor(board, move_numbers[i], input_channels))
             
             # Select move - early in training, explore more. Later, be more greedy.
             exploration_threshold = 0.8 + 0.1 * (1 - progress_factor)  # Decreases from 0.9 to 0.8 over time
@@ -300,6 +304,8 @@ def generate_self_play_games(model, device, num_games=100, use_mcts=True):
     games = []
     model.eval()
     
+    input_channels = model.input_channels if hasattr(model, 'input_channels') else 20
+
     if use_mcts:
         # Use MCTS for higher quality games (but slower generation)
         for i in range(num_games):
@@ -307,7 +313,7 @@ def generate_self_play_games(model, device, num_games=100, use_mcts=True):
                 print(f"Generating MCTS game {i+1}/{num_games}")
             game = generate_mcts_game(model, device, temperature=1.0, 
                                     num_simulations=100, c_puct=1.0, 
-                                    parallel_workers=4)
+                                    parallel_workers=4, input_channels=input_channels)
             games.append(game)
         return games
     
@@ -332,7 +338,7 @@ def generate_self_play_games(model, device, num_games=100, use_mcts=True):
             
         # Batch process all active boards
         input_tensors = torch.stack([
-            torch.tensor(board_to_tensor(active_games[i], move_numbers[i]), dtype=torch.float32)
+            torch.tensor(board_to_tensor(active_games[i], move_numbers[i], input_channels=input_channels), dtype=torch.float32)
             for i in active_indices
         ]).to(device)
         
@@ -399,18 +405,19 @@ def generate_self_play_games(model, device, num_games=100, use_mcts=True):
     return games[:num_games]  # Ensure we only return the requested number
 
 
-def run_self_play_training(model, device, save_path, state_file, num_games=50, num_iterations=5, use_mcts=False, fast_mcts=False):
+def run_self_play_training(model, device, save_path, state_file, puzzle_dataloader=None, 
+                         num_games=50, num_iterations=5, use_mcts=False, fast_mcts=False):
     """Run self-play training to improve the model through reinforcement learning"""
     print(f"\n=== STARTING SELF-PLAY REINFORCEMENT LEARNING ===")
     print(f"Training for {num_iterations} iterations with {num_games} games per iteration")
     
     if use_mcts and fast_mcts:
-        print("MCTS: Fast mode (balanced speed/quality)")
+        print("MCTS: Fast mode with integrated tactical training (balanced speed/quality)")
     elif use_mcts:
-        print("MCTS: Full mode (highest quality)")
+        print("MCTS: Full mode with integrated tactical training (highest quality)")
     else:
-        print("MCTS: Disabled (fastest training)")
-    
+        print("MCTS: Disabled with integrated tactical training (fastest training)")
+    input_channels = model.input_channels if hasattr(model, 'input_channels') else 20
     # Initialize optimizer and loss functions
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0005, weight_decay=1e-5)
     policy_loss_fn = torch.nn.CrossEntropyLoss()
@@ -418,8 +425,8 @@ def run_self_play_training(model, device, save_path, state_file, num_games=50, n
     scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
     
     # Lower batch size to reduce memory pressure
-    batch_size = min(16, get_optimal_batch_size(model, device, starting_size=32, min_size=8) // 4)
-    print(f"Using conservative batch size: {batch_size}")
+    batch_size = get_optimal_batch_size(model, device, starting_size=32, min_size=8)
+    print(f"Using optimal batch size: {batch_size}")
     
     # Track progress across iterations
     total_positions = 0
@@ -454,7 +461,7 @@ def run_self_play_training(model, device, save_path, state_file, num_games=50, n
             if fast_mcts:
                 # Fast MCTS settings - use simplified MCTS algorithm
                 print("Using simplified MCTS for faster training")
-                num_simulations = 30
+                num_simulations = 50
                 adjusted_games = max(10, min(20, num_games // 5))
                 
                 games = []
@@ -480,8 +487,8 @@ def run_self_play_training(model, device, save_path, state_file, num_games=50, n
                         continue
             else:
                 # Full MCTS settings - more thorough but slower
-                num_simulations = 50
-                parallel_workers = 3
+                num_simulations = 200
+                parallel_workers = 5
                 adjusted_games = max(5, min(10, num_games // 10))
                 
                 games = []
@@ -497,7 +504,8 @@ def run_self_play_training(model, device, save_path, state_file, num_games=50, n
                             temperature=1.0,
                             num_simulations=num_simulations,
                             c_puct=1.0,
-                            parallel_workers=parallel_workers
+                            parallel_workers=parallel_workers,
+                            input_channels=input_channels
                         )
                         games.append(game)
                         
@@ -526,7 +534,7 @@ def run_self_play_training(model, device, save_path, state_file, num_games=50, n
                     move_number = 1
                     
                     for move in game.mainline_moves():
-                        board_history.append(board_to_tensor(board, move_number))
+                        board_history.append(board_to_tensor(board, move_number, input_channels))
                         move_history.append(get_move_index(move))
                         board.push(move)
                         move_number += 1
@@ -542,8 +550,6 @@ def run_self_play_training(model, device, save_path, state_file, num_games=50, n
                     # Clear references to help with memory
                     del board_history
                     del move_history
-                    if len(self_play_samples) > 10000:  # Limit to reasonable number
-                        break
             else:
                 print("Failed to generate valid self-play games with MCTS. Falling back to non-MCTS.")
                 # Fall back to non-MCTS
@@ -580,22 +586,17 @@ def run_self_play_training(model, device, save_path, state_file, num_games=50, n
             print("Failed to generate enough valid self-play samples. Skipping iteration.")
             continue
             
-        # Limit samples to avoid memory issues
-        if len(self_play_samples) > 50000:
-            print(f"Too many samples ({len(self_play_samples)}), limiting to 50000")
-            random.shuffle(self_play_samples)
-            self_play_samples = self_play_samples[:50000]
             
         print(f"Generated {len(self_play_samples)} training positions from self-play")
         
         # Phase 2: Train on the generated positions with smaller batch size and more frequent cleanup
-        print("Training on self-play positions...")
-        rl_dataset = SelfPlayDataset(self_play_samples)
+        print("Training on self-play positions with integrated tactical training...")
+        rl_dataset = SelfPlayDataset(self_play_samples, "small" if model.is_small_model() else "big")
         rl_dataloader = torch.utils.data.DataLoader(
             rl_dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=1,  # Reduce workers to 1
+            num_workers=4, 
             pin_memory=True
         )
         
@@ -604,74 +605,278 @@ def run_self_play_training(model, device, save_path, state_file, num_games=50, n
         total_rl_loss = 0
         batch_count = 0
         
-        for batch in rl_dataloader:
-            inputs, policy_targets, value_targets = batch
-            inputs = inputs.to(device)
-            policy_targets = policy_targets.to(device)
-            value_targets = value_targets.to(device)
-            
-            optimizer.zero_grad()
-            
-            if scaler:  # Use mixed precision if available
-                with torch.amp.autocast(device_type="cuda"):
+        # Determine if we can train on puzzles
+        can_train_puzzles = puzzle_dataloader is not None
+        puzzle_policy_weight = 3.0
+        puzzle_value_weight = 2.0
+        puzzle_batches_per_rl_batch = 10  # Train on 10 puzzle batches after each RL batch
+        num_epochs = 5
+
+        for epoch in range(num_epochs):
+            print(f"Epoch {epoch+1}/{num_epochs}")
+            total_rl_loss = 0
+            batch_count = 0
+    
+        
+            for batch in rl_dataloader:
+                # Train on self-play batch
+                inputs, policy_targets, value_targets = batch
+                inputs = inputs.to(device)
+                policy_targets = policy_targets.to(device)
+                value_targets = value_targets.to(device)
+                
+                optimizer.zero_grad()
+                
+                # Regular self-play training code...
+                if scaler:
+                    with torch.amp.autocast(device_type="cuda"):
+                        policy_logits, value_pred = model(inputs)
+                        policy_loss = policy_loss_fn(policy_logits, policy_targets)
+                        value_loss = value_loss_fn(value_pred.squeeze(), value_targets)
+                        loss = policy_weight * policy_loss + value_weight * value_loss
+                    
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
                     policy_logits, value_pred = model(inputs)
                     policy_loss = policy_loss_fn(policy_logits, policy_targets)
                     value_loss = value_loss_fn(value_pred.squeeze(), value_targets)
                     loss = policy_weight * policy_loss + value_weight * value_loss
+                    
+                    loss.backward()
+                    optimizer.step()
                 
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                policy_logits, value_pred = model(inputs)
-                policy_loss = policy_loss_fn(policy_logits, policy_targets)
-                value_loss = value_loss_fn(value_pred.squeeze(), value_targets)
-                loss = policy_weight * policy_loss + value_weight * value_loss
+                total_rl_loss += loss.item()
+                batch_count += 1
                 
-                loss.backward()
-                optimizer.step()
+                if batch_count % 5 == 0:
+                    print(f"  Self-play batch {batch_count}, Loss: {loss.item():.4f}")
+                
+                # Now train on puzzle batches after each self-play batch
+                if can_train_puzzles:
+                    print(f"  Training on puzzle batches after self-play batch {batch_count}...")
+                    puzzle_losses = []
+                    
+                    # Train on multiple puzzle batches for each self-play batch
+                    for _ in range(puzzle_batches_per_rl_batch):
+                        # Get a batch of puzzles
+                        puzzle_batch = next(iter(puzzle_dataloader))
+                        
+                        # Handle both 3-element and 4-element batches
+                        if len(puzzle_batch) == 3:
+                            p_inputs, p_policy_targets, p_value_targets = puzzle_batch
+                            categories = ["default"] * p_inputs.size(0)
+                        else:
+                            p_inputs, p_policy_targets, p_value_targets, categories = puzzle_batch
+                        
+                        p_inputs = p_inputs.to(device)
+                        p_policy_targets = p_policy_targets.to(device)
+                        p_value_targets = p_value_targets.to(device)
+                        
+                        optimizer.zero_grad()
+                        
+                        # Training with category-specific weighting
+                        if scaler:
+                            with torch.amp.autocast(device_type="cuda"):
+                                p_policy_logits, p_value_pred = model(p_inputs)
+                                
+                                # Apply category weights
+                                puzzle_loss = 0
+                                for i, category in enumerate(categories):
+                                    # Prioritize checkmates and endgames
+                                    if category == "mate_in_one":
+                                        cat_weight = 5.0
+                                    elif category == "endgame":
+                                        cat_weight = 3.0
+                                    elif category in ["knight_fork", "pin", "discovered"]:
+                                        cat_weight = 2.0
+                                    else:
+                                        cat_weight = 1.0
+                                    
+                                    p_loss = policy_loss_fn(p_policy_logits[i:i+1], p_policy_targets[i:i+1])
+                                    v_loss = value_loss_fn(p_value_pred[i:i+1].squeeze(), p_value_targets[i:i+1])
+                                    sample_loss = (puzzle_policy_weight * p_loss + puzzle_value_weight * v_loss) * cat_weight
+                                    puzzle_loss += sample_loss
+                                
+                            scaler.scale(puzzle_loss).backward()
+                            scaler.step(optimizer)
+                            scaler.update()
+                        else:
+                            # Non-scaler version of puzzle training
+                            p_policy_logits, p_value_pred = model(p_inputs)
+                            puzzle_loss = 0
+                            
+                            for i, category in enumerate(categories):
+                                # Prioritize checkmates and endgames
+                                if category == "mate_in_one":
+                                    cat_weight = 5.0
+                                elif category == "endgame":
+                                    cat_weight = 3.0
+                                elif category in ["knight_fork", "pin", "discovered"]:
+                                    cat_weight = 2.0
+                                else:
+                                    cat_weight = 1.0
+                                
+                                p_loss = policy_loss_fn(p_policy_logits[i:i+1], p_policy_targets[i:i+1])
+                                v_loss = value_loss_fn(p_value_pred[i:i+1].squeeze(), p_value_targets[i:i+1])
+                                sample_loss = (puzzle_policy_weight * p_loss + puzzle_value_weight * v_loss) * cat_weight
+                                puzzle_loss += sample_loss
+                            
+                            puzzle_loss.backward()
+                            optimizer.step()
+                        
+                        puzzle_losses.append(puzzle_loss.item())
+                    
+                    if puzzle_losses:
+                        avg_puzzle_loss = sum(puzzle_losses) / len(puzzle_losses)
+                        print(f"    Puzzle batch loss: {avg_puzzle_loss:.4f}")
+                
+                # Memory cleanup every few batches
+                if batch_count % 10 == 0:
+                    clear_memory()
             
-            total_rl_loss += loss.item()
-            batch_count += 1
+            if batch_count > 0:
+                avg_loss = total_rl_loss / batch_count
+                print(f"Avg training loss: {avg_loss:.4f}")
             
-            if batch_count % 10 == 0:
-                print(f"  Batch {batch_count}, Loss: {loss.item():.4f}")
+            # Save checkpoint after each iteration
+            torch.save(model.state_dict(), save_path)
+            print(f"Model checkpoint saved after iteration {iteration+1}")
+            
+            # Test tactical recognition after each iteration
+            print("Testing tactical recognition...")
+            test_accuracy = test_tactical_recognition(model, device)
+            print(f"Tactical recognition accuracy: {test_accuracy:.2%}")
+            
+            if test_accuracy > best_accuracy:
+                best_accuracy = test_accuracy
+                # Save best model separately
+                torch.save(model.state_dict(), save_path.replace('.pth', '_best.pth'))
+                print(f"New best model saved with accuracy: {best_accuracy:.2%}")
+            total_positions += len(self_play_samples)
+            
+            # Clean up between iterations
+            del self_play_samples
+            del rl_dataset
+            del rl_dataloader
+            clear_memory()
+            
+            # Add a brief pause to let system cool down
+            print("Pausing for 5 seconds to allow system recovery...")
+            time.sleep(5)
+            
+            # ADD THIS SECTION: Integrated tactical training after each self-play iteration
+            if puzzle_dataloader is not None:
+                print("\n=== INTEGRATED TACTICAL TRAINING PHASE ===")
                 
-            # More frequent cleanup
-            if batch_count % 50 == 0:
-                # Force garbage collection more aggressively 
-                del inputs, policy_targets, value_targets, policy_logits, value_pred
-                clear_memory()
-        
-        if batch_count > 0:
-            avg_loss = total_rl_loss / batch_count
-            print(f"Avg training loss: {avg_loss:.4f}")
-        
-        # Save checkpoint after each iteration
-        torch.save(model.state_dict(), save_path)
-        print(f"Model checkpoint saved after iteration {iteration+1}")
-        
-        # Test tactical recognition after each iteration
-        print("Testing tactical recognition...")
-        test_accuracy = test_tactical_recognition(model, device)
-        print(f"Tactical recognition accuracy: {test_accuracy:.2%}")
-        
-        if test_accuracy > best_accuracy:
-            best_accuracy = test_accuracy
-            # Save best model separately
-            torch.save(model.state_dict(), save_path.replace('.pth', '_best.pth'))
-            print(f"New best model saved with accuracy: {best_accuracy:.2%}")
-        total_positions += len(self_play_samples)
-        
-        # Clean up between iterations
-        del self_play_samples
-        del rl_dataset
-        del rl_dataloader
-        clear_memory()
-        
-        # Add a brief pause to let system cool down
-        print("Pausing for 5 seconds to allow system recovery...")
-        time.sleep(5)
+                # Create optimizer specifically for tactics
+                tactical_optimizer = torch.optim.Adam(model.parameters(), lr=0.0008)
+                
+                # Calculate dynamic epochs based on progress - more later in training
+                tactical_epochs = 2 + int(iteration / num_iterations * 3)  # 2-5 epochs
+                print(f"Running tactical training for {tactical_epochs} epochs")
+                
+                # Weight tactical positions even higher than regular ones
+                puzzle_policy_weight = 3.0
+                puzzle_value_weight = 2.0
+                
+                # Tactical training loop
+                model.train()
+                total_loss = 0
+                batch_count = 0
+                
+                for epoch in range(tactical_epochs):
+                    for batch in puzzle_dataloader:
+                        # Handle both 3-element and 4-element batches
+                        if len(batch) == 3:
+                            inputs, policy_targets, value_targets = batch
+                            categories = ["default"] * inputs.size(0)
+                        else:
+                            inputs, policy_targets, value_targets, categories = batch
+                        
+                        inputs = inputs.to(device)
+                        policy_targets = policy_targets.to(device)
+                        value_targets = value_targets.to(device)
+                        
+                        tactical_optimizer.zero_grad()
+                        
+                        # Training with category-specific weighting
+                        if scaler:
+                            with torch.amp.autocast(device_type="cuda"):
+                                policy_logits, value_pred = model(inputs)
+                                
+                                # Weight different tactical positions differently
+                                loss = 0
+                                for i, category in enumerate(categories):
+                                    # Get single sample
+                                    policy_logit = policy_logits[i:i+1]
+                                    policy_target = policy_targets[i:i+1]
+                                    value_target = value_targets[i:i+1]
+                                    value_p = value_pred[i:i+1]
+                                    
+                                    # Prioritize checkmates and endgames
+                                    if category == "mate_in_one":
+                                        cat_weight = 5.0
+                                    elif category == "endgame":
+                                        cat_weight = 3.0
+                                    elif category in ["knight_fork", "pin", "discovered"]:
+                                        cat_weight = 2.0
+                                    else:
+                                        cat_weight = 1.0
+                                    
+                                    p_loss = policy_loss_fn(policy_logit, policy_target)
+                                    v_loss = value_loss_fn(value_p.squeeze(), value_target)
+                                    sample_loss = (puzzle_policy_weight * p_loss + puzzle_value_weight * v_loss) * cat_weight
+                                    loss += sample_loss
+                                
+                            scaler.scale(loss).backward()
+                            scaler.step(tactical_optimizer)
+                            scaler.update()
+                        else:
+                            # Similar non-scaler code
+                            policy_logits, value_pred = model(inputs)
+                            loss = 0
+                            
+                            for i, category in enumerate(categories):
+                                # Get single sample
+                                policy_logit = policy_logits[i:i+1]
+                                policy_target = policy_targets[i:i+1]
+                                value_target = value_targets[i:i+1]
+                                value_p = value_pred[i:i+1]
+                                
+                                # Prioritize checkmates and endgames
+                                if category == "mate_in_one":
+                                    cat_weight = 5.0
+                                elif category == "endgame":
+                                    cat_weight = 4.0
+                                elif category in ["knight_fork", "pin", "discovered"]:
+                                    cat_weight = 3.0
+                                else:
+                                    cat_weight = 1.0
+                                
+                                p_loss = policy_loss_fn(policy_logit, policy_target)
+                                v_loss = value_loss_fn(value_p.squeeze(), value_target)
+                                sample_loss = (puzzle_policy_weight * p_loss + puzzle_value_weight * v_loss) * cat_weight
+                                loss += sample_loss
+                            
+                            loss.backward()
+                            tactical_optimizer.step()
+                        
+                        total_loss += loss.item()
+                        batch_count += 1
+                        
+                        # Process fewer batches per epoch to save time
+                        if batch_count % epoch == 5:
+                            break
+                    
+                    print(f"Tactical epoch {epoch+1}/{tactical_epochs}, loss: {loss.item():.4f}")
+                    
+                    # Memory cleanup after each tactical epoch
+                    clear_memory()
+
+                if batch_count > 0:
+                    print(f"Average tactical loss: {total_loss/batch_count:.4f}")
         
     
     print(f"\n=== SELF-PLAY TRAINING COMPLETED ===")
@@ -681,84 +886,127 @@ def run_self_play_training(model, device, save_path, state_file, num_games=50, n
 
 
 
-def simple_mcts_for_training(board, model, device, num_simulations=50, temperature=1.0):
-    """Simplified MCTS designed for stability during training"""
-    # Get initial policy from model
-    input_tensor = torch.tensor(board_to_tensor(board, board.fullmove_number), 
+class SimpleNode:
+    def __init__(self, board, move=None, parent=None, prior=0):
+        self.board = board
+        self.move = move
+        self.parent = parent
+        self.prior = prior
+        self.children = {}
+        self.visit_count = 0
+        self.value_sum = 0
+    
+    def value(self):
+        return self.value_sum / self.visit_count if self.visit_count > 0 else 0
+
+def simple_mcts_for_training(board, model, device, num_simulations=50, temperature=1.0, depth_limit=6):
+    """Enhanced MCTS with recursive search and backpropagation"""
+    # Create root node
+    root = SimpleNode(board)
+    input_channels = model.input_channels if hasattr(model, 'input_channels') else 20
+    # Initial policy from model
+    input_tensor = torch.tensor(board_to_tensor(board, board.fullmove_number, input_channels), 
                               dtype=torch.float32).unsqueeze(0).to(device)
     with torch.no_grad():
         policy_logits, _ = model(input_tensor)
     policy = F.softmax(policy_logits, dim=1).cpu().numpy().flatten()
     
-    # Get move probabilities for legal moves
+    # Expand root with all legal moves
     legal_moves = list(board.legal_moves)
-    move_probs = np.zeros(len(legal_moves))
-    
-    for i, move in enumerate(legal_moves):
+    for move in legal_moves:
         move_index = get_move_index(move)
-        if move_index < len(policy):
-            move_probs[i] = policy[move_index]
-    
-    # Normalize probabilities
-    if np.sum(move_probs) > 1e-8:
-        move_probs = move_probs / np.sum(move_probs)
-    else:
-        move_probs = np.ones(len(legal_moves)) / len(legal_moves)
-    
-    # Add Dirichlet noise to root
-    noise = np.random.dirichlet([0.3] * len(legal_moves))
-    move_probs = 0.75 * move_probs + 0.25 * noise
-    
-    # Track visit counts and values for each move
-    visits = np.zeros(len(legal_moves))
-    values = np.zeros(len(legal_moves))
-    
-    # Simplified simulation loop - no threading
-    for _ in range(num_simulations):
-        # Select move using UCB
-        best_score = -float('inf')
-        best_move_idx = -1
-        
-        for i in range(len(legal_moves)):
-            if visits[i] == 0:
-                score = move_probs[i] * 1000  # High priority for unexplored
-            else:
-                exploit = values[i] / visits[i]
-                explore = np.sqrt(np.log(np.sum(visits) + 1) / (visits[i] + 1e-8))
-                score = exploit + 2.0 * move_probs[i] * explore
-                
-            if score > best_score:
-                best_score = score
-                best_move_idx = i
-        
-        # Simulate selected move
-        move = legal_moves[best_move_idx]
+        prior = policy[move_index] if move_index < len(policy) else 0.001
         next_board = board.copy()
         next_board.push(move)
-        
-        # Get value from neural network
-        next_tensor = torch.tensor(board_to_tensor(next_board, next_board.fullmove_number), 
-                              dtype=torch.float32).unsqueeze(0).to(device)
-        with torch.no_grad():
-            _, value_tensor = model(next_tensor)
-        sim_value = -float(value_tensor.item())  # Negate for opponent's perspective
-        
-        # Update statistics
-        visits[best_move_idx] += 1
-        values[best_move_idx] += sim_value
+        root.children[move] = SimpleNode(next_board, move, root, prior)
     
-    # Apply temperature to visit distribution
+    # Add Dirichlet noise at root
+    if legal_moves:
+        noise = np.random.dirichlet([0.3] * len(legal_moves))
+        for i, move in enumerate(legal_moves):
+            root.children[move].prior = 0.75 * root.children[move].prior + 0.25 * noise[i]
+    
+    # Run simulations
+    for _ in range(num_simulations):
+        # Selection and expansion phase - traverse tree to leaf
+        node, depth = root, 0
+        while node.children and depth < depth_limit:
+            # Select child with highest UCB
+            best_score = -float('inf')
+            best_move = None
+            
+            for move, child in node.children.items():
+                # UCB formula
+                if child.visit_count == 0:
+                    score = 1000 + child.prior  # Prioritize unexplored
+                else:
+                    exploit = child.value()
+                    explore = 2.0 * child.prior * (np.sqrt(node.visit_count) / (1 + child.visit_count))
+                    score = exploit + explore
+                
+                if score > best_score:
+                    best_score = score
+                    best_move = move
+            
+            # Move down the tree
+            node = node.children[best_move]
+            depth += 1
+        
+        # Expand if node is not terminal and we're not at depth limit
+        if not node.board.is_game_over() and depth < depth_limit and not node.children:
+            # Get policy from model
+            input_channels = model.input_channels if hasattr(model, 'input_channels') else 20
+            input_tensor = torch.tensor(board_to_tensor(node.board, node.board.fullmove_number, input_channels), 
+                                     dtype=torch.float32).unsqueeze(0).to(device)
+            with torch.no_grad():
+                policy_logits, _ = model(input_tensor)
+            policy = F.softmax(policy_logits, dim=1).cpu().numpy().flatten()
+            
+            # Create children
+            for move in node.board.legal_moves:
+                move_index = get_move_index(move)
+                prior = policy[move_index] if move_index < len(policy) else 0.001
+                next_board = node.board.copy()
+                next_board.push(move)
+                node.children[move] = SimpleNode(next_board, move, node, prior)
+        
+        # Evaluate position
+        if node.board.is_game_over():
+            # Terminal position - real game result
+            if node.board.is_checkmate():
+                value = -1.0  # -1 because it's from the perspective of the player who just moved
+            else:
+                value = 0.0  # Draw
+        else:
+            # Use neural network for non-terminal positions
+            input_tensor = torch.tensor(board_to_tensor(node.board, node.board.fullmove_number, input_channels), 
+                                     dtype=torch.float32).unsqueeze(0).to(device)
+            with torch.no_grad():
+                _, value_tensor = model(input_tensor)
+            value = float(value_tensor.item())
+        
+        # Backpropagate
+        while node:
+            node.visit_count += 1
+            node.value_sum += value
+            value = -value  # Flip for opponent's perspective
+            node = node.parent
+    
+    # Select move based on visit counts
+    visits = np.array([root.children[move].visit_count for move in legal_moves])
+    
+    # Apply temperature
     if temperature == 0:  # Deterministic
-        best_move_idx = np.argmax(visits)
+        best_idx = np.argmax(visits)
         probs = np.zeros_like(visits)
-        probs[best_move_idx] = 1.0
+        probs[best_idx] = 1.0
     else:
         # Apply temperature
         visits_temp = np.power(visits, 1.0 / temperature)
         if np.sum(visits_temp) > 0:
             probs = visits_temp / np.sum(visits_temp)
         else:
-            probs = move_probs  # Fall back to policy network
+            probs = np.ones(len(legal_moves)) / len(legal_moves)
     
     # Return both selected move and full distribution for training
     selected_idx = np.random.choice(len(legal_moves), p=probs)
@@ -769,6 +1017,11 @@ def simple_mcts_for_training(board, model, device, num_simulations=50, temperatu
 
 def generate_simple_mcts_game(model, device, temperature=1.0, num_simulations=50):
     """Generate a self-play game using the simplified MCTS (faster for training)"""
+    # Get half the available CPU cores
+    parallel_workers = math.ceil(max(1, multiprocessing.cpu_count() // 1.5))
+    print(f"Using {parallel_workers} CPU cores for simple MCTS")
+    input_channels = model.input_channels if hasattr(model, 'input_channels') else 20
+    
     game = chess.pgn.Game()
     board = chess.Board()
     node = game
@@ -792,13 +1045,13 @@ def generate_simple_mcts_game(model, device, temperature=1.0, num_simulations=50
                 board, 
                 model, 
                 device,
-                num_simulations=num_simulations,
+                num_simulations=num_simulations,  # Default is now 100
                 temperature=current_temp
             )
         except Exception as e:
             print(f"MCTS error: {e}. Falling back to direct move selection.")
             # Fallback to direct move selection if MCTS fails
-            input_tensor = torch.tensor(board_to_tensor(board, move_number), dtype=torch.float32).unsqueeze(0).to(device)
+            input_tensor = torch.tensor(board_to_tensor(board, move_number, input_channels), dtype=torch.float32).unsqueeze(0).to(device)
             with torch.no_grad():
                 policy_logits, _ = model(input_tensor)
             policy = F.softmax(policy_logits, dim=1).squeeze().cpu().numpy()

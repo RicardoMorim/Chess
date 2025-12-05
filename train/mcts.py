@@ -28,8 +28,10 @@ class MCTSNode:
 
 # Expand a leaf node using the neural network.
 def expand_node(node: MCTSNode, model, device):
-    board_tensor = torch.tensor(board_to_tensor(node.board, node.board.fullmove_number), 
-                                  dtype=torch.float32).unsqueeze(0).to(device)
+    input_channels = model.input_channels if hasattr(model, 'input_channels') else 20
+    
+    board_tensor = torch.tensor(board_to_tensor(node.board, node.board.fullmove_number, input_channels), 
+                               dtype=torch.float32).unsqueeze(0).to(device)
     with torch.no_grad():
         policy_logits, value_pred = model(board_tensor)
     policy = F.softmax(policy_logits, dim=1).cpu().numpy().flatten()
@@ -209,7 +211,14 @@ def select_move_with_mcts(board: chess.Board, model, device, num_simulations: in
         pi[best_idx] = 1.0
     else:
         counts = np.power(counts, 1.0 / temperature)
-        pi = counts / np.sum(counts)
+        # Fix for the NaN error in select_move_with_mcts function
+        counts = np.power(counts, 1.0 / temperature)
+        # Add this check to prevent division by zero
+        if np.sum(counts) > 0:
+            pi = counts / np.sum(counts)
+        else:
+            # If all counts are zero, use uniform distribution
+            pi = np.ones_like(counts) / len(counts) if len(counts) > 0 else np.array([])
         best_move = np.random.choice(moves, p=pi)
     
     # For tree persistence, update the tree to the chosen move.
@@ -219,14 +228,15 @@ def select_move_with_mcts(board: chess.Board, model, device, num_simulations: in
 
 # Function to enhance self-play by using MCTS instead of simpler search
 def generate_mcts_game(model, device, temperature=1.0, num_simulations=50, 
-                      c_puct=1.5, parallel_workers=2):
+                      c_puct=1.5, parallel_workers=2, input_channels=20):
     """Generate a self-play game using MCTS for move selection with more stable settings"""
     game = chess.pgn.Game()
     board = chess.Board()
     node = game
     move_number = 1
     tree = None
-
+    if input_channels is None:
+            input_channels = model.input_channels if hasattr(model, 'input_channels') else 20
     # Apply early termination for very long games
     max_moves = 80  # Limit to reasonable game length
     
@@ -255,7 +265,8 @@ def generate_mcts_game(model, device, temperature=1.0, num_simulations=50,
         except Exception as e:
             print(f"MCTS error: {e}. Falling back to direct move selection.")
             # Fallback to direct move selection if MCTS fails
-            input_tensor = torch.tensor(board_to_tensor(board, move_number), dtype=torch.float32).unsqueeze(0).to(device)
+            input_tensor = torch.tensor(board_to_tensor(board, move_number, input_channels), 
+                              dtype=torch.float32).unsqueeze(0).to(device)
             with torch.no_grad():
                 policy_logits, _ = model(input_tensor)
             policy = F.softmax(policy_logits, dim=1).squeeze().cpu().numpy()

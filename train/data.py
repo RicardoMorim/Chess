@@ -17,32 +17,60 @@ def get_move_index(move):
         return promotion_moves[(move.from_square, move.to_square, move.promotion)]
     return move.from_square * 64 + move.to_square
 
-def board_to_tensor(board, move_number):
-    """Convert a chess board to a tensor representation"""
-    tensor = np.zeros((20, 8, 8), dtype=np.float32)  # Increased to 20 channels
-    for piece_type in chess.PIECE_TYPES:
-        for color in chess.COLORS:
-            for square in board.pieces(piece_type, color):
-                row, col = divmod(square, 8)
-                channel = piece_type - 1 if color == chess.WHITE else piece_type + 5
-                tensor[channel, row, col] = 1
-    tensor[12, :, :] = board.has_kingside_castling_rights(chess.WHITE)
-    tensor[13, :, :] = board.has_queenside_castling_rights(chess.WHITE)
-    tensor[14, :, :] = board.has_kingside_castling_rights(chess.BLACK)
-    tensor[15, :, :] = board.has_queenside_castling_rights(chess.BLACK)
-    if board.ep_square is not None:
-        row, col = divmod(board.ep_square, 8)
-        tensor[16, row, col] = 1
-    tensor[17, :, :] = 1 if board.turn == chess.WHITE else 0
-    tensor[18, :, :] = board.halfmove_clock / 50.0  # Normalized repetition counter (fifty-move rule)
-    tensor[19, :, :] = move_number / 200.0  # Normalized move number (assuming max 200 moves)
+def board_to_tensor(board, move_number=None, input_channels=20):
+    """Convert a chess board to a tensor representation
+    
+    Args:
+        board: The chess.Board object
+        move_number: The move number (only used for 20-channel model)
+        input_channels: Number of input channels (18 or 20)
+    """
+    # Use the appropriate number of channels based on model type
+    if input_channels == 18:  # Small model (original)
+        tensor = np.zeros((18, 8, 8), dtype=np.float32)
+        for piece_type in chess.PIECE_TYPES:
+            for color in chess.COLORS:
+                for square in board.pieces(piece_type, color):
+                    row, col = divmod(square, 8)
+                    channel = piece_type - 1 if color == chess.WHITE else piece_type + 5
+                    tensor[channel, row, col] = 1
+        tensor[12, :, :] = board.has_kingside_castling_rights(chess.WHITE)
+        tensor[13, :, :] = board.has_queenside_castling_rights(chess.WHITE)
+        tensor[14, :, :] = board.has_kingside_castling_rights(chess.BLACK)
+        tensor[15, :, :] = board.has_queenside_castling_rights(chess.BLACK)
+        if board.ep_square is not None:
+            row, col = divmod(board.ep_square, 8)
+            tensor[16, row, col] = 1
+        tensor[17, :, :] = 1 if board.turn == chess.WHITE else 0
+    else:  # Big model (20 channels)
+        tensor = np.zeros((20, 8, 8), dtype=np.float32)
+        for piece_type in chess.PIECE_TYPES:
+            for color in chess.COLORS:
+                for square in board.pieces(piece_type, color):
+                    row, col = divmod(square, 8)
+                    channel = piece_type - 1 if color == chess.WHITE else piece_type + 5
+                    tensor[channel, row, col] = 1
+        tensor[12, :, :] = board.has_kingside_castling_rights(chess.WHITE)
+        tensor[13, :, :] = board.has_queenside_castling_rights(chess.WHITE)
+        tensor[14, :, :] = board.has_kingside_castling_rights(chess.BLACK)
+        tensor[15, :, :] = board.has_queenside_castling_rights(chess.BLACK)
+        if board.ep_square is not None:
+            row, col = divmod(board.ep_square, 8)
+            tensor[16, row, col] = 1
+        tensor[17, :, :] = 1 if board.turn == chess.WHITE else 0
+        tensor[18, :, :] = board.halfmove_clock / 50.0  # Normalized repetition counter
+        # If move_number is not provided, use halfmove_clock as a proxy
+        tensor[19, :, :] = (move_number or board.fullmove_number) / 200.0  # Normalized move number
+        
     return tensor
 
 class ChessDataset(Dataset):
-    """Dataset for chess games with symmetry augmentation"""
-    def __init__(self, games, augment=True):
+    """Dataset for chess games with symmetry augmentation and model type support"""
+    def __init__(self, games, augment=True, model_type="big"):
         self.positions = []
         self.augment = augment
+        self.model_type = model_type
+        self.input_channels = 18 if model_type.lower() == "small" else 20
         
         for game in games:
             result_str = game.headers.get("Result", "*")
@@ -80,16 +108,19 @@ class ChessDataset(Dataset):
     def __getitem__(self, idx):
         fen, move_number, policy_target, value_target = self.positions[idx]
         board = chess.Board(fen)
-        input_tensor = board_to_tensor(board, move_number)
+        # Use the appropriate tensor representation based on model type
+        input_tensor = board_to_tensor(board, move_number, self.input_channels)
         
         return (torch.tensor(input_tensor, dtype=torch.float32),
                 torch.tensor(policy_target, dtype=torch.long),
                 torch.tensor(value_target, dtype=torch.float32))
 
 class PuzzleDataset(Dataset):
-    """Dataset for chess puzzles"""
-    def __init__(self, puzzles):
+    """Dataset for chess puzzles with model type support"""
+    def __init__(self, puzzles, model_type="big"):
         self.puzzles = puzzles
+        self.model_type = model_type
+        self.input_channels = 18 if model_type.lower() == "small" else 20
 
     def __len__(self):
         return len(self.puzzles)
@@ -98,22 +129,39 @@ class PuzzleDataset(Dataset):
         fen, move_uci, value_target = self.puzzles[idx]
         board = chess.Board(fen)
         move = chess.Move.from_uci(move_uci)
-        input_tensor = board_to_tensor(board, 0)  # Move number not tracked in puzzles
+        # Use the appropriate tensor representation based on model type
+        input_tensor = board_to_tensor(board, 0, self.input_channels)
         policy_target = get_move_index(move)
         return (torch.tensor(input_tensor, dtype=torch.float32),
                 torch.tensor(policy_target, dtype=torch.long),
                 torch.tensor(value_target, dtype=torch.float32))
 
 class SelfPlayDataset(Dataset):
-    """Dataset for self-play reinforcement learning samples"""
-    def __init__(self, samples):
+    """Dataset for self-play reinforcement learning samples with model type support"""
+    def __init__(self, samples, model_type="big"):
         self.samples = samples
+        self.model_type = model_type
+        self.input_channels = 18 if model_type.lower() == "small" else 20
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         board_tensor, policy_target, value_target = self.samples[idx]
+        
+        # Make sure the tensor has the right dimensions for the model type
+        if isinstance(board_tensor, np.ndarray) and board_tensor.shape[0] != self.input_channels:
+            print(f"Warning: Converting tensor from {board_tensor.shape[0]} to {self.input_channels} channels")
+            if self.input_channels == 18 and board_tensor.shape[0] == 20:
+                # Convert from 20 to 18 channels by trimming
+                board_tensor = board_tensor[:18]
+            elif self.input_channels == 20 and board_tensor.shape[0] == 18:
+                # Convert from 18 to 20 channels by padding
+                padded = np.zeros((20, 8, 8), dtype=np.float32)
+                padded[:18] = board_tensor
+                padded[18:, :, :] = 0.0  # Zero the extra channels
+                board_tensor = padded
+        
         return (torch.tensor(board_tensor, dtype=torch.float32),
                 torch.tensor(policy_target, dtype=torch.long),
                 torch.tensor(value_target, dtype=torch.float32))

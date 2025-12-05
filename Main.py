@@ -19,15 +19,9 @@ import pygame
 sys.stdout = orig_stdout
 sys.stderr = orig_stderr
 import chess
-import MonteCarlo as MTCS
-import Minimax
-import Minimaxv2
-import chess.engine
-import mtcs
-import newAI
 from pytorch_model import PytorchModel
 from old_model import OldPytorchModel
-
+from Minimax import MinimaxAI
 
 class Main:
     piece_images = None
@@ -49,16 +43,26 @@ class Main:
         self.AI_turn = False
         self.color = "w"
         self.AI_type = "minimax"
-        # self.engine_eval = chess.engine.SimpleEngine.popen_uci(
-        #     stockfish_path, debug=False
-        # )
-        # self.engine_eval.configure({"Threads": 8})
         pygame.display.set_caption("Chess Game")
         self.openings_folder = "./oppenings"
         self.openings = {}
         self.load_openings()
         self.pytorch_engine = PytorchModel()
+        self.new_old = OldPytorchModel("chess_model/old/100000games/chess_model.pth")
         self.old_pytorch_engine = OldPytorchModel()
+        self.select_side_screen()
+
+        self.minimax_engine = MinimaxAI(self.openings, "w" if self.color == "b" else "b", 6)
+
+        # New flags for human input
+        self.human_moved = False
+        self.start_click_square = None
+        self.start_click_pos = None
+        self.drag_started = False
+        # New flags for two-click support
+        self.waiting_for_second_click = False
+        self.ignore_release = False
+
 
     @classmethod
     def load_piece_images(cls):
@@ -125,72 +129,121 @@ class Main:
                     )
 
     def handle_mouse_click(self, event):
-        logging.debug("Mouse Clicked")
-        if self.dragging:
-            self.dragging = False
-            self.selected_piece = None
-            self.drag_offset = None
-            return
-
         x, y = event.pos
         col, row = x // self.square_size, y // self.square_size
 
-        if 0 <= col < 8 and 0 <= row < 8:
-            if self.color == "b":
-                square = chess.square(7 - col, row)  # Mirror the square for black
-            else:
-                square = chess.square(col, 7 - row)
-            piece = self.board.piece_at(square)
-            if not piece:
-                return
-            self.selected_piece = (piece, square)
-            self.drag_offset = (
-                event.pos[0] - (square % 8) * self.square_size,
-                event.pos[1] - (square // 8) * self.square_size,
-            )
-            pygame.display.flip()
+        if not (0 <= col < 8 and 0 <= row < 8):
+            self.selected_piece = None
+            self.dragging = False
+            self.start_click_square = None
+            self.waiting_for_second_click = False
+            return
 
-    def handle_mouse_drag(self, event):
-        logging.debug("Mouse Dragged")
+        if self.color == "b":
+            square = chess.square(7 - col, row)  
+        else:
+            square = chess.square(col, 7 - row)
+
+
+        # If no piece is selected yet, try to select an allied piece.
+        if not self.selected_piece:
+            piece = self.board.piece_at(square)
+            if piece and piece.color == self.board.turn:
+                print(f"Selected piece at {chess.square_name(square)}")
+                self.selected_piece = (piece, square)
+                self.waiting_for_second_click = True
+            # Else: do nothing (click on empty or enemy square does nothing)
+        else:
+            # There is an active selection (waiting for second click)
+            # If the clicked square is different than the originally selected square,
+            # treat it as the move destination (for two-click mode).
+            if self.waiting_for_second_click and square != self.selected_piece[1]:
+                move = chess.Move(self.selected_piece[1], square)
+                if move in self.board.legal_moves:
+                    print(f"Valid move (2-click): {move} ({chess.square_name(self.selected_piece[1])} -> {chess.square_name(square)})")
+                    self.board.push(move)
+                    self.human_moved = True
+                else:
+                    print(f"Invalid move attempted: {move}")
+                    print(f"Legal moves: {[m.uci() for m in self.board.legal_moves]}")
+                # Clear selection and disable processing on release.
+                self.selected_piece = None
+                self.waiting_for_second_click = False
+                self.ignore_release = True
+            else:
+                # If the same square is clicked, update selection.
+                piece = self.board.piece_at(square)
+                if piece and piece.color == self.board.turn:
+                    print(f"Switching selection to {chess.square_name(square)}")
+                    self.selected_piece = (piece, square)
+        pygame.display.flip()
+
+    def handle_mouse_motion(self, event):
+        if self.selected_piece and self.start_click_pos:
+            dx = event.pos[0] - self.start_click_pos[0]
+            dy = event.pos[1] - self.start_click_pos[1]
+            dist = (dx**2 + dy**2)**0.5
+            # If motion is significant, consider it a drag.
+            if dist > 5:
+                self.drag_started = True
+                self.dragging = True
+                # Cancel two-click mode if dragging
+                self.waiting_for_second_click = False
+            # (You might add visual feedback for dragging here.)
+    
+    def handle_mouse_release(self, event):
+        if self.ignore_release:
+            self.ignore_release = False
+            return
+
         if not self.selected_piece:
             return
 
         x, y = event.pos
-        new_x, new_y = x - self.drag_offset[0], y - self.drag_offset[1]
-        col, row = new_x // self.square_size, new_y // self.square_size
-
-        if 0 <= col < 8 and 0 <= row < 8:
-            if self.color == "b":
-                new_square_visual = chess.square(7 - col, row)
-                new_x = (7 - col) * self.square_size + self.square_size / 4
-                new_y = row * self.square_size + self.square_size / 4
-            else:
-                new_square_visual = chess.square(col, 7 - row)
-                new_x = col * self.square_size + self.square_size / 4
-                new_y = (7 - row) * self.square_size + self.square_size / 4
-
-            self.selected_piece = (self.selected_piece[0], new_square_visual)
-            self.drag_offset = (x - new_x, y - new_y)
-            self.draw_board()
-            self.draw_pieces()
-            pygame.display.flip()
-
-    def handle_mouse_release(self, event):
-        logging.debug("Mouse Released")
-        if not self.dragging:
+        col, row = x // self.square_size, y // self.square_size
+        if not (0 <= col < 8 and 0 <= row < 8):
+            self.selected_piece = None
+            self.dragging = False
+            self.start_click_square = None
             return
 
-        move = self.get_move_from_drag_visual(*self.selected_piece)
-        if move in self.board.legal_moves:
-            self.board.push(move)
+        if self.color == "b":
+            release_square = chess.square(7 - col, row)  # Only mirror the column for black
         else:
-            print("Invalid move!")
+            release_square = chess.square(col, 7 - row)
 
-        self.dragging = False
+
+        # If a drag was detected, use the release square as the destination.
+        # Otherwise, in two-click mode, only act if the release square
+        # is different from the originally clicked square.
+        if self.drag_started:
+            dest_square = release_square
+        else:
+            # Two-click mode: if the release square is different from the selected square,
+            # treat it as the destination.
+            if release_square != self.selected_piece[1]:
+                dest_square = release_square
+            else:
+                # Clicking the same square does nothing.
+                self.selected_piece = None
+                self.start_click_square = None
+                return
+
+        move = chess.Move(self.selected_piece[1], dest_square)
+        if move in self.board.legal_moves:
+            print(f"Valid move: {move} ({chess.square_name(self.selected_piece[1])} -> {chess.square_name(dest_square)})")
+            self.board.push(move)
+            self.human_moved = True
+        else:
+            print(f"Invalid move attempted: {move}")
+            print(f"Legal moves: {[m.uci() for m in self.board.legal_moves]}")
+
+        # Clear selection and drag info.
         self.selected_piece = None
-        self.drag_offset = None
-        self.draw_board()
-        self.draw_pieces()
+        self.dragging = False
+        self.start_click_square = None
+        self.drag_started = False
+        pygame.display.flip()
 
     def get_square_at_position(self, position):
         x, y = position
@@ -215,63 +268,20 @@ class Main:
 
         return chess.Move.from_uci(f"{start_square}{target_square_str}")
 
-    def get_move_from_drag_visual(self, piece_and_square, target_square):
-        piece, square = piece_and_square
-        piece_type = chess.PIECE_TYPES[piece.piece_type]
+    def get_move_from_drag_visual(self, piece, target_square):
+        piece, from_square = piece
+        
+        # Both squares are already in internal board representation
+        # No need for complex transformations
+        move = chess.Move(from_square, target_square)
+        
+        # Debug info
+        print(f"Attempting move: {move} ({chess.square_name(from_square)} to {chess.square_name(target_square)})")
+        print(f"Legal moves: {[m.uci() for m in self.board.legal_moves]}")
+        
+        return move
 
-        if self.color == "b":
-            start_square_visual = chess.square(
-                7 - square % 8, 7 - square // 8
-            )  # Mirror the square for black visualization
-        else:
-            start_square_visual = chess.square(square % 8, square // 8)
 
-        target_square_visual = chess.square(
-            7 - target_square % 8, 7 - target_square // 8
-        )  # Mirror the square for black visualization
-
-        start_square_str_visual = chess.square_string(start_square_visual)
-        target_square_str_visual = chess.square_string(target_square_visual)
-
-        return chess.Move.from_uci(
-            f"{start_square_str_visual}{target_square_str_visual}"
-        )
-
-    def play_human_move(self):
-        legal_moves = [move.uci() for move in self.board.legal_moves]
-
-        move_started = False
-        start_square = None
-
-        while not move_started:
-            for event in pygame.event.get():
-                if event.type == pygame.MOUSEBUTTONDOWN:
-                    square = self.get_square_at_position(event.pos)
-                    if square:
-                        piece = self.board.piece_at(square)
-                        if piece and piece.color == self.board.turn:
-                            move_started = True
-                            start_square = square
-                elif event.type == pygame.QUIT:
-                    pygame.quit()
-                    sys.exit()
-
-        move_ended = False
-        while not move_ended:
-            for event in pygame.event.get():
-                if event.type == pygame.MOUSEBUTTONUP:
-                    end_square = self.get_square_at_position(event.pos)
-                    if end_square:
-                        move = chess.Move(start_square, end_square)
-                        move_uci = move.uci()
-                        if move_uci in legal_moves:
-                            self.board.push_uci(move_uci)
-                            move_ended = True
-                        else:
-                            print("Invalid move!")
-                elif event.type == pygame.QUIT:
-                    pygame.quit()
-                    sys.exit()
 
     def push_move(self, best_move):
         if best_move in self.board.legal_moves:
@@ -281,83 +291,31 @@ class Main:
 
     def play_engine_move(self, max_depth, color):
         print("engine: " + self.AI_type)
-        ## OTHER ENGINES TO USE ##
-        # Minimaxv2.Minimax(self.board, max_depth, color)
-        # mtcs.MonteCarloTreeSearchAI(self.engine_eval if self.stockfish else None)
-
-        ## COMPARE BUILT-IN EVAL WITH STOCKFISH EVAL ##
-        # if self.AI_type == "minimax":
-        #     if self.stockfish:
-        #         engine = Minimax.Engine(self.board, 2, color, self.engine_eval)
-        #         best_move = engine.getBestMove()
-        #         self.push_move(best_move)
-        #         return
-        # engine = Minimax.Engine(self.board, 5, color, None)
-        # best_move = engine.getBestMove()
-        # self.push_move(best_move)
-        # return
-
-        #       if self.AI_type == "minimax":
-        # if self.stockfish:
-
         if self.AI_turn:
-            # print("The engine is thinking DIRECT for color: " + self.color)
-            # best_move = self.pytorch_engine.best_move_direct(self.board)
+
+            print ("Minimax AI thinking...")
+            best_move = self.minimax_engine.get_best_move(self.board)
+            self.push_move(best_move)
+            print("MOVE BY MINIMAX:", best_move)
+            return
+            # print("The engine is thinking OLD with MTCS for color: " + self.color)
+            # best_move = self.old_pytorch_engine.get_best_move_mtcs(self.board)
             # self.push_move(best_move)
-            # print("MOVE DIRECT:", best_move)
+            # print("MOVE BY OLD:", best_move)
             # return
         
-            print("The engine is thinking MTCS for color: " + self.color)
-            best_move = self.pytorch_engine.get_best_move_mcts(
-                self.board, 
-                iterations=3000,  # Adjust based on time constraints
-                c_puct=1.5,       # Exploration constant
-                dirichlet_alpha=0.3,  # Noise for exploration
-                temperature=1.0,  # For training, use 1.0; for strong play use 0.5 or lower
-                parallel_workers=4,  # For your i5 with 8 threads
-                reuse_tree=True   # Reuse tree between moves for faster play
-            )
-            self.push_move(best_move)
-            print("MOVE BY MTCS:", best_move)
-            return
-        
-        print("The engine is thinking OLD with MTCS for color: " + self.color)
-        best_move = self.old_pytorch_engine.get_best_move_mtcs(self.board)
+        print("The engine is thinking with new trained OLD for color: " + self.color)
+        best_move = self.new_old.get_best_move_mtcs(self.board)
         self.push_move(best_move)
-        print("MOVE BY OLD:", best_move)
+        print("MOVE BY NEW:", best_move)
         return
-
-        # if self.AI_type == "pytorch":
-        #     engine = PytorchModel()
-        #     best_move = engine.predict_move(self.board)
-        #     self.board.push_uci(best_move)
-        #     return
-
-        # if self.AI_type == "minimax":
-        #     engine = Minimaxv2.Minimax(self.board, 6, color, self.openings)
-        #     best_move = engine.getBestMove()
-        #     self.push_move(best_move)
-        #     print("MOVE:", best_move)
-        #     return
-
-        # if self.AI_type == "monte_carlo":
-        #     engine = MTCS.Engine(self.board, color, None, iterations=2000)
-        #     best_move = engine.getBestMove()
-        #     self.push_move(best_move)
-        #     return
-        # engine = Minimaxv2.Minimax(self.board, 6, color, self.openings)
-        # best_move = engine.getBestMove()
-        # self.push_move(best_move)
-        # print("MOVE:", best_move)
-        return None
 
     def start_game(self):
         logging.basicConfig(level=logging.DEBUG)
 
-        self.select_side_screen()
-
         ai_color = "w" if self.color == "b" else "b"
-        self.AI_turn = False if self.color == "w" else True
+
+        # self.AI_turn = False  
         max_depth = 3  # Set the initial max depth for the engine
 
         clock = pygame.time.Clock()
@@ -368,58 +326,53 @@ class Main:
                     pygame.quit()
                     sys.exit()
 
-                if event.type == pygame.MOUSEBUTTONDOWN:
-                    self.handle_mouse_click(event)
-                elif event.type == pygame.MOUSEMOTION and self.selected_piece:
-                    self.handle_mouse_drag(event)
-                elif event.type == pygame.MOUSEBUTTONUP:
-                    self.handle_mouse_release(event)
+                # Process mouse events only if it is human's turn.
+                if not self.AI_turn:
+                    if event.type == pygame.MOUSEBUTTONDOWN:
+                        self.handle_mouse_click(event)
+                    elif event.type == pygame.MOUSEMOTION:
+                        self.handle_mouse_motion(event)
+                    elif event.type == pygame.MOUSEBUTTONUP:
+                        self.handle_mouse_release(event)
 
             self.draw_board()
-
             self.draw_pieces()
             pygame.display.flip()
 
-            ## TEST AI VS AI  ##
-            self.play_engine_move(max_depth, ai_color)
-
-            # self.AI_type = "monte_carlo" if self.AI_type == "minimax" else "minimax"
-
-            ai_color = "w" if ai_color == "b" else "b"
+            ## AI VS AI ##
+            # self.human_moved = True
             
-            self.AI_turn = not self.AI_turn
+            # print("The engine is thinking...")
+            # self.play_engine_move(max_depth, ai_color)
+            # self.AI_turn = not self.AI_turn
 
-            self.color = "w" if self.color == "b" else "b"
 
+            ## AI VS HUMAN ##
+            # If it's human turn and a move has been made, then switch to AI turn.
+            if not self.AI_turn and self.human_moved:
+                self.AI_turn = True
+                self.human_moved = False
 
+            # If it's AI's turn, execute the engine move and then switch turn.
+            if self.AI_turn:
+                print("The engine is thinking...")
+                sleep(1)
+                self.play_engine_move(max_depth, ai_color)
+                self.AI_turn = False
 
-            
-            # HUMAN VS AI ##
-            # if self.AI_turn:
-            #     print("The engine is thinking...")
-            #     sleep(1)
-            #     self.play_engine_move(max_depth, ai_color)
-            #     self.AI_turn = False
-            # else:
-            #     self.play_human_move()
-            #     self.AI_turn = True
+            clock.tick(60)  # Limit frames per second
 
         # Game over, show end game screen
         print(self.board.outcome)
         winner = "White" if self.board.turn == chess.BLACK else "Black"
         print("Looser: " + self.AI_type)
-        print("Winner: " + "monte_carlo" if self.AI_type == "minimax" else "minimax")
+        print("Winner: " + ("monte_carlo" if self.AI_type == "minimax" else "minimax"))
         print(str(chess.pgn.Game.from_board(self.board)))
         if self.end_game_screen(winner):
             return True  # Start a new game
-
         else:
             pygame.quit()
             return False
-
-        clock.tick(60)  # Limit frames per second
-
-        pygame.quit()
 
     def end_game_screen(self, winner):
         font = pygame.font.Font(None, 36)
@@ -489,7 +442,6 @@ class Main:
                 else pygame.Rect(self.width // 2.5 + 75, self.height // 2 + 75, 170, 50)
             )
       
-
             pytorch_button = (
                 pygame.Rect(self.width // 2.5 + 75, self.height // 2 + 150, 200, 60)
                 if self.AI_type == "pytorch"
@@ -518,7 +470,6 @@ class Main:
                 center=monte_carlo_button.center
             )
 
-
             pytorch_text = font.render("Pytorch AI", True, (255, 255, 255))
             pytorch_text_rect = pytorch_text.get_rect(center=pytorch_button.center)
 
@@ -538,12 +489,15 @@ class Main:
                 if event.type == pygame.MOUSEBUTTONDOWN:
                     if white_button.collidepoint(event.pos):
                         self.color = "w"
+                        self.AI_turn = False
                         return
                     elif black_button.collidepoint(event.pos):
                         self.color = "b"
+                        self.AI_turn = True
                         return
                     elif minimax_button.collidepoint(event.pos):
                         self.AI_type = "minimax"
+
                     elif monte_carlo_button.collidepoint(event.pos):
                         self.AI_type = "monte_carlo"
                     elif pytorch_button.collidepoint(event.pos):

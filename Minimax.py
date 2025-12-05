@@ -1,564 +1,552 @@
+import chess
+import chess.pgn
+import chess.polyglot
 import random
-from time import sleep
-import chess as ch
-import os
-from collections import OrderedDict, namedtuple
-import json
-import logging
-import chess.engine
-import stable
+import numpy as np
+from TranspositionTable import TranspositionTable
 
+# Import Cython implementations if available
+try:
+    # import minimax_cy
+    CYTHON_AVAILABLE =  False
+    print("Cython acceleration enabled!")
+except ImportError:
+    CYTHON_AVAILABLE = False
+    print("Cython module not found. Using Python implementation.")
 
-class ChessEncoder(json.JSONEncoder):
-    """
-    JSON encoder for chess-related objects.
-    """
-
-    KEY_SAN = "san"
-    KEY_VALUE = "value"
-    KEY_MOVE = "move"
-
-    def default(self, obj):
+class MinimaxAI:
+    def __init__(self, openings, color, depth=4):
         """
-        Convert chess-related objects to JSON-compatible format.
+        Initialize the Minimax AI with openings, color, and search depth.
 
-        Args:
-            obj: The object to be converted.
-
-        Returns:
-            The JSON-compatible representation of the object.
+        :param openings: Dictionary of opening names to chess.pgn.Game objects
+        :param color: chess.WHITE or chess.BLACK, indicating AI's color
+        :param depth: Search depth for Minimax algorithm
         """
-        if type(obj) == ch.Move:
-            return {self.KEY_SAN: obj.uci()}
-        elif type(obj) == MoveEvaluation:
-            return {
-                self.KEY_VALUE: obj.value,
-                self.KEY_MOVE: obj.move.uci() if obj.move else None,
-            }
-        return super().default(obj)
-
-
-# Define a named tuple to represent a move and its evaluation
-MoveEvaluation = namedtuple("MoveEvaluation", ["value", "move"])
-
-# Piece values for evaluation
-piece_values = {
-    ch.PAWN: 1,
-    ch.ROOK: 5,
-    ch.BISHOP: 3,
-    ch.KNIGHT: 3,
-    ch.QUEEN: 8,
-    ch.KING: 999,
-}
-
-
-class Engine:
-    def __init__(
-        self,
-        board,
-        maxDepth,
-        color,
-        # cache_file="E:/chess_cache/transposition_cache.json",
-        stockfish,
-        cache_file="./cache/transposition_cache_Minimax.json",
-    ):
-        """
-        Initialize the chess engine.
-
-        Parameters:
-        - board: The chess board.
-        - maxDepth: The maximum depth for the search algorithm.
-        - color: The color of the engine.
-        - cache_file: The file to store the transposition cache.
-
-        This function loads the transposition cache from the cache file.
-        """
-        self.board = board
+        self.openings = openings
         self.color = color
-        self.maxDepth = maxDepth
-        self.transposition_table = OrderedDict()
-        self.cache_file = cache_file
-        self.load_cache()
-        self.engine_eval = stockfish
-        self.openings_folder = "./oppenings"
-        self.openings = {}
-        self.load_openings()
-
-    def store_transposition_table_entry(self, board, depth, value, best_move, flag):
-        """
-        Store an entry in the transposition table.
-
-        Parameters:
-        - board: The chess board.
-        - depth: The depth of the search.
-        - value: The evaluation value.
-        - best_move: The best move found.
-        - flag: the flag indicating if a move was evaluated by stockfish
-
-        """
-        key = self.calculate_board_hash(board)
-        self.transposition_table[key] = {
-            "depth": depth,
-            "value": value,
-            "best_move": best_move,
-            "flag": flag,
+        self.depth = depth
+        self.opening_moves = self.process_openings()
+        
+        # Initialize transposition table
+        self.tt = TranspositionTable()
+        
+        # History heuristic table for move ordering
+        self.history = {}  # (from_square, to_square) -> score
+        
+        # Piece values in centipawns
+        self.piece_value = {
+            chess.PAWN: 100,
+            chess.KNIGHT: 300,
+            chess.BISHOP: 300,
+            chess.ROOK: 500,
+            chess.QUEEN: 900,
+            chess.KING: 0
         }
+        
+        # Simplified piece-square tables for white (in centipawns)
+        self.pawn_pst_white = [
+            0, 0, 0, 0, 0, 0, 0, 0,
+            50, 50, 50, 50, 50, 50, 50, 50,
+            10, 10, 20, 30, 30, 20, 10, 10,
+            5, 5, 10, 25, 25, 10, 5, 5,
+            0, 0, 0, 20, 20, 0, 0, 0,
+            5, -5, -10, 0, 0, -10, -5, 5,
+            5, 10, 10, -20, -20, 10, 10, 5,
+            0, 0, 0, 0, 0, 0, 0, 0
+        ]
+        self.knight_pst_white = [
+            -50, -40, -30, -30, -30, -30, -40, -50,
+            -40, -20, 0, 0, 0, 0, -20, -40,
+            -30, 0, 10, 15, 15, 10, 0, -30,
+            -30, 5, 15, 20, 20, 15, 5, -30,
+            -30, 0, 15, 20, 20, 15, 0, -30,
+            -30, 5, 10, 15, 15, 10, 5, -30,
+            -40, -20, 0, 5, 5, 0, -20, -40,
+            -50, -40, -30, -30, -30, -30, -40, -50
+        ]
+        self.bishop_pst_white = self.knight_pst_white  # Simplified
+        self.rook_pst_white = [
+            0, 0, 0, 0, 0, 0, 0, 0,
+            5, 10, 10, 10, 10, 10, 10, 5,
+            -5, 0, 0, 0, 0, 0, 0, -5,
+            -5, 0, 0, 0, 0, 0, 0, -5,
+            -5, 0, 0, 0, 0, 0, 0, -5,
+            -5, 0, 0, 0, 0, 0, 0, -5,
+            5, 10, 10, 10, 10, 10, 10, 5,
+            0, 0, 0, 5, 5, 0, 0, 0
+        ]
+        self.queen_pst_white = [x / 2 for x in self.knight_pst_white]  # Scaled
+        self.king_pst_white = [
+            -30, -40, -40, -50, -50, -40, -40, -30,
+            -30, -40, -40, -50, -50, -40, -40, -30,
+            -30, -40, -40, -50, -50, -40, -40, -30,
+            -30, -40, -40, -50, -50, -40, -40, -30,
+            -20, -30, -30, -40, -40, -30, -30, -20,
+            -10, -20, -20, -20, -20, -20, -20, -10,
+            20, 20, 0, 0, 0, 0, 20, 20,
+            20, 30, 10, 0, 0, 10, 30, 20
+        ]
+        
+        self.pst_white = {
+            chess.PAWN: self.pawn_pst_white,
+            chess.KNIGHT: self.knight_pst_white,
+            chess.BISHOP: self.bishop_pst_white,
+            chess.ROOK: self.rook_pst_white,
+            chess.QUEEN: self.queen_pst_white,
+            chess.KING: self.king_pst_white
+        }
+        
+        # Precompute piece-square tables for black side
+        self.pst_black = {}
+        for piece_type, table in self.pst_white.items():
+            self.pst_black[piece_type] = [table[chess.square_mirror(i)] for i in range(64)]
+        
+        # For Cython, prepare flattened PST arrays
+        if CYTHON_AVAILABLE:
+            self._prepare_cython_tables()
+        
+        # Killer moves: store two killer moves per ply
+        self.killer_moves = [[None, None] for _ in range(self.depth + 1)]
 
-    def load_cache(self):
+    def _prepare_cython_tables(self):
+        """Prepare optimized tables for Cython functions"""
+        # Create flattened numpy arrays for faster access in Cython
+        piece_types = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING]
+        
+        # Initialize arrays (square * 6 + piece_idx)
+        self.pst_white_flat = np.zeros(64 * 6, dtype=np.int32)
+        self.pst_black_flat = np.zeros(64 * 6, dtype=np.int32)
+        
+        # Populate the arrays
+        for square in range(64):
+            for i, piece_type in enumerate(piece_types):
+                self.pst_white_flat[square * 6 + i] = self.pst_white[piece_type][square]
+                self.pst_black_flat[square * 6 + i] = self.pst_black[piece_type][square]
+
+    def process_openings(self):
         """
-        Load the transposition cache from the cache file.
+        Process opening games to map board positions (FEN) to recommended moves.
 
-        If the file doesn't exist or is empty, it initializes an empty cache.
+        :return: Dictionary mapping FEN strings to lists of possible moves
         """
-        os.makedirs(os.path.dirname(self.cache_file), exist_ok=True)
-        try:
-            with open(self.cache_file, "r") as file:
-                cache_data = json.load(file)
-                self.transposition_table.update(cache_data)
-                logging.info("Transposition cache loaded")
-        except (FileNotFoundError, json.JSONDecodeError):
-            with open(self.cache_file, "w") as file:
-                json.dump({}, file)
-                logging.info("Cache file didn't exist. Created a new cache file.")
+        opening_moves = {}
+        for opening_name, game in self.openings.items():
+            board = chess.Board()
+            node = game
+            while node.variations:
+                next_node = node.variation[0]
+                move = next_node.move
+                fen = board.fen()
+                if fen not in opening_moves:
+                    opening_moves[fen] = []
+                opening_moves[fen].append(move)
+                board.push(move)
+                node = next_node
+        return opening_moves
 
-    def update_cache(self):
+    def score_move(self, board, move, ply, tt_move=None):
         """
-        Update the transposition cache with the latest information.
+        Assign a score to a move for move ordering.
 
-        Parameters:
-        - board: The chess board.
-        - depth: The depth of the search.
-        - value: The evaluation value.
-        - best_move: The best move found.
-        - flag: the flag indicating if a move was evaluated by stockfish
+        :param board: Current chess board
+        :param move: Move to score
+        :param ply: Current ply in the search
+        :param tt_move: Best move from transposition table, if available
+        :return: Score for the move
         """
-        transposition_copy = self.transposition_table.copy()
-        with open(self.cache_file, "w") as file:
-            json.dump(transposition_copy, file, cls=ChessEncoder)
-        logging.info("done updating cache file")
+        if CYTHON_AVAILABLE:
+            return minimax_cy.score_move_cy(board, move, ply, tt_move, 
+                                           self.killer_moves, self.history, self.piece_value)
+        
+        # Original Python implementation
+        if tt_move and move == tt_move:
+            return 20000  # TT move highest priority
 
-    def getBestMove(self):
-        """
-        Get the best move using the engine.
+        if ply < len(self.killer_moves) and move in self.killer_moves[ply]:
+            return 10000  # Prioritize killer moves
 
-        Returns:
-        - The best move found by the engine.
-        """
-
-        if len(self.board.move_stack) < 20:
-            return self.play_opening_move(self.board)
-
-        if self.engine_eval is not None:
-            result = self.engine_eval.play(self.board, chess.engine.Limit(time=0.1))
-            return result.move
-        return self.engine()
-
-    def evalFunct(self, board):
-        """
-        Evaluate the current position based on material and positional factors.
-
-        Returns:
-        - The evaluation score for the current position.
-        """
-        if self.engine_eval is None:
-            return self.built_in_evalFunc(board)
-        try:
-            result = self.engine_eval.analyse(board, chess.engine.Limit(time=0.5))
-            score = result["score"].relative.score()
-            if not isinstance(score, (int, float, complex)):
-                print("error getting stockfish score")
-                score = 0
-            return score
-        except (ValueError, TimeoutError) as e:
-            logging.error("Error parsing Stockfish output.")
-            logging.error("Retying to get the value for the board.")
-            return self.evalFunct(board)
-
-    def calculate_repetition_penalty(self, move, board):
-        """
-        Calculate a penalty for move repetition.
-
-        Parameters:
-        - move: The chess move.
-
-        Returns:
-        - A penalty if the move has been repeated, 0 otherwise.
-        """
-        move_history = [board_move.uci() for board_move in board.move_stack]
-        move_count = move_history.count(move.uci())
-
-        # Apply a penalty if the move has been repeated more than once
-        if move_count > 1:
-            return -100 * move_count
-        else:
-            return 0
-
-    def load_openings(self):
-        """
-        Load openings from PGN files in the specified folder and its subfolders.
-        """
-        self.openings = {}
-        for root, dirs, files in os.walk(self.openings_folder):
-            for filename in files:
-                if filename.endswith(".pgn"):
-                    opening_name = os.path.splitext(filename)[0]
-                    full_path = os.path.join(root, filename)
-                    self.openings[opening_name] = chess.pgn.read_game(open(full_path))
-        # Shuffle the keys of the openings dictionary
-        keys = list(self.openings.keys())
-        random.shuffle(keys)
-        self.openings = {key: self.openings[key] for key in keys}
-
-    def play_opening_move(self, board):
-        """
-        Play an opening move from the loaded openings.
-
-        Parameters:
-        - board: The current chess board.
-
-        Returns:
-        - The updated board after playing the move.
-        - The move played.
-        """
-        for opening_name, opening in self.openings.items():
-            newBoard = chess.Board()
-            for move in opening.mainline_moves():
-                if newBoard == board:
-                    sleep(1)
-                    print(move)
-                    return move
-                newBoard.push(move)
-
-        return self.engine()
-
-    def getPieceValue(self, piece, x, y):
-
-        if piece == None:
-            return 0
-
-        def getAbsoluteValue(piece, isWhite, x, y):
-            piece_type = piece.piece_type
-            if piece_type == chess.PAWN:
-                return 10 + (
-                    stable.pawnEvalWhite[y][x]
-                    if isWhite
-                    else stable.pawnEvalBlack[y][x]
-                )
-            elif piece_type == chess.ROOK:
-                return 50 + (
-                    stable.rookEvalWhite[y][x]
-                    if isWhite
-                    else stable.rookEvalBlack[y][x]
-                )
-            elif piece_type == chess.KNIGHT:
-                return 30 + stable.knightEval[y][x]
-            elif piece_type == chess.BISHOP:
-                return 30 + (
-                    stable.bishopEvalWhite[y][x]
-                    if isWhite
-                    else stable.bishopEvalBlack[y][x]
-                )
-            elif piece_type == chess.QUEEN:
-                return 90 + stable.evalQueen[y][x]
-            elif piece_type == chess.KING:
-                return 900 + (
-                    stable.kingEvalWhite[y][x]
-                    if isWhite
-                    else stable.kingEvalBlack[y][x]
-                )
-
-        absolute_value = getAbsoluteValue(piece, piece.color == "w", x, y)
-        return absolute_value if piece.color == chess.WHITE else -absolute_value
-
-    def built_in_evalFunc(self, board):
-        a = self.mateOpportunity(board)
-        if a is not None:
-            return a
-
-        compt = 0
-        # Sums up the material values
-        for i in range(8):
-            for j in range(8):
-                square = chess.square(j, 7 - i)
-                compt += self.getPieceValue(board.piece_at(square), i, j)
-
-        compt *= 2
-
-        def has_castled(board, color):
-            for move in board.move_stack:
-                if (
-                    board.is_castling(move)
-                    and board.color_at(move.from_square) == color
-                ):
-                    return True
-            return False
-
-        # Then in your evaluation function:
-        if has_castled(board, self.color):
-            compt += 100  # Give 100 points if the AI has castled
-
-        last_move = board.peek()
-        compt += self.openning(board) + self.calculate_repetition_penalty(
-            last_move, board
-        )
-
-        if board.is_check():
-            if board.turn == self.color:
-                compt -= 50
+            
+        if board.is_capture(move):
+            captured_piece = board.piece_at(move.to_square)
+            attacker_piece = board.piece_at(move.from_square)
+            
+            if captured_piece:
+                # MVV-LVA: Most Valuable Victim - Least Valuable Attacker
+                victim_value = self.piece_value[captured_piece.piece_type]
+                attacker_value = self.piece_value[attacker_piece.piece_type]
+                return 9000 + (victim_value * 10 - attacker_value)
             else:
-                compt += 50
+                return 8000  # En passant
+                
+        if move.promotion:
+            return 9500 if move.promotion == chess.QUEEN else 8500
+            
+        # Check if move gives check (more expensive calculation)
+        if board.gives_check(move):
+            return 8000
+            
+        # History heuristic
+        move_key = (move.from_square, move.to_square)
+        return self.history.get(move_key, 0)
 
-        compt += random.randint(-1, 1)
-        return compt
-
-    def mateOpportunity(self, board):
+    def evaluate_static(self, board):
         """
-        Check if the current position presents a checkmate opportunity.
+        Optimized static evaluation function.
 
-        Returns:
-        - A large positive score if the current player has a checkmate opportunity.
-        - A large negative score if the opponent has a checkmate opportunity.
-        - Otherwise, returns 0.
+        :param board: Current chess board
+        :return: Score in centipawns, positive favors white
         """
-        if board.is_checkmate():
-            if board.turn == self.color:
-                return 999999
-
-            return -999999
-
-        if board.is_game_over():
-            return 0
-        return None
-
-    def openning(self, board):
-        """
-        Evaluate the opening phase of the game.
-
-        Returns:
-        - A score based on the number of legal moves, adjusted for the opening phase.
-        """
-        legal_moves = list(board.legal_moves)
-        if board.fullmove_number < 10:
-            if board.turn == self.color:
-                return 1 / 30 * len(legal_moves)
-            else:
-                return -1 / 30 * len(legal_moves)
-        else:
-            return 0
-            opening_evaluation = self.calculate_opening_evaluation(board)
-            return opening_evaluation
-
-    def calculate_opening_evaluation(self, board):
-        """
-        Calculate the overall opening evaluation based on material, pawn structure, and mobility.
-
-        Returns:
-        - The opening evaluation score.
-        """
-        return (
-            0.2 * self.calculate_material_evaluation(board)
-            + 0.3 * self.calculate_pawn_structure_evaluation(board)
-            + 0.2 * self.calculate_mobility_evaluation(board)
-            + 0.3 * self.calculate_king_safety_evaluation(board)
-        )
-
-    def calculate_material_evaluation(self, board):
-        """
-        Calculate the material evaluation based on the piece values.
-
-        Returns:
-        - The material evaluation score.
-        """
-        material_eval = 0
+        if CYTHON_AVAILABLE:
+            return minimax_cy.evaluate_static_cy(self.piece_value, 
+                                               self.pst_white_flat,
+                                               self.pst_black_flat,
+                                               board)
+        
+        # Original Python implementation
+        material = 0
+        pst_score = 0
+        
+        # Process all pieces in one loop to reduce overhead
         for square, piece in board.piece_map().items():
-            value = piece_values.get(piece.piece_type, 0)
-            if piece.color == self.color:
-                material_eval += value
+            piece_value = self.piece_value[piece.piece_type]
+            if piece.color == chess.WHITE:
+                material += piece_value
+                pst_score += self.pst_white[piece.piece_type][square]
             else:
-                material_eval -= value
-        return material_eval
+                material -= piece_value
+                pst_score -= self.pst_black[piece.piece_type][square]
+        
+        king_safety = self.evaluate_king_safety(board)
+        return material + pst_score + king_safety
 
-    def calculate_pawn_structure_evaluation(self, board):
+    def evaluate_king_safety(self, board):
         """
-        Calculate the pawn structure evaluation.
+        Evaluate king safety based on castling rights and pawn shield.
 
-        Returns:
-        - The pawn structure evaluation score.
+        :param board: Current chess board
+        :return: Safety score, positive favors white
         """
-        pawn_structure_eval = 0
-        for square, piece in board.piece_map().items():
-            if piece.piece_type == ch.PAWN and piece.color == self.color:
-                file, rank = ch.square_file(square), ch.square_rank(square)
-                pawn_structure_eval += 0.1 * (4 - abs(3 - file))
-        return pawn_structure_eval
+        score = 0
+        # Castling rights
+        if board.has_kingside_castling_rights(chess.WHITE):
+            score += 50
+        if board.has_queenside_castling_rights(chess.WHITE):
+            score += 50
+        if board.has_kingside_castling_rights(chess.BLACK):
+            score -= 50
+        if board.has_queenside_castling_rights(chess.BLACK):
+            score -= 50
+        
+        # Pawn shield for white king on g1
+        if board.king(chess.WHITE) == chess.G1:
+            if board.piece_at(chess.F2) == chess.Piece(chess.PAWN, chess.WHITE):
+                score += 20
+            if board.piece_at(chess.G2) == chess.Piece(chess.PAWN, chess.WHITE):
+                score += 20
+            if board.piece_at(chess.H2) == chess.Piece(chess.PAWN, chess.WHITE):
+                score += 20
+        
+        # Pawn shield for black king on g8
+        if board.king(chess.BLACK) == chess.G8:
+            if board.piece_at(chess.F7) == chess.Piece(chess.PAWN, chess.BLACK):
+                score -= 20
+            if board.piece_at(chess.G7) == chess.Piece(chess.PAWN, chess.BLACK):
+                score -= 20
+            if board.piece_at(chess.H7) == chess.Piece(chess.PAWN, chess.BLACK):
+                score -= 20
+        
+        return score
 
-    def calculate_mobility_evaluation(self, board):
+    def quiescence(self, board, alpha, beta, maximizing_player):
         """
-        Calculate the mobility evaluation based on legal moves.
-
-        Returns:
-        - The mobility evaluation score.
+        Quiescence search to evaluate only capture moves at search leaves.
+        Includes delta pruning to avoid searching unpromising captures.
+        
+        :param board: Current chess board
+        :param alpha: Alpha value for pruning
+        :param beta: Beta value for pruning
+        :param maximizing_player: True if maximizing, False if minimizing
+        :return: Quiescent evaluation score
         """
-        mobility_eval = 0
+        if CYTHON_AVAILABLE:
+            return minimax_cy.quiescence_cy(self.evaluate_static, board, alpha, beta, 
+                                          maximizing_player, self.piece_value)
+        
+        # Original Python implementation
+        stand_pat = self.evaluate_static(board)
+        if maximizing_player:
+            if stand_pat >= beta:
+                return beta
+            alpha = max(alpha, stand_pat)
+        else:
+            if stand_pat <= alpha:
+                return alpha
+            beta = min(beta, stand_pat)
+        
         for move in board.legal_moves:
-            if board.turn == self.color:
-                mobility_eval += 1  # Increase for own legal moves
+            if not board.is_capture(move):
+                continue
+            captured_piece = board.piece_at(move.to_square)
+            # Delta pruning - skip captures that can't improve position enough
+            delta = self.piece_value[captured_piece.piece_type] if captured_piece else 100
+            if maximizing_player and stand_pat + delta + 200 < alpha:  # 200 as margin
+                continue
+            elif not maximizing_player and stand_pat - delta - 200 > beta:
+                continue
+            
+            board.push(move)
+            eval = self.quiescence(board, alpha, beta, not maximizing_player)
+            board.pop()
+            
+            if maximizing_player:
+                alpha = max(alpha, eval)
+                if alpha >= beta:
+                    break
             else:
-                mobility_eval -= 1  # Decrease for opponent's legal moves
-        return mobility_eval
+                beta = min(beta, eval)
+                if beta <= alpha:
+                    break
+        
+        return alpha if maximizing_player else beta
 
-    def deepening_search_depth(self):
+    def alphabeta(self, board, depth, alpha, beta, maximizing_player, ply=0, is_pv_node=True):
         """
-        Increase the search depth as the game progresses.
+        Principal Variation Search (PVS) with Alpha-Beta pruning.
 
-        This function adjusts the maximum depth for the search algorithm based on the number of pieces on the board.
+        :param board: Current chess board
+        :param depth: Remaining search depth
+        :param alpha: Alpha value for pruning
+        :param beta: Beta value for pruning
+        :param maximizing_player: True if maximizing, False if minimizing
+        :param ply: Current ply in the search
+        :param is_pv_node: True if this is a PV node (should search with full window)
+        :return: Best evaluation score and best move
         """
-        # Calculate the number of pieces on the board
-        num_pieces = len(self.board.piece_map())
+        # Generate Zobrist hash for current position
+        zobrist_hash = chess.polyglot.zobrist_hash(board)
+        original_alpha = alpha
 
-        # Adjust the maximum depth based on the number of pieces
-        if num_pieces < 4:
-            self.maxDepth += 6
-        elif num_pieces < 5:
-            self.maxDepth += 5
-        elif num_pieces < 6:
-            self.maxDepth += 4
-        elif num_pieces < 8:
-            self.maxDepth += 3
-        elif num_pieces < 12:
-            self.maxDepth += 2
-        elif num_pieces < 14:
-            self.maxDepth += 1
-        print(self.maxDepth)
+        # Check for game over
+        if board.is_game_over():
+            if board.is_checkmate():
+                return -99999 if board.turn == chess.WHITE else 99999, None
+            elif board.is_stalemate() or board.is_insufficient_material():
+                return 0, None
 
-    def engine(self):
-        """
-        Perform the main engine search.
+        # Probe transposition table
+        tt_entry = self.tt.probe(zobrist_hash)
+        if tt_entry and tt_entry[1] >= depth:
+            flag, value, best_move = tt_entry[2], tt_entry[3], tt_entry[4]
+            if flag == 'exact':
+                return value, best_move
+            elif flag == 'lower' and value > alpha:
+                alpha = value
+            elif flag == 'upper' and value < beta:
+                beta = value
+            if alpha >= beta:
+                return value, best_move
 
-        Returns:
-        - The best move found by the engine.
-        """
-        key = self.calculate_board_hash(self.board)
+        # Leaf node - use quiescence search
+        if depth <= 0:
+            return self.quiescence(board, alpha, beta, maximizing_player), None
 
-        if key in self.transposition_table:
-            entry = self.transposition_table[key]
-            if entry["depth"] >= self.maxDepth:
-                if (entry["flag"] == True and self.engine_eval is not None) or (
-                    entry["flag"] == False and self.engine_eval is None
-                ):
-                    return chess.Move.from_uci(entry["best_move"]["san"])
+        # Null Move Pruning
+        if depth >= 2 and not board.is_check() and not is_pv_node and maximizing_player:
+            # Avoid null move in endgame (simplified check)
+            piece_count = len(board.piece_map())
+            if piece_count > 6:  # Arbitrary threshold
+                board.push(chess.Move.null())
+                null_eval, _ = self.alphabeta(board, depth - 3, beta - 1, beta, False, ply + 1, False)
+                board.pop()
+                if null_eval >= beta:
+                    return beta, None
+        
+        # Razoring - prune at low depths if static evaluation is far below alpha
+        if depth >= 1 and depth <= 3 and not board.is_check() and not is_pv_node:
+            # Increasing margin with depth
+            razor_margin = 300 + (depth - 1) * 100
+            static_eval = self.evaluate_static(board)
+            
+            # If static evaluation + margin is below alpha, it's unlikely this position will be good
+            if maximizing_player and static_eval + razor_margin < alpha:
+                # At depth 1, just return quiescence score
+                if depth == 1:
+                    q_eval = self.quiescence(board, alpha, beta, maximizing_player)
+                    return q_eval, None
+                
+                # At depths 2-3, verify with reduced depth search
+                razor_alpha = alpha - razor_margin
+                razor_eval, _ = self.alphabeta(board, 1, razor_alpha, razor_alpha + 1, maximizing_player, ply, False)
+                if razor_eval <= razor_alpha:
+                    return razor_eval, None
+            
+            # Mirror logic for minimizing player
+            elif not maximizing_player and static_eval - razor_margin > beta:
+                if depth == 1:
+                    q_eval = self.quiescence(board, alpha, beta, maximizing_player)
+                    return q_eval, None
+                
+                razor_beta = beta + razor_margin
+                razor_eval, _ = self.alphabeta(board, 1, razor_beta - 1, razor_beta, maximizing_player, ply, False)
+                if razor_eval >= razor_beta:
+                    return razor_eval, None
 
-        if self.engine_eval is None:
-            self.deepening_search_depth()
+        # Futility Pruning
+        if depth == 1 and not board.is_check() and not is_pv_node:
+            static_eval = self.evaluate_static(board)
+            futility_margin = 900  # Queen value
+            if maximizing_player and static_eval + futility_margin <= alpha:
+                return static_eval, None
+            elif not maximizing_player and static_eval - futility_margin >= beta:
+                return static_eval, None
 
-        move, val = self.minimax(self.board.copy(), float("-inf"), float("inf"), 1)
+        # Get legal moves and sort them
+        moves = list(board.legal_moves)
+        tt_move = tt_entry[4] if tt_entry else None
+        moves.sort(key=lambda m: self.score_move(board, m, ply, tt_move), reverse=True)
 
-        self.store_transposition_table_entry(
-            self.board,
-            self.maxDepth,
-            val,
-            move,
-            True if self.engine_eval is not None else False,
-        )
+        if not moves:
+            return self.evaluate_static(board), None
 
-        self.update_cache()
-        return move
-
-    def calculate_complexity(self):
-        """
-        Calculate the complexity of the position.
-
-        Returns:
-        - The calculated complexity score.
-        """
-        material_complexity = abs(self.calculate_material_evaluation())
-        pawn_structure_complexity = self.calculate_pawn_structure_evaluation()
-        king_safety_complexity = self.calculate_king_safety_evaluation()
-
-        total_complexity = (
-            material_complexity + pawn_structure_complexity + king_safety_complexity
-        )
-        return total_complexity
-
-    def calculate_king_safety_evaluation(self, board):
-        """
-        Calculate the king safety evaluation based on pawn shields.
-
-        Returns:
-        - The king safety evaluation score.
-        """
-        pawn_shield_eval = 0
-        for square, piece in board.piece_map().items():
-            if piece.piece_type == ch.PAWN and piece.color == self.color:
-                file, rank = ch.square_file(square), ch.square_rank(square)
-                if rank == 1 and self.color == ch.WHITE:
-                    pawn_shield_eval += 1
-                elif rank == 6 and self.color == ch.BLACK:
-                    pawn_shield_eval += 1
-        return pawn_shield_eval
-
-    def is_checkmate(self, move, board):
-        """
-        Check if a move results in a checkmate.
-
-        Parameters:
-        - move: The chess move.
-        - board: The chess board.
-
-        Returns:
-        - True if the move results in a checkmate, False otherwise.
-        """
-        board_copy = board.copy()
-        board_copy.push(move)
-        return board_copy.is_checkmate
-
-    def calculate_board_hash(self, board):
-        """
-        Calculate a hash value for the chess board.
-
-        Parameters:
-        - board: The chess board.
-
-        Returns:
-        - The calculated hash value.
-        """
-        return board.fen()
-
-    def minimax(self, board, alpha, beta, depth):
-
-        moveList = list(board.legal_moves)
-        moveList.sort(
-            key=lambda move: (board.is_capture(move), board.is_check()),
-            reverse=True,
-        )
-
-        if not moveList:
-            return None, self.evalFunct(board)
-
-        newCandidate = float("-inf") if depth % 2 != 0 else float("inf")
         best_move = None
+        best_eval = -99999 if maximizing_player else 99999
+        search_pv = True  # Flag to track if we are searching the first move (PV)
 
-        for i in moveList:
-            board.push(i)
-            if depth == self.maxDepth:
-                value = self.evalFunct(board)
+        for i, move in enumerate(moves):
+            board.push(move)
+            
+            # Apply Late Move Reduction (LMR)
+            if i >= 4 and depth >= 3 and not board.is_check() and not board.is_capture(move) and not move.promotion:
+                reduced_depth = depth - 2
             else:
-                _, value = self.minimax(board, alpha, beta, depth + 1)
+                reduced_depth = depth - 1
 
-            if (value > newCandidate and depth % 2 != 0) or (
-                value < newCandidate and depth % 2 == 0
-            ):
-                best_move = i
-                newCandidate = value
-
-            if depth % 2 == 0:
-                alpha = max(alpha, value)
+            # Principal Variation Search
+            if search_pv:
+                # First move searched with full window
+                eval, _ = self.alphabeta(board, reduced_depth, alpha, beta, not maximizing_player, ply + 1, is_pv_node)
+                search_pv = False
             else:
-                beta = min(beta, value)
-
+                # Remaining moves searched with null window, re-search if promising
+                eval, _ = self.alphabeta(board, reduced_depth, alpha, alpha + 1, not maximizing_player, ply + 1, False)
+                
+                # Re-search with full window if needed
+                if alpha < eval < beta:
+                    eval, _ = self.alphabeta(board, reduced_depth, alpha, beta, not maximizing_player, ply + 1, False)
+            
             board.pop()
 
-            if beta <= alpha:
-                break
+            if maximizing_player:
+                if eval > best_eval:
+                    best_eval = eval
+                    best_move = move
+                alpha = max(alpha, eval)
+                if beta <= alpha:
+                    # Update history for good quiet moves causing beta cutoff
+                    if not board.is_capture(move):
+                        move_key = (move.from_square, move.to_square)
+                        self.history[move_key] = self.history.get(move_key, 0) + depth * depth
+                        self.killer_moves[ply][1] = self.killer_moves[ply][0]
+                        self.killer_moves[ply][0] = move
+                    break
+            else:
+                if eval < best_eval:
+                    best_eval = eval
+                    best_move = move
+                beta = min(beta, eval)
+                if beta <= alpha:
+                    # Update history for good quiet moves causing alpha cutoff
+                    if not board.is_capture(move):
+                        move_key = (move.from_square, move.to_square)
+                        self.history[move_key] = self.history.get(move_key, 0) + depth * depth
+                        self.killer_moves[ply][1] = self.killer_moves[ply][0]
+                        self.killer_moves[ply][0] = move
+                    break
 
-        return best_move, newCandidate
+        # Store in transposition table
+        if best_move:
+            flag = 'exact'
+            if best_eval <= original_alpha:
+                flag = 'upper'
+            elif best_eval >= beta:
+                flag = 'lower'
+            self.tt.store(zobrist_hash, depth, flag, best_eval, best_move)
+
+        return best_eval, best_move
+
+    def get_best_move(self, board):
+        """
+        Return the best move for the current board position using iterative deepening
+        and aspiration windows.
+
+        :param board: Current chess board
+        :return: Best move as a chess.Move object
+        """
+        # Use opening book if position is in opening database
+        if board.fen() in self.opening_moves:
+            return random.choice(self.opening_moves[board.fen()])
+        
+        best_move = None
+        prev_eval = 0  # Initial evaluation guess
+        window = 50    # Initial aspiration window width (in centipawns)
+        
+        # Iterative deepening loop
+        for depth in range(1, self.depth + 1):
+            # Use best_move from previous depth at the beginning of move ordering
+            moves = list(board.legal_moves)
+            if best_move in moves:
+                moves.remove(best_move)
+                moves.insert(0, best_move)
+            
+            # Set aspiration window based on previous depth evaluation
+            alpha = prev_eval - window
+            beta = prev_eval + window
+            
+            # Keep re-searching with wider windows if evaluation falls outside the window
+            attempts = 0
+            while attempts < 3:  # Limit re-searches to avoid infinite loops
+                if self.color == chess.WHITE:
+                    eval, new_best_move = self.alphabeta(board, depth, alpha, beta, True, 0)
+                else:
+                    eval, new_best_move = self.alphabeta(board, depth, alpha, beta, False, 0)
+                
+                # Check if evaluation is within window
+                if self.color == chess.WHITE and eval <= alpha:  # Fail low
+                    window = window * 2
+                    alpha = eval - window
+                    attempts += 1
+                    continue
+                elif self.color == chess.WHITE and eval >= beta:  # Fail high
+                    window = window * 2
+                    beta = eval + window
+                    attempts += 1
+                    continue
+                elif self.color == chess.BLACK and eval >= beta:  # Fail high for black
+                    window = window * 2
+                    beta = eval + window
+                    attempts += 1
+                    continue
+                elif self.color == chess.BLACK and eval <= alpha:  # Fail low for black
+                    window = window * 2
+                    alpha = eval - window
+                    attempts += 1
+                    continue
+                
+                # If we're here, the evaluation is within the window
+                if new_best_move:
+                    best_move = new_best_move
+                prev_eval = eval
+                break
+            
+            # If we reach max attempts, use whatever best_move we have
+            if attempts >= 3 and new_best_move:
+                best_move = new_best_move
+        
+        # In the unlikely case we have no best move, just pick the first legal move
+        if not best_move and board.legal_moves:
+            best_move = list(board.legal_moves)[0]
+            prev_eval = self.evaluate_static(board)
+
+        print(f"Best move found: {best_move} with evaluation: {prev_eval}")
+        return best_move

@@ -8,15 +8,16 @@ import signal
 import sys
 import gc
 import random
+import argparse
 
 
-from models import ChessNet
+from models import ChessNet, create_chess_model
 from data import (ChessDataset, PuzzleDataset, load_puzzles, load_lichess_puzzles, 
                  filter_and_prioritize_puzzles_cached, load_professional_games, 
                  load_games_in_batches)
-from utils import clear_memory, test_tactical_recognition
+from utils import clear_memory, test_tactical_recognition, get_optimal_batch_size
 from self_play import generate_self_play_games, run_self_play_training
-from training import train_batch, train_tactical, get_optimal_batch_size
+from training import train_batch, train_tactical
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -31,18 +32,84 @@ def signal_handler(sig, frame, model, save_path, state_file, processed_games, cu
     print(f"Model saved to {save_path}, state saved to {state_file}")
     sys.exit(0)
 
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Chess model training script")
+    
+    # Training mode
+    parser.add_argument("mode", nargs="?", default=None, choices=["pro", "regular", "self-play"], 
+                        help="Training mode: professional games, regular games, or self-play")
+    
+    # Model parameters
+    parser.add_argument("--model", default="big", choices=["small", "big"], 
+                        help="Model size: small (fewer parameters) or big (more parameters)")
+    
+    parser.add_argument("--model-path", default=None, 
+                        help="Path to save/load the model (default: ./chess_model/[model_size]_model.pth)")
+    
+    # MCTS parameters
+    parser.add_argument("--no-mcts", action="store_true", 
+                        help="Disable MCTS for self-play (faster but lower quality)")
+    
+    parser.add_argument("--fast-mtcs", action="store_true", 
+                        help="Use fast MCTS for self-play (balanced speed/quality)")
+    
+    # Self-play parameters when in self-play mode
+    parser.add_argument("games", nargs="?", type=int, default=None,
+                        help="Number of games per batch in self-play mode")
+    
+    parser.add_argument("iterations", nargs="?", type=int, default=None,
+                        help="Number of iterations per cycle in self-play mode")
+    
+    args = parser.parse_args()
+    
+    # Set defaults based on arguments
+    if args.model_path is None:
+        args.model_path = f"./chess_model/{args.model}_model.pth"
+        
+    # Backward compatibility for positional arguments
+    if len(sys.argv) > 1 and sys.argv[1] in ["pro", "regular", "self-play"] and args.mode is None:
+        args.mode = sys.argv[1]
+    
+    return args
+
+
 # Main execution function
 def main():
-    # Initialize model and basic setup
-    model = ChessNet(num_blocks=10, channels=256).to(device)  
-    save_path = "./chess_model/chess_model.pth"
-    state_file = "./chess_model/training_state.json"
-    pro_state_file = "./chess_model/pro_training_state.json"
+    # Parse command line arguments
+    args = parse_arguments()
+    
+    # Initialize model based on size
+    if args.model == "small":
+        print("Using small model architecture (fewer parameters)")
+        model = create_chess_model("small").to(device)
+    else:  # "big"
+        print("Using big model architecture (more parameters)")
+        model = create_chess_model("big").to(device)
+        
+    # Setup paths
+    save_path = args.model_path
+    model_dir = os.path.dirname(save_path)
+    state_file = os.path.join(model_dir, "training_state.json")
+    pro_state_file = os.path.join(model_dir, "pro_training_state.json")
     
     # Create directory if it doesn't exist
-    os.makedirs("./chess_model", exist_ok=True)
+    os.makedirs(model_dir, exist_ok=True)
     
+    # Determine MCTS settings
+    use_mcts = not args.no_mcts
+    fast_mcts = args.fast_mtcs
+    
+    if not use_mcts:
+        print("MCTS disabled for self-play (faster but lower quality)")
+    elif fast_mcts:
+        print("Using fast MCTS for self-play (balanced speed/quality)")
+    else:
+        print("Full MCTS enabled for self-play (highest quality games)")
+    
+    # Load existing model if available
     if os.path.exists(save_path):
+        print(f"Loading existing model from {save_path}")
         model.load_state_dict(torch.load(save_path))
         print(f"Loaded existing model from {save_path}")
 
@@ -99,8 +166,14 @@ def main():
 
     all_puzzles = pgn_puzzles + lichess_puzzles
     prioritized_puzzles = filter_and_prioritize_puzzles_cached(all_puzzles)
-    puzzle_dataset = PuzzleDataset(prioritized_puzzles)
+    
+    # Add this line to determine model type based on the loaded model
+    model_type = "small" if model.is_small_model() else "big"
+    
+    # Pass model_type to puzzle_dataset to ensure matching channels
+    puzzle_dataset = PuzzleDataset(prioritized_puzzles, model_type=model_type)
     print(f"Total puzzles after prioritization: {len(prioritized_puzzles)}")
+    print(f"Using {model_type} model architecture with {model.input_channels} input channels")
 
     # Find optimal batch size
     print("Determining optimal batch size...")
@@ -108,6 +181,7 @@ def main():
     optimal_batch_size = get_optimal_batch_size(model, device, starting_size=64)
     model.train()
     print(f"Using optimal batch size: {optimal_batch_size}")
+    
     
     # Create puzzle dataloader once - puzzles are smaller and reused
     puzzle_dataloader = DataLoader(
@@ -118,32 +192,16 @@ def main():
         pin_memory=True
     )
     
-    # Default training mode and MCTS settings
+    # Determine training mode
     current_phase = "regular"  # Default mode
-    use_mcts = True  # Default is now to use MCTS for better quality
     is_mode_locked = False  # Track if mode is locked by command line
     
-    # Check if mode is specified via command line
-    if len(sys.argv) > 1:
-        if sys.argv[1] in ["pro", "regular", "self-play"]:
-            current_phase = sys.argv[1]
-            is_mode_locked = True  # Lock the mode when specified via command line
-            print(f"Command-line override: Using {current_phase} training mode (locked)")
+    # Set mode based on command line argument
+    if args.mode:
+        current_phase = args.mode
+        is_mode_locked = True
+        print(f"Command-line override: Using {current_phase} training mode (locked)")
             
-        # Check for MCTS flags
-        if "--no-mcts" in sys.argv:
-            use_mcts = False
-            fast_mcts = False
-            print("MCTS disabled for self-play (faster but lower quality)")
-        elif "--fast-mtcs" in sys.argv:
-            use_mcts = True
-            fast_mcts = True
-            print("Using fast MCTS for self-play (balanced speed/quality)")
-        else:
-            use_mcts = True
-            fast_mcts = False
-            print("Full MCTS enabled for self-play (highest quality games)")
-    
     # Set batch sizes - smaller batch sizes for faster processing
     pro_batch_size = 1000
     regular_batch_size = 1000
@@ -161,24 +219,16 @@ def main():
             print("\n=== SELF-PLAY REINFORCEMENT LEARNING MODE ===")
             
             # Default number of self-play games and iterations for continuous mode
-            games_per_batch = 10  # Lower default for continuous mode
-            iterations_per_cycle = 1  # Fewer iterations per cycle for faster feedback
+            games_per_batch = 30  # Lower default for continuous mode
+            iterations_per_cycle = 2  # Fewer iterations per cycle for faster feedback
             
-            # Check if user specified number of games and iterations
-            if len(sys.argv) > 2 and sys.argv[2] not in ["--mcts"]:
-                try:
-                    # In continuous mode, this is games per batch
-                    games_per_batch = int(sys.argv[2])
-                except ValueError:
-                    print(f"Invalid number of games: {sys.argv[2]}. Using default: {games_per_batch}")
-                    
-            if len(sys.argv) > 3 and sys.argv[3] not in ["--mcts"]:
-                try:
-                    # In continuous mode, this is iterations per cycle
-                    iterations_per_cycle = int(sys.argv[3])
-                except ValueError:
-                    print(f"Invalid iterations per cycle: {sys.argv[3]}. Using default: {iterations_per_cycle}")
-            
+            # Use command line arguments if provided
+            if args.games is not None:
+                games_per_batch = args.games
+                
+            if args.iterations is not None:
+                iterations_per_cycle = args.iterations
+                
             print(f"Running {iterations_per_cycle} iterations with {games_per_batch} games per iteration")
             
             # Run self-play training for this batch
@@ -196,7 +246,7 @@ def main():
             # Run tactical training after self-play to maintain tactical awareness
             print("Running tactical training phase...")
             tactical_optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
-            tactical_epochs = min(3 + iterations // 5, 10)  # Start with 3, gradually increase
+            tactical_epochs = min(6 + iterations // 5, 20)  # Start with 6, gradually increase
             train_tactical(model, tactical_optimizer, puzzle_dataloader, device, epochs=tactical_epochs)
             
             # Test tactical recognition occasionally
@@ -233,7 +283,7 @@ def main():
             print(f"Processing professional batch with {batch_size} games")
             
             # Create dataset and dataloader for this batch only
-            game_dataset = ChessDataset(pro_games, augment=True)
+            game_dataset = ChessDataset(pro_games, augment=True, model_type=model_type)
             game_dataloader = DataLoader(
                 game_dataset, 
                 batch_size=optimal_batch_size,
@@ -255,31 +305,9 @@ def main():
             
             # Tactical training after professional batch
             print("Running quick tactical training phase...")
-            tactical_optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
-            train_tactical(model, tactical_optimizer, puzzle_dataloader, device, epochs=3)
+            tactical_optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+            train_tactical(model, tactical_optimizer, puzzle_dataloader, device, epochs=6)
             
-            # Generate a few self-play games after each pro batch
-            self_play_count = min(iterations, 5)
-            print(f"Generating {self_play_count} self-play games...")
-            self_play_games = generate_self_play_games(model, device, num_games=self_play_count, use_mcts=use_mcts)
-            
-            if self_play_games:
-                self_play_dataset = ChessDataset(self_play_games, augment=True)
-                self_play_dataloader = DataLoader(
-                    self_play_dataset,
-                    batch_size=optimal_batch_size,
-                    shuffle=True,
-                    num_workers=1,
-                    pin_memory=True
-                )
-                train_batch(model, self_play_dataloader, puzzle_dataloader, save_path, pro_state_file, 
-                        epochs=1, processed_games=processed_games, device=device)
-                
-                del self_play_games
-                del self_play_dataset
-                del self_play_dataloader
-                gc.collect()
-                clear_memory()
             
             # Test tactical recognition occasionally
             if iterations % 3 == 0:
@@ -333,6 +361,10 @@ def main():
             del game_dataloader
             gc.collect()
             clear_memory()
+
+            print("Running enhanced tactical training phase for regular games...")
+            tactical_optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
+            train_tactical(model, tactical_optimizer, puzzle_dataloader, device, epochs=6)
             
             # Generate some self-play games after regular batch
             self_play_count = min(5 + iterations // 2, 10)

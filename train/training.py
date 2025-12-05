@@ -8,8 +8,6 @@ import os
 import sys
 import time
 
-from utils import clear_memory, test_tactical_recognition
-from data import SelfPlayDataset
 
 
 def train_batch(model, game_dataloader, puzzle_dataloader, save_path, state_file, epochs=5, processed_games=0, device='cuda'):
@@ -58,7 +56,7 @@ def train_batch(model, game_dataloader, puzzle_dataloader, save_path, state_file
             
             if scaler:  # Use mixed precision if available
                 # Use autocast for mixed precision
-                with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu"):
+                with autocast():
                     policy_logits, value_pred = model(inputs)
                     policy_loss = policy_loss_fn(policy_logits, policy_targets)
                     value_loss = value_loss_fn(value_pred.squeeze(), value_targets)
@@ -93,7 +91,7 @@ def train_batch(model, game_dataloader, puzzle_dataloader, save_path, state_file
                     
                     if scaler:  # Use mixed precision if available
                         # Use autocast for puzzles too
-                        with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu"):
+                        with autocast():
                             policy_logits, value_pred = model(inputs)
                             policy_loss = policy_loss_fn(policy_logits, policy_targets)
                             value_loss = value_loss_fn(value_pred.squeeze(), value_targets)
@@ -134,8 +132,6 @@ def train_tactical(model, optimizer, dataloader, device, epochs=3):
     value_loss_fn = nn.MSELoss()
     model.train()
     
-    # Add position filtering to focus on most valuable positions
-    
     # Track loss by category
     category_losses = {}
     category_counts = {}
@@ -145,7 +141,18 @@ def train_tactical(model, optimizer, dataloader, device, epochs=3):
         total_loss = 0
         
         for batch in dataloader:
-            inputs, policy_targets, value_targets, categories = batch  # Add category tracking
+            # Handle both 3-element and 4-element batches
+            if len(batch) == 3:
+                inputs, policy_targets, value_targets = batch
+                # Default categories when not provided
+                categories = ["default"] * inputs.size(0)
+            else:
+                inputs, policy_targets, value_targets, categories = batch
+            
+            inputs = inputs.to(device)
+            policy_targets = policy_targets.to(device)
+            value_targets = value_targets.to(device)
+
             
             # Calculate loss with category-based weighting
             loss = 0
@@ -185,8 +192,6 @@ def train_tactical(model, optimizer, dataloader, device, epochs=3):
             
             total_loss += loss.item()
             batch_count += 1
-            if batch_count >= 10:  # Limit number of batches for speed
-                break
         
         if batch_count > 0:
             avg_loss = total_loss / batch_count
@@ -195,23 +200,3 @@ def train_tactical(model, optimizer, dataloader, device, epochs=3):
     return total_loss / batch_count if batch_count > 0 else 0
 
 
-def get_optimal_batch_size(model, device, starting_size=32, min_size=8):
-    """Find the largest batch size that fits in memory"""
-    batch_size = starting_size
-    
-    while batch_size >= min_size:
-        try:
-            # Try to create a batch of random data
-            dummy_input = torch.randn(batch_size, 20, 8, 8, device=device)
-            model(dummy_input)
-            dummy_input = None
-            clear_memory()
-            return batch_size
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                batch_size //= 2
-                clear_memory()
-            else:
-                raise e
-    
-    return min_size  # Fallback to minimum size

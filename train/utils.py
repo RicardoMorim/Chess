@@ -20,10 +20,13 @@ def get_optimal_batch_size(model, device, starting_size=32, min_size=8):
     """Find the largest batch size that fits in memory"""
     batch_size = starting_size
     
+    # Add this line to detect input channels from the model
+    input_channels = model.input_channels
+    
     while batch_size >= min_size:
         try:
-            # Try to create a batch of random data
-            dummy_input = torch.randn(batch_size, 20, 8, 8, device=device)
+            # Use the detected input_channels instead of hardcoded 20
+            dummy_input = torch.randn(batch_size, input_channels, 8, 8, device=device)
             model(dummy_input)
             dummy_input = None
             clear_memory()
@@ -36,7 +39,6 @@ def get_optimal_batch_size(model, device, starting_size=32, min_size=8):
                 raise e
     
     return min_size  # Fallback to minimum size
-
 
 def load_tactical_test_positions() -> List[Tuple[str, str, str]]:
     """Returns a flattened list of all tactical test positions"""
@@ -54,6 +56,7 @@ def test_tactical_recognition(model, device):
     test_positions = load_tactical_test_positions()
     batch_size = 8  # Process multiple positions at once
     correct = 0
+    input_channels = model.input_channels if hasattr(model, 'input_channels') else 20
     
     for i in range(0, len(test_positions), batch_size):
         batch_positions = test_positions[i:i+batch_size]
@@ -62,7 +65,7 @@ def test_tactical_recognition(model, device):
         
         # Batch process the input tensors
         input_tensors = torch.stack([
-            torch.tensor(board_to_tensor(board, 0), dtype=torch.float32)
+            torch.tensor(board_to_tensor(board, 0, input_channels), dtype=torch.float32)
             for board in boards
         ]).to(device)
         

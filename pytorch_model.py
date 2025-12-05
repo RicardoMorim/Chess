@@ -274,7 +274,7 @@ class PytorchModel:
         # Updated to use the enhanced model with 10 blocks
         self.model = ChessNet(num_blocks=10, channels=256).to(device)
 
-        self.model.quantize()
+        # self.model.quantize()
 
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model not found at {model_path}")
