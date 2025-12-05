@@ -210,21 +210,126 @@ class LegacyChessNet(nn.Module):
 
 
 # ============================================================================
+# LIMITED MODEL (Optimized for low VRAM - 2GB GPUs like GTX 1050)
+# ============================================================================
+class LimitedChessNet(nn.Module):
+    """Memory-efficient Chess Neural Network for low VRAM GPUs (2GB).
+    
+    Optimizations:
+    - Only 4 residual blocks (vs 10-15)
+    - 64 filters (vs 256) - 16x fewer parameters
+    - No SE blocks (saves memory)
+    - 18 input channels (no attack maps)
+    - Smaller value head
+    
+    This model is designed to fit in 2GB VRAM with batch size 16.
+    Estimated VRAM usage: ~800MB model + ~600MB gradients + ~400MB batch = ~1.8GB
+    """
+    def __init__(self, num_blocks=4, channels=64, input_channels=18):
+        super(LimitedChessNet, self).__init__()
+        self.input_channels = input_channels
+        self.num_blocks = num_blocks
+        self.channels = channels
+        self.use_se = False
+        self.legacy_mode = False
+        
+        # Initial convolution
+        self.conv1 = nn.Conv2d(input_channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(channels)
+        
+        # Residual tower (lightweight blocks)
+        self.blocks = nn.ModuleList([
+            self._make_block(channels) for _ in range(num_blocks)
+        ])
+        
+        # Policy head - 73 planes for move encoding
+        self.policy_conv = nn.Conv2d(channels, 32, kernel_size=1, bias=False)  # Smaller intermediate
+        self.policy_bn = nn.BatchNorm2d(32)
+        self.policy_fc = nn.Linear(32 * 64, 4672)  # 4672 = 73 * 64 move outputs
+        
+        # Compact value head with global pooling
+        self.value_conv = nn.Conv2d(channels, 16, kernel_size=1, bias=False)
+        self.value_bn = nn.BatchNorm2d(16)
+        self.value_fc1 = nn.Linear(16, 64)
+        self.value_fc2 = nn.Linear(64, 1)
+        
+        # Initialize weights
+        self._initialize_weights()
+    
+    def _make_block(self, channels):
+        """Create a simple residual block without SE."""
+        return nn.Sequential(
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+        )
+    
+    def _initialize_weights(self):
+        """Initialize weights for better training."""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x):
+        # Initial convolution
+        x = F.relu(self.bn1(self.conv1(x)))
+        
+        # Residual tower with skip connections
+        for block in self.blocks:
+            residual = x
+            x = block(x) + residual
+        
+        # Policy head
+        policy = F.relu(self.policy_bn(self.policy_conv(x)))
+        policy = policy.view(policy.size(0), -1)
+        policy = self.policy_fc(policy)
+        
+        # Value head with global average pooling
+        value = F.relu(self.value_bn(self.value_conv(x)))
+        value = value.mean(dim=[2, 3])  # Global avg pool: (B, 16, 8, 8) -> (B, 16)
+        value = F.relu(self.value_fc1(value))
+        value = torch.tanh(self.value_fc2(value))
+        
+        return policy, value
+    
+    def is_small_model(self):
+        return True
+    
+    def is_big_model(self):
+        return False
+
+
+# ============================================================================
 # FACTORY FUNCTIONS
 # ============================================================================
 def create_chess_model(model_type="big", use_se=True, legacy=False):
     """Create a chess model based on the specified type.
     
     Args:
-        model_type: 'big', 'small', or 'medium'
+        model_type: 'big', 'small', 'medium', or 'limited'
         use_se: Whether to use Squeeze-and-Excitation blocks (recommended)
         legacy: If True, create legacy model for loading old checkpoints
     
     Model configurations:
-    - small: 6 blocks, 18 input channels (fast, for testing)
-    - medium: 10 blocks, 22 input channels (balanced)
-    - big: 15 blocks, 22 input channels (best quality)
+    - limited: 4 blocks, 64 channels, 18 inputs (for 2GB VRAM GPUs)
+    - small: 6 blocks, 256 channels, 18 inputs (fast, for testing)
+    - medium: 10 blocks, 256 channels, 22 inputs (balanced)
+    - big: 15 blocks, 256 channels, 22 inputs (best quality)
     """
+    if model_type.lower() == "limited":
+        # Special memory-efficient model for low VRAM GPUs
+        return LimitedChessNet(num_blocks=4, channels=64, input_channels=18)
+    
     if legacy:
         # Return legacy model for loading old checkpoints
         if model_type.lower() == "small":
@@ -269,14 +374,23 @@ def load_model_with_compatibility(model_path, device='cuda', prefer_new=True):
     first_conv_weight = checkpoint.get('conv1.weight', None)
     if first_conv_weight is not None:
         input_channels = first_conv_weight.shape[1]
+        num_filters = first_conv_weight.shape[0]
     else:
         input_channels = 20  # Default
+        num_filters = 256
     
     # Count number of blocks
-    num_blocks = len([k for k in checkpoint.keys() if k.startswith('blocks.') and k.endswith('.conv1.weight')])
+    num_blocks = len([k for k in checkpoint.keys() if k.startswith('blocks.') and k.endswith('.0.weight')])
+    if num_blocks == 0:
+        num_blocks = len([k for k in checkpoint.keys() if k.startswith('blocks.') and k.endswith('.conv1.weight')])
+    
+    # Check for limited model (64 filters, 4 blocks, has policy_fc)
+    is_limited = num_filters <= 64 or 'policy_fc.weight' in checkpoint.keys()
     
     # Determine model type
-    if has_se or input_channels == 22:
+    if is_limited:
+        model = create_chess_model("limited")
+    elif has_se or input_channels == 22:
         # New architecture
         if num_blocks <= 6:
             model = create_chess_model("small", use_se=has_se, legacy=False)
