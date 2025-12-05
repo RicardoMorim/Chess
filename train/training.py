@@ -1,30 +1,189 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR, LambdaLR
 from torch.cuda.amp import autocast, GradScaler
 import json
 import os
 import sys
 import time
+import math
 
-
-
-def train_batch(model, game_dataloader, puzzle_dataloader, save_path, state_file, epochs=5, processed_games=0, device='cuda'):
-    """Train the model on a batch of games and puzzles"""
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
-    policy_loss_fn = nn.CrossEntropyLoss()
-    value_loss_fn = nn.MSELoss()
+# ============================================================================
+# TRAINING CONFIGURATION
+# ============================================================================
+TRAIN_CONFIG = {
+    # Optimizer settings (AlphaZero-style)
+    'optimizer': 'sgd',           # 'sgd' or 'adam'
+    'sgd_lr': 0.2,                # Initial LR for SGD
+    'sgd_momentum': 0.9,          # Momentum for SGD
+    'adam_lr': 0.001,             # Initial LR for Adam
+    'weight_decay': 1e-4,         # L2 regularization
     
-    # Initialize gradient scaler for mixed precision
+    # Learning rate schedule
+    'lr_schedule': 'cosine',      # 'cosine', 'step', or 'onecycle'
+    'lr_milestones': [100, 150],  # For step schedule
+    'lr_gamma': 0.1,              # LR decay factor
+    
+    # Gradient clipping
+    'grad_clip': 1.0,             # Max gradient norm
+    
+    # Loss weights
+    'policy_weight': 1.0,         # Policy loss weight
+    'value_weight': 1.0,          # Value loss weight
+    'puzzle_policy_weight': 2.0,  # Higher weight for puzzles
+    'puzzle_value_weight': 1.5,   # Higher weight for puzzle values
+    
+    # Training dynamics
+    'puzzle_frequency': 1,        # Train on puzzles every N game batches
+    'puzzle_batches': 5,          # Number of puzzle batches per game batch
+}
+
+
+# ============================================================================
+# LOSS FUNCTIONS
+# ============================================================================
+class PolicyLoss(nn.Module):
+    """Policy loss that handles both hard targets (indices) and soft targets (distributions)."""
+    def __init__(self):
+        super().__init__()
+        self.ce_loss = nn.CrossEntropyLoss()
+    
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits: Policy logits from network (B, num_moves)
+            targets: Either class indices (B,) or soft target distributions (B, num_moves)
+        """
+        if targets.dim() == 1:
+            # Hard targets (class indices) - use cross entropy
+            return self.ce_loss(logits, targets)
+        else:
+            # Soft targets (probability distributions) - use KL divergence
+            log_probs = F.log_softmax(logits, dim=1)
+            return -(targets * log_probs).sum(dim=1).mean()
+
+
+class ValueLoss(nn.Module):
+    """Value loss with optional Huber loss for robustness."""
+    def __init__(self, use_huber=False, delta=1.0):
+        super().__init__()
+        self.use_huber = use_huber
+        if use_huber:
+            self.loss_fn = nn.SmoothL1Loss(beta=delta)
+        else:
+            self.loss_fn = nn.MSELoss()
+    
+    def forward(self, pred, target):
+        return self.loss_fn(pred.squeeze(), target)
+
+
+# ============================================================================
+# OPTIMIZER FACTORY
+# ============================================================================
+def create_optimizer(model, config=None):
+    """Create optimizer based on configuration.
+    
+    AlphaZero uses SGD with momentum, which often works better than Adam
+    for self-play reinforcement learning.
+    """
+    if config is None:
+        config = TRAIN_CONFIG
+    
+    if config['optimizer'] == 'sgd':
+        optimizer = torch.optim.SGD(
+            model.parameters(),
+            lr=config['sgd_lr'],
+            momentum=config['sgd_momentum'],
+            weight_decay=config['weight_decay'],
+            nesterov=True  # Nesterov momentum often helps
+        )
+    else:  # adam
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=config['adam_lr'],
+            weight_decay=config['weight_decay'],
+            betas=(0.9, 0.999)
+        )
+    
+    return optimizer
+
+
+def create_scheduler(optimizer, num_epochs, config=None):
+    """Create learning rate scheduler."""
+    if config is None:
+        config = TRAIN_CONFIG
+    
+    if config['lr_schedule'] == 'cosine':
+        scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+    elif config['lr_schedule'] == 'onecycle':
+        # OneCycleLR is good for training from scratch
+        scheduler = OneCycleLR(
+            optimizer,
+            max_lr=config['sgd_lr'] if config['optimizer'] == 'sgd' else config['adam_lr'],
+            epochs=num_epochs,
+            steps_per_epoch=1,  # Will be updated
+            pct_start=0.3,
+            anneal_strategy='cos'
+        )
+    else:  # step
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            optimizer,
+            milestones=config['lr_milestones'],
+            gamma=config['lr_gamma']
+        )
+    
+    return scheduler
+
+
+# ============================================================================
+# MAIN TRAINING FUNCTION
+# ============================================================================
+def train_batch(model, game_dataloader, puzzle_dataloader, save_path, state_file, 
+                epochs=5, processed_games=0, device='cuda', use_sgd=True):
+    """Train the model on a batch of games and puzzles.
+    
+    Improvements over original:
+    - Option to use SGD with momentum (AlphaZero-style)
+    - Gradient clipping for stability
+    - Better loss weighting
+    - Support for soft policy targets
+    """
+    # Create optimizer
+    if use_sgd:
+        optimizer = torch.optim.SGD(
+            model.parameters(), 
+            lr=0.01,  # Start lower, let scheduler handle
+            momentum=0.9, 
+            weight_decay=1e-4,
+            nesterov=True
+        )
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+    
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    
+    # Loss functions
+    policy_loss_fn = PolicyLoss()
+    value_loss_fn = ValueLoss(use_huber=True)  # Huber loss is more robust
+    
+    # Gradient scaler for mixed precision
     scaler = GradScaler() if torch.cuda.is_available() else None
     
-    # Use puzzle dataloader as an iterator
+    # Configuration
+    grad_clip = TRAIN_CONFIG['grad_clip']
+    policy_weight = TRAIN_CONFIG['policy_weight']
+    value_weight = TRAIN_CONFIG['value_weight']
+    puzzle_policy_weight = TRAIN_CONFIG['puzzle_policy_weight']
+    puzzle_value_weight = TRAIN_CONFIG['puzzle_value_weight']
+    puzzle_frequency = TRAIN_CONFIG['puzzle_frequency']
+    puzzle_batches = TRAIN_CONFIG['puzzle_batches']
+    
+    # Puzzle iterator
     import itertools
     puzzle_iter = itertools.cycle(puzzle_dataloader)
     
-    # State loading
+    # Load state
     if os.path.exists(state_file):
         with open(state_file, 'r') as f:
             state = json.load(f)
@@ -34,17 +193,14 @@ def train_batch(model, game_dataloader, puzzle_dataloader, save_path, state_file
         state = {"processed_games": processed_games, "last_epoch": 0}
         start_epoch = 0
 
-    puzzle_frequency = 1
-    puzzle_batch_multiplier = 10  
-    policy_weight = 1.5
-    value_weight = 1.0
-    puzzle_policy_weight = 3.0  
-    puzzle_value_weight = 2.0
-
     for epoch in range(start_epoch, epochs + start_epoch):
         model.train()
         total_loss = 0
+        total_policy_loss = 0
+        total_value_loss = 0
         game_batch_count = 0
+        
+        epoch_start = time.time()
         
         for game_batch in game_dataloader:
             inputs, policy_targets, value_targets = game_batch
@@ -54,140 +210,150 @@ def train_batch(model, game_dataloader, puzzle_dataloader, save_path, state_file
             
             optimizer.zero_grad()
             
-            if scaler:  # Use mixed precision if available
-                # Use autocast for mixed precision
+            if scaler:
                 with autocast():
                     policy_logits, value_pred = model(inputs)
                     policy_loss = policy_loss_fn(policy_logits, policy_targets)
-                    value_loss = value_loss_fn(value_pred.squeeze(), value_targets)
+                    value_loss = value_loss_fn(value_pred, value_targets)
                     loss = policy_weight * policy_loss + value_weight * value_loss
                 
-                # Scale gradients and optimize
                 scaler.scale(loss).backward()
+                
+                # Gradient clipping
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 policy_logits, value_pred = model(inputs)
                 policy_loss = policy_loss_fn(policy_logits, policy_targets)
-                value_loss = value_loss_fn(value_pred.squeeze(), value_targets)
+                value_loss = value_loss_fn(value_pred, value_targets)
                 loss = policy_weight * policy_loss + value_weight * value_loss
                 
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
             
             total_loss += loss.item()
+            total_policy_loss += policy_loss.item()
+            total_value_loss += value_loss.item()
             game_batch_count += 1
 
-            # Train on puzzle batches
+            # Interleaved puzzle training
             if game_batch_count % puzzle_frequency == 0:
-                for _ in range(puzzle_batch_multiplier):
+                for _ in range(puzzle_batches):
                     puzzle_batch = next(puzzle_iter)
-                    inputs, policy_targets, value_targets = puzzle_batch
-                    inputs = inputs.to(device)
-                    policy_targets = policy_targets.to(device)
-                    value_targets = value_targets.to(device)
+                    p_inputs, p_policy_targets, p_value_targets = puzzle_batch[:3]
+                    p_inputs = p_inputs.to(device)
+                    p_policy_targets = p_policy_targets.to(device)
+                    p_value_targets = p_value_targets.to(device)
                     
                     optimizer.zero_grad()
                     
-                    if scaler:  # Use mixed precision if available
-                        # Use autocast for puzzles too
+                    if scaler:
                         with autocast():
-                            policy_logits, value_pred = model(inputs)
-                            policy_loss = policy_loss_fn(policy_logits, policy_targets)
-                            value_loss = value_loss_fn(value_pred.squeeze(), value_targets)
-                            loss = puzzle_policy_weight * policy_loss + puzzle_value_weight * value_loss
+                            p_logits, p_value = model(p_inputs)
+                            p_policy_loss = policy_loss_fn(p_logits, p_policy_targets)
+                            p_value_loss = value_loss_fn(p_value, p_value_targets)
+                            p_loss = puzzle_policy_weight * p_policy_loss + puzzle_value_weight * p_value_loss
                         
-                        scaler.scale(loss).backward()
+                        scaler.scale(p_loss).backward()
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                         scaler.step(optimizer)
                         scaler.update()
                     else:
-                        policy_logits, value_pred = model(inputs)
-                        policy_loss = policy_loss_fn(policy_logits, policy_targets)
-                        value_loss = value_loss_fn(value_pred.squeeze(), value_targets)
-                        loss = puzzle_policy_weight * policy_loss + puzzle_value_weight * value_loss
+                        p_logits, p_value = model(p_inputs)
+                        p_policy_loss = policy_loss_fn(p_logits, p_policy_targets)
+                        p_value_loss = value_loss_fn(p_value, p_value_targets)
+                        p_loss = puzzle_policy_weight * p_policy_loss + puzzle_value_weight * p_value_loss
                         
-                        loss.backward()
+                        p_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                         optimizer.step()
                     
-                    total_loss += loss.item()
+                    total_loss += p_loss.item()
 
-        # Update scheduler, save checkpoint, etc.
+        # Update scheduler
         scheduler.step()
-        num_puzzle_batches = len(game_dataloader) // puzzle_frequency * puzzle_batch_multiplier
-        avg_loss = total_loss / (len(game_dataloader) + num_puzzle_batches)
-        print(f"Epoch {epoch + 1}/{epochs}, Loss: {avg_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
+        
+        # Logging
+        epoch_time = time.time() - epoch_start
+        avg_loss = total_loss / max(1, game_batch_count * (1 + puzzle_batches))
+        avg_policy = total_policy_loss / max(1, game_batch_count)
+        avg_value = total_value_loss / max(1, game_batch_count)
+        
+        print(f"Epoch {epoch + 1}/{epochs + start_epoch}")
+        print(f"  Loss: {avg_loss:.4f} (policy: {avg_policy:.4f}, value: {avg_value:.4f})")
+        print(f"  LR: {scheduler.get_last_lr()[0]:.6f}, Time: {epoch_time:.1f}s")
 
+        # Save checkpoint
         state["last_epoch"] = epoch + 1
         state["processed_games"] = processed_games
         
         torch.save(model.state_dict(), save_path)
         with open(state_file, 'w') as f:
             json.dump(state, f)
-        print(f"Checkpoint saved at epoch {epoch + 1}")
 
 
-def train_tactical(model, optimizer, dataloader, device, epochs=3):
-    """Train on tactical puzzles for a specific number of epochs"""
-    policy_loss_fn = nn.CrossEntropyLoss()
-    value_loss_fn = nn.MSELoss()
+# ============================================================================
+# TACTICAL TRAINING
+# ============================================================================
+def train_tactical(model, optimizer, dataloader, device, epochs=3, grad_clip=1.0):
+    """Train on tactical puzzles with category-based weighting.
+    
+    Tactical puzzles are crucial for chess strength - they teach the model
+    to recognize patterns like forks, pins, and checkmates.
+    """
+    policy_loss_fn = PolicyLoss()
+    value_loss_fn = ValueLoss(use_huber=True)
     model.train()
     
-    # Track loss by category
-    category_losses = {}
-    category_counts = {}
+    # Category weights - prioritize critical tactics
+    category_weights = {
+        'mate_in_one': 5.0,
+        'mate_in_two': 4.0,
+        'endgame': 3.0,
+        'knight_fork': 2.5,
+        'pin': 2.5,
+        'skewer': 2.5,
+        'discovered': 2.5,
+        'default': 1.0
+    }
     
     for epoch in range(epochs):
         batch_count = 0
         total_loss = 0
         
         for batch in dataloader:
-            # Handle both 3-element and 4-element batches
+            # Handle variable batch formats
             if len(batch) == 3:
                 inputs, policy_targets, value_targets = batch
-                # Default categories when not provided
-                categories = ["default"] * inputs.size(0)
+                categories = ['default'] * inputs.size(0)
             else:
                 inputs, policy_targets, value_targets, categories = batch
             
             inputs = inputs.to(device)
             policy_targets = policy_targets.to(device)
             value_targets = value_targets.to(device)
-
-            
-            # Calculate loss with category-based weighting
-            loss = 0
-            for i, category in enumerate(categories):
-                # Get a single example
-                input_i = inputs[i:i+1]
-                policy_target_i = policy_targets[i:i+1]
-                value_target_i = value_targets[i:i+1]
-                
-                # Forward pass
-                policy_logits, value_pred = model(input_i)
-                
-                # Weight losses by category
-                if category == "mate_in_one":
-                    category_weight = 5.0  # High priority
-                elif category == "endgame":
-                    category_weight = 3.0  # Medium-high priority
-                else:
-                    category_weight = 1.0
-                    
-                policy_loss = policy_loss_fn(policy_logits, policy_target_i) * category_weight
-                value_loss = value_loss_fn(value_pred.squeeze(), value_target_i) * category_weight
-                
-                sample_loss = 3.0 * policy_loss + value_loss
-                loss += sample_loss
-                
-                # Track loss by category
-                if category not in category_losses:
-                    category_losses[category] = 0
-                    category_counts[category] = 0
-                category_losses[category] += sample_loss.item()
-                category_counts[category] += 1
             
             optimizer.zero_grad()
+            
+            # Forward pass (batch)
+            policy_logits, value_pred = model(inputs)
+            
+            # Calculate weighted loss
+            policy_loss = policy_loss_fn(policy_logits, policy_targets)
+            value_loss = value_loss_fn(value_pred, value_targets)
+            
+            # Apply category weighting (average weight for batch)
+            batch_weight = sum(category_weights.get(c, 1.0) for c in categories) / len(categories)
+            
+            loss = batch_weight * (2.0 * policy_loss + value_loss)
+            
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
             
             total_loss += loss.item()
@@ -195,7 +361,84 @@ def train_tactical(model, optimizer, dataloader, device, epochs=3):
         
         if batch_count > 0:
             avg_loss = total_loss / batch_count
-            print(f"Tactical training epoch {epoch+1}, avg loss: {avg_loss:.4f}")
+            print(f"Tactical epoch {epoch+1}/{epochs}, loss: {avg_loss:.4f}")
+    
+    return total_loss / batch_count if batch_count > 0 else 0
+
+
+# ============================================================================
+# SELF-PLAY TRAINING UTILITIES
+# ============================================================================
+def train_on_self_play(model, samples, device, optimizer=None, epochs=3, 
+                       batch_size=64, grad_clip=1.0, use_soft_targets=True):
+    """Train model on self-play generated samples.
+    
+    Args:
+        model: The neural network
+        samples: List of (board_tensor, policy_target, value_target) tuples
+        device: Computation device
+        optimizer: Optional optimizer (creates new one if None)
+        epochs: Number of training epochs
+        batch_size: Batch size for training
+        grad_clip: Gradient clipping threshold
+        use_soft_targets: If True, policy_target should be a distribution
+    """
+    from torch.utils.data import TensorDataset, DataLoader
+    
+    if not samples:
+        return 0.0
+    
+    # Create optimizer if not provided
+    if optimizer is None:
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=0.001, momentum=0.9, weight_decay=1e-4
+        )
+    
+    # Prepare data
+    boards = torch.stack([torch.tensor(s[0], dtype=torch.float32) for s in samples])
+    
+    if use_soft_targets:
+        # Soft targets (probability distributions)
+        policies = torch.stack([torch.tensor(s[1], dtype=torch.float32) for s in samples])
+    else:
+        # Hard targets (indices)
+        policies = torch.tensor([s[1] for s in samples], dtype=torch.long)
+    
+    values = torch.tensor([s[2] for s in samples], dtype=torch.float32)
+    
+    dataset = TensorDataset(boards, policies, values)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
+    # Loss functions
+    policy_loss_fn = PolicyLoss()
+    value_loss_fn = ValueLoss(use_huber=True)
+    
+    model.train()
+    total_loss = 0
+    batch_count = 0
+    
+    for epoch in range(epochs):
+        for batch_boards, batch_policies, batch_values in dataloader:
+            batch_boards = batch_boards.to(device)
+            batch_policies = batch_policies.to(device)
+            batch_values = batch_values.to(device)
+            
+            optimizer.zero_grad()
+            
+            policy_logits, value_pred = model(batch_boards)
+            
+            policy_loss = policy_loss_fn(policy_logits, batch_policies)
+            value_loss = value_loss_fn(value_pred, batch_values)
+            
+            # Equal weighting for self-play (policy and value both important)
+            loss = policy_loss + value_loss
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+            
+            total_loss += loss.item()
+            batch_count += 1
     
     return total_loss / batch_count if batch_count > 0 else 0
 

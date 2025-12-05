@@ -8,19 +8,51 @@ import math
 import psutil
 import os
 import random
-import multiprocessing  # Add import for CPU core detection
+import multiprocessing
 
 from data import board_to_tensor, get_move_index, SelfPlayDataset
 from utils import clear_memory, test_tactical_recognition
 
 # Add import for MCTS functionality
-from mcts import generate_mcts_game
+from mcts import generate_mcts_game, select_move_with_mcts, MCTS_CONFIG
 
 from utils import get_optimal_batch_size, clear_memory
 
 
-def generate_reinforcement_learning_samples(model, device, num_games=100, reward_shaping=True, iteration=0, total_iterations=5):
-    """Generate self-play games with reinforcement learning objectives and MCTS-inspired search
+# ============================================================================
+# SELF-PLAY CONFIGURATION
+# ============================================================================
+SELF_PLAY_CONFIG = {
+    # MCTS settings for self-play
+    'num_simulations': 200,       # Simulations per move (was 10, now much higher)
+    'fast_simulations': 50,       # Simulations for fast mode
+    
+    # Temperature schedule
+    'temp_initial': 1.0,          # Temperature for first N moves
+    'temp_mid': 0.5,              # Temperature for mid-game
+    'temp_final': 0.1,            # Temperature for late game
+    'temp_move_threshold_1': 15,  # Moves before reducing temp
+    'temp_move_threshold_2': 30,  # Moves before final temp
+    
+    # Exploration
+    'dirichlet_alpha': 0.3,       # Dirichlet noise alpha
+    'dirichlet_weight': 0.25,     # Weight of noise at root
+    
+    # Game limits
+    'max_moves': 200,             # Maximum moves per game
+    'min_game_length': 10,        # Minimum game length to use
+    
+    # Reward shaping
+    'use_reward_shaping': True,   # Apply reward shaping
+    'discount_factor': 0.99,      # Gamma for reward discounting
+}
+
+
+def generate_reinforcement_learning_samples(model, device, num_games=100, reward_shaping=True, 
+                                           iteration=0, total_iterations=5):
+    """Generate self-play games with reinforcement learning objectives.
+    
+    Uses MCTS for move selection with proper exploration via Dirichlet noise.
     
     Args:
         model: The neural network model
@@ -37,45 +69,44 @@ def generate_reinforcement_learning_samples(model, device, num_games=100, reward
     model.eval()
     
     # Determine input channels from model
-    input_channels = model.input_channels if hasattr(model, 'input_channels') else 20
+    input_channels = model.input_channels if hasattr(model, 'input_channels') else 22
     
-    # Parallel game generation
+    # Parallel game generation setup
     batch_size = min(16, num_games)
     active_games = [chess.Board() for _ in range(batch_size)]
     move_histories = [[] for _ in range(batch_size)]
     board_histories = [[] for _ in range(batch_size)]
+    policy_histories = [[] for _ in range(batch_size)]  # Store MCTS policies
     move_numbers = [1 for _ in range(batch_size)]
     active_mask = [True for _ in range(batch_size)]
     completed_games = 0
     
-    # MCTS simulation parameters
-    num_simulations = 10  # Number of simulations per move - keep relatively low for speed
-    
-    # Adaptive temperature - start high for exploration, decrease for exploitation
+    # Progressive exploration reduction
     progress_factor = iteration / max(1, total_iterations - 1)
-    base_temp = 1.0
-    final_temp = 0.5
-    temperature = base_temp - progress_factor * (base_temp - final_temp)
     
-    # Dirichlet noise parameters - higher alpha = more uniform noise
-    dirichlet_alpha = 0.3 * (1 - 0.5 * progress_factor)  # Decrease from 0.3 to 0.15 as training progresses
-    dirichlet_weight = 0.25 * (1 - 0.5 * progress_factor)  # Decrease from 0.25 to 0.125 as training progresses
+    # MCTS parameters - increase simulations as training progresses for quality
+    base_simulations = SELF_PLAY_CONFIG['num_simulations']
+    num_simulations = max(50, int(base_simulations * (0.5 + 0.5 * progress_factor)))
     
-    # Some games may go very long - limit total moves to avoid infinite games
-    max_moves_per_game = 200
+    # Temperature scheduling
+    base_temp = SELF_PLAY_CONFIG['temp_initial']
+    final_temp = SELF_PLAY_CONFIG['temp_final']
+    
+    # Reduce noise as training progresses
+    dirichlet_alpha = SELF_PLAY_CONFIG['dirichlet_alpha'] * (1 - 0.5 * progress_factor)
+    dirichlet_weight = SELF_PLAY_CONFIG['dirichlet_weight'] * (1 - 0.5 * progress_factor)
+    
+    max_moves_per_game = SELF_PLAY_CONFIG['max_moves']
     moves_played = [0 for _ in range(batch_size)]
     
-    print(f"Generating self-play games with MCTS (temp={temperature:.2f}, noise_weight={dirichlet_weight:.2f})...")
+    print(f"Generating {num_games} self-play games with MCTS ({num_simulations} sims, temp={base_temp:.2f})")
     
-    # Dynamic batch sizing - start with smaller batches and increase
-    # This avoids OOM errors while maximizing throughput
+    # Dynamic batch sizing
     current_batch_size = 4
     max_batch_size = 16
     batch_success_count = 0
-    input_channels = model.input_channels if hasattr(model, 'input_channels') else 20
     
     while any(active_mask) and completed_games < num_games:
-        # Get all active boards
         active_indices = [i for i, active in enumerate(active_mask) if active]
         
         if not active_indices:
@@ -406,46 +437,85 @@ def generate_self_play_games(model, device, num_games=100, use_mcts=True):
 
 
 def run_self_play_training(model, device, save_path, state_file, puzzle_dataloader=None, 
-                         num_games=50, num_iterations=5, use_mcts=False, fast_mcts=False):
-    """Run self-play training to improve the model through reinforcement learning"""
-    print(f"\n=== STARTING SELF-PLAY REINFORCEMENT LEARNING ===")
-    print(f"Training for {num_iterations} iterations with {num_games} games per iteration")
+                         num_games=50, num_iterations=5, use_mcts=True, fast_mcts=False):
+    """Run self-play training to improve the model through reinforcement learning.
     
-    if use_mcts and fast_mcts:
-        print("MCTS: Fast mode with integrated tactical training (balanced speed/quality)")
-    elif use_mcts:
-        print("MCTS: Full mode with integrated tactical training (highest quality)")
-    else:
-        print("MCTS: Disabled with integrated tactical training (fastest training)")
-    input_channels = model.input_channels if hasattr(model, 'input_channels') else 20
-    # Initialize optimizer and loss functions
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0005, weight_decay=1e-5)
-    policy_loss_fn = torch.nn.CrossEntropyLoss()
-    value_loss_fn = torch.nn.MSELoss()
+    This is the main self-play training loop that:
+    1. Generates self-play games using MCTS
+    2. Trains on the generated positions
+    3. Interleaves puzzle training for tactical awareness
+    4. Evaluates progress with tactical benchmarks
+    
+    Args:
+        model: The neural network
+        device: Computation device
+        save_path: Path to save model checkpoints
+        state_file: Path to save training state
+        puzzle_dataloader: DataLoader for tactical puzzles
+        num_games: Number of games per iteration
+        num_iterations: Number of training iterations
+        use_mcts: Whether to use MCTS for game generation
+        fast_mcts: Use faster MCTS settings
+    """
+    print(f"\n{'='*60}")
+    print("SELF-PLAY REINFORCEMENT LEARNING")
+    print(f"{'='*60}")
+    print(f"Iterations: {num_iterations}, Games per iteration: {num_games}")
+    print(f"MCTS: {'Fast' if fast_mcts else 'Full' if use_mcts else 'Disabled'}")
+    
+    input_channels = model.input_channels if hasattr(model, 'input_channels') else 22
+    
+    # Use SGD with momentum (AlphaZero-style) for better convergence
+    optimizer = torch.optim.SGD(
+        model.parameters(), 
+        lr=0.01,  # Will be scheduled
+        momentum=0.9, 
+        weight_decay=1e-4,
+        nesterov=True
+    )
+    
+    # Learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=num_iterations, eta_min=1e-5
+    )
+    
+    # Loss functions with improvements
+    from training import PolicyLoss, ValueLoss
+    policy_loss_fn = PolicyLoss()
+    value_loss_fn = ValueLoss(use_huber=True)
+    
+    # Mixed precision training
     scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
     
-    # Lower batch size to reduce memory pressure
+    # Find optimal batch size
     batch_size = get_optimal_batch_size(model, device, starting_size=32, min_size=8)
-    print(f"Using optimal batch size: {batch_size}")
+    print(f"Batch size: {batch_size}")
     
-    # Track progress across iterations
+    # Track progress
     total_positions = 0
     best_accuracy = 0
     
-    # Progressive weight adjustment - start with policy focus, gradually increase value focus
-    initial_policy_weight = 2.0
-    initial_value_weight = 1.0
-    final_value_weight = 2.5  # Increased importance of value over time
+    # MCTS settings based on mode
+    if fast_mcts:
+        mcts_simulations = SELF_PLAY_CONFIG['fast_simulations']
+    else:
+        mcts_simulations = SELF_PLAY_CONFIG['num_simulations']
+    
+    # Gradient clipping threshold
+    grad_clip = 1.0
     
     for iteration in range(num_iterations):
-        print(f"\nIteration {iteration+1}/{num_iterations}")
+        print(f"\n--- Iteration {iteration+1}/{num_iterations} ---")
         
-        # Calculate current weights - increase value weight as training progresses
-        progress_factor = iteration / num_iterations
-        policy_weight = initial_policy_weight
-        value_weight = initial_value_weight + progress_factor * (final_value_weight - initial_value_weight)
+        # Progressive training adjustments
+        progress_factor = iteration / max(1, num_iterations - 1)
         
-        print(f"Current weights: policy={policy_weight:.2f}, value={value_weight:.2f}")
+        # Increase value weight over time (initially focus on policy)
+        policy_weight = 1.0
+        value_weight = 1.0 + progress_factor * 1.0  # 1.0 -> 2.0
+        
+        current_lr = scheduler.get_last_lr()[0]
+        print(f"LR: {current_lr:.6f}, Policy weight: {policy_weight:.2f}, Value weight: {value_weight:.2f}")
         
         # Monitor memory usage before generation
         process = psutil.Process(os.getpid())

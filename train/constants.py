@@ -1,5 +1,99 @@
 import chess
 
+# ============================================================================
+# MODEL CONFIGURATION
+# ============================================================================
+MODEL_CONFIG = {
+    # Small model (fast, for testing)
+    'small': {
+        'num_blocks': 6,
+        'channels': 256,
+        'input_channels': 18,
+        'use_se': True,
+    },
+    # Medium model (balanced)
+    'medium': {
+        'num_blocks': 10,
+        'channels': 256,
+        'input_channels': 22,
+        'use_se': True,
+    },
+    # Big model (best quality)
+    'big': {
+        'num_blocks': 15,
+        'channels': 256,
+        'input_channels': 22,
+        'use_se': True,
+    },
+}
+
+# ============================================================================
+# TRAINING CONFIGURATION
+# ============================================================================
+TRAINING_CONFIG = {
+    # Optimizer (AlphaZero uses SGD)
+    'optimizer': 'sgd',
+    'sgd_lr': 0.2,
+    'sgd_momentum': 0.9,
+    'weight_decay': 1e-4,
+    
+    # Learning rate schedule
+    'lr_schedule': 'cosine',
+    'lr_warmup_epochs': 5,
+    
+    # Gradient clipping
+    'grad_clip': 1.0,
+    
+    # Batch training
+    'epochs_per_batch': 5,
+    'puzzle_batches_per_game_batch': 5,
+}
+
+# ============================================================================
+# MCTS CONFIGURATION
+# ============================================================================
+MCTS_CONFIG = {
+    # Search parameters
+    'num_simulations': 400,       # Simulations per move (training)
+    'num_simulations_play': 800,  # Simulations per move (play)
+    'c_puct': 2.5,                # Exploration constant
+    
+    # Parallelization
+    'parallel_workers': 4,
+    'virtual_loss': 3.0,
+    
+    # Exploration noise (Dirichlet)
+    'dirichlet_alpha': 0.3,       # Alpha for Dirichlet noise
+    'dirichlet_epsilon': 0.25,    # Weight of noise
+    
+    # Early stopping
+    'early_stop_threshold': 0.9,
+    'min_simulations': 100,
+}
+
+# ============================================================================
+# SELF-PLAY CONFIGURATION
+# ============================================================================
+SELF_PLAY_CONFIG = {
+    # Temperature schedule
+    'temp_initial': 1.0,
+    'temp_mid': 0.5,
+    'temp_final': 0.1,
+    'temp_threshold_1': 15,       # Moves before first reduction
+    'temp_threshold_2': 30,       # Moves before second reduction
+    
+    # Game limits
+    'max_moves': 200,
+    'min_game_length': 10,
+    
+    # Reward shaping
+    'use_reward_shaping': True,
+    'discount_factor': 0.99,
+}
+
+# ============================================================================
+# TACTICAL TEST POSITIONS
+# ============================================================================
 # Dictionary of tactical test positions with categories
 TACTICAL_TEST_POSITIONS = {
     # Checkmate patterns (verified forced mates)
@@ -60,7 +154,9 @@ TACTICAL_TEST_POSITIONS = {
     ]
 }
 
-# Move Index Mapping
+# ============================================================================
+# MOVE INDEX MAPPING
+# ============================================================================
 promotion_moves = {}
 promotion_idx = 4096
 for rank in [6, 1]:

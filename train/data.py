@@ -7,6 +7,7 @@ import os
 import pickle
 import hashlib
 import random
+import glob
 from torch.utils.data import Dataset
 
 from constants import promotion_moves
@@ -17,52 +18,86 @@ def get_move_index(move):
         return promotion_moves[(move.from_square, move.to_square, move.promotion)]
     return move.from_square * 64 + move.to_square
 
-def board_to_tensor(board, move_number=None, input_channels=20):
-    """Convert a chess board to a tensor representation
+def board_to_tensor(board, move_number=None, input_channels=22):
+    """Convert a chess board to a tensor representation.
     
+    This is a critical function that encodes the board state for the neural network.
+    
+    Channel layout for 22-channel (big) model:
+    - 0-5:   White pieces (P, N, B, R, Q, K)
+    - 6-11:  Black pieces (p, n, b, r, q, k)
+    - 12-15: Castling rights (WK, WQ, BK, BQ)
+    - 16:    En passant square
+    - 17:    Side to move (1 = white, 0 = black)
+    - 18:    Halfmove clock (for 50-move rule)
+    - 19:    Fullmove number
+    - 20:    White attack map (squares attacked by white)
+    - 21:    Black attack map (squares attacked by black)
+    
+    Channel layout for 18-channel (small) model:
+    - 0-5:   White pieces
+    - 6-11:  Black pieces
+    - 12-15: Castling rights
+    - 16:    En passant
+    - 17:    Side to move
+
     Args:
         board: The chess.Board object
         move_number: The move number (only used for 20-channel model)
-        input_channels: Number of input channels (18 or 20)
+        input_channels: Number of input channels (18, 20, or 22)
+    
+    Returns:
+        numpy array of shape (input_channels, 8, 8)
     """
-    # Use the appropriate number of channels based on model type
-    if input_channels == 18:  # Small model (original)
-        tensor = np.zeros((18, 8, 8), dtype=np.float32)
-        for piece_type in chess.PIECE_TYPES:
-            for color in chess.COLORS:
-                for square in board.pieces(piece_type, color):
-                    row, col = divmod(square, 8)
-                    channel = piece_type - 1 if color == chess.WHITE else piece_type + 5
-                    tensor[channel, row, col] = 1
-        tensor[12, :, :] = board.has_kingside_castling_rights(chess.WHITE)
-        tensor[13, :, :] = board.has_queenside_castling_rights(chess.WHITE)
-        tensor[14, :, :] = board.has_kingside_castling_rights(chess.BLACK)
-        tensor[15, :, :] = board.has_queenside_castling_rights(chess.BLACK)
-        if board.ep_square is not None:
-            row, col = divmod(board.ep_square, 8)
-            tensor[16, row, col] = 1
-        tensor[17, :, :] = 1 if board.turn == chess.WHITE else 0
-    else:  # Big model (20 channels)
-        tensor = np.zeros((20, 8, 8), dtype=np.float32)
-        for piece_type in chess.PIECE_TYPES:
-            for color in chess.COLORS:
-                for square in board.pieces(piece_type, color):
-                    row, col = divmod(square, 8)
-                    channel = piece_type - 1 if color == chess.WHITE else piece_type + 5
-                    tensor[channel, row, col] = 1
-        tensor[12, :, :] = board.has_kingside_castling_rights(chess.WHITE)
-        tensor[13, :, :] = board.has_queenside_castling_rights(chess.WHITE)
-        tensor[14, :, :] = board.has_kingside_castling_rights(chess.BLACK)
-        tensor[15, :, :] = board.has_queenside_castling_rights(chess.BLACK)
-        if board.ep_square is not None:
-            row, col = divmod(board.ep_square, 8)
-            tensor[16, row, col] = 1
-        tensor[17, :, :] = 1 if board.turn == chess.WHITE else 0
-        tensor[18, :, :] = board.halfmove_clock / 50.0  # Normalized repetition counter
-        # If move_number is not provided, use halfmove_clock as a proxy
-        tensor[19, :, :] = (move_number or board.fullmove_number) / 200.0  # Normalized move number
+    tensor = np.zeros((input_channels, 8, 8), dtype=np.float32)
+    
+    # Piece positions (channels 0-11)
+    for piece_type in chess.PIECE_TYPES:
+        for color in chess.COLORS:
+            for square in board.pieces(piece_type, color):
+                row, col = divmod(square, 8)
+                channel = piece_type - 1 if color == chess.WHITE else piece_type + 5
+                tensor[channel, row, col] = 1.0
+    
+    # Castling rights (channels 12-15)
+    tensor[12, :, :] = float(board.has_kingside_castling_rights(chess.WHITE))
+    tensor[13, :, :] = float(board.has_queenside_castling_rights(chess.WHITE))
+    tensor[14, :, :] = float(board.has_kingside_castling_rights(chess.BLACK))
+    tensor[15, :, :] = float(board.has_queenside_castling_rights(chess.BLACK))
+    
+    # En passant square (channel 16)
+    if board.ep_square is not None:
+        row, col = divmod(board.ep_square, 8)
+        tensor[16, row, col] = 1.0
+    
+    # Side to move (channel 17)
+    tensor[17, :, :] = 1.0 if board.turn == chess.WHITE else 0.0
+    
+    # Extended features for larger models
+    if input_channels >= 20:
+        # Halfmove clock normalized (channel 18)
+        tensor[18, :, :] = min(board.halfmove_clock / 50.0, 1.0)
         
+        # Move number normalized (channel 19)
+        move_num = move_number if move_number is not None else board.fullmove_number
+        tensor[19, :, :] = min(move_num / 200.0, 1.0)
+    
+    # Attack maps for 22-channel model
+    if input_channels >= 22:
+        # White attacks (channel 20)
+        for square in chess.SQUARES:
+            if board.is_attacked_by(chess.WHITE, square):
+                row, col = divmod(square, 8)
+                tensor[20, row, col] = 1.0
+        
+        # Black attacks (channel 21)
+        for square in chess.SQUARES:
+            if board.is_attacked_by(chess.BLACK, square):
+                row, col = divmod(square, 8)
+                tensor[21, row, col] = 1.0
+
     return tensor
+
 
 class ChessDataset(Dataset):
     """Dataset for chess games with symmetry augmentation and model type support"""

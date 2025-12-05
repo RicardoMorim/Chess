@@ -11,16 +11,21 @@ import random
 import argparse
 
 
-from models import ChessNet, create_chess_model
+from models import ChessNet, create_chess_model, load_model_with_compatibility
 from data import (ChessDataset, PuzzleDataset, load_puzzles, load_lichess_puzzles, 
                  filter_and_prioritize_puzzles_cached, load_professional_games, 
                  load_games_in_batches)
-from utils import clear_memory, test_tactical_recognition, get_optimal_batch_size
+from utils import clear_memory, test_tactical_recognition, get_optimal_batch_size, model_summary
 from self_play import generate_self_play_games, run_self_play_training
 from training import train_batch, train_tactical
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+if device.type == 'cuda':
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
 
 # Signal handler 
 def signal_handler(sig, frame, model, save_path, state_file, processed_games, current_epoch):
@@ -34,24 +39,30 @@ def signal_handler(sig, frame, model, save_path, state_file, processed_games, cu
 
 
 def parse_arguments():
-    parser = argparse.ArgumentParser(description="Chess model training script")
+    parser = argparse.ArgumentParser(description="Chess AI Training Script (Improved)")
     
     # Training mode
     parser.add_argument("mode", nargs="?", default=None, choices=["pro", "regular", "self-play"], 
                         help="Training mode: professional games, regular games, or self-play")
     
     # Model parameters
-    parser.add_argument("--model", default="big", choices=["small", "big"], 
-                        help="Model size: small (fewer parameters) or big (more parameters)")
+    parser.add_argument("--model", default="big", choices=["small", "medium", "big"], 
+                        help="Model size: small (6 blocks), medium (10 blocks), or big (15 blocks)")
     
     parser.add_argument("--model-path", default=None, 
                         help="Path to save/load the model (default: ./chess_model/[model_size]_model.pth)")
+    
+    parser.add_argument("--legacy", action="store_true",
+                        help="Load legacy model architecture (for old checkpoints)")
+    
+    parser.add_argument("--no-se", action="store_true",
+                        help="Disable Squeeze-and-Excitation blocks")
     
     # MCTS parameters
     parser.add_argument("--no-mcts", action="store_true", 
                         help="Disable MCTS for self-play (faster but lower quality)")
     
-    parser.add_argument("--fast-mtcs", action="store_true", 
+    parser.add_argument("--fast-mcts", action="store_true", 
                         help="Use fast MCTS for self-play (balanced speed/quality)")
     
     # Self-play parameters when in self-play mode
@@ -79,13 +90,25 @@ def main():
     # Parse command line arguments
     args = parse_arguments()
     
+    print(f"\n{'='*60}")
+    print("CHESS AI TRAINING")
+    print(f"{'='*60}")
+    
     # Initialize model based on size
+    use_se = not args.no_se
+    
     if args.model == "small":
-        print("Using small model architecture (fewer parameters)")
-        model = create_chess_model("small").to(device)
+        print(f"Model: Small (6 blocks, 18 channels, SE={use_se})")
+        model = create_chess_model("small", use_se=use_se, legacy=args.legacy).to(device)
+    elif args.model == "medium":
+        print(f"Model: Medium (10 blocks, 22 channels, SE={use_se})")
+        model = create_chess_model("medium", use_se=use_se, legacy=args.legacy).to(device)
     else:  # "big"
-        print("Using big model architecture (more parameters)")
-        model = create_chess_model("big").to(device)
+        print(f"Model: Big (15 blocks, 22 channels, SE={use_se})")
+        model = create_chess_model("big", use_se=use_se, legacy=args.legacy).to(device)
+    
+    # Print model summary
+    model_summary(model)
         
     # Setup paths
     save_path = args.model_path
@@ -98,7 +121,7 @@ def main():
     
     # Determine MCTS settings
     use_mcts = not args.no_mcts
-    fast_mcts = args.fast_mtcs
+    fast_mcts = args.fast_mcts
     
     if not use_mcts:
         print("MCTS disabled for self-play (faster but lower quality)")
