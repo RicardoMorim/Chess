@@ -78,6 +78,10 @@ class Main:
         # New flags for two-click support
         self.waiting_for_second_click = False
         self.ignore_release = False
+        
+        # Parallel search settings
+        self.use_parallel_minimax = True  # Enable Lazy SMP by default
+        self.minimax_depth = 6
     
     @property
     def neural_engine(self):
@@ -95,7 +99,12 @@ class Main:
         """Lazy load minimax engine only when needed."""
         if self._minimax_engine is None:
             ai_color = "w" if self.color == "b" else "b"
-            self._minimax_engine = MinimaxAI(self.openings, ai_color, depth=6)
+            self._minimax_engine = MinimaxAI(
+                self.openings, 
+                ai_color, 
+                depth=self.minimax_depth,
+                use_parallel=self.use_parallel_minimax
+            )
         return self._minimax_engine
 
 
@@ -604,6 +613,10 @@ class Main:
 
 # Create an instance and start a game
 if __name__ == "__main__":
+    # Required for multiprocessing on Windows
+    import multiprocessing
+    multiprocessing.freeze_support()
+    
     pygame.init()
     start_game = True
     while start_game:

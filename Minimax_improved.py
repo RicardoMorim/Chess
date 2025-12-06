@@ -10,6 +10,7 @@ Significant improvements over the original:
 5. Check extensions
 6. Proper aspiration windows for both colors
 7. Memory management (history table aging)
+8. **Lazy SMP parallel search** using multiprocessing (bypasses GIL!)
 
 Compatible with the original MinimaxAI interface.
 """
@@ -18,11 +19,42 @@ import chess
 import chess.pgn
 import chess.polyglot
 import random
+import os
+from multiprocessing import Pool, cpu_count, Manager
 from TranspositionTable import TranspositionTable
 
 
+# Global for multiprocessing workers
+_worker_engine = None
+
+
+def _init_worker(openings, color, depth, tt_data):
+    """Initialize worker process with its own engine instance."""
+    global _worker_engine
+    _worker_engine = MinimaxAI(openings, color, depth, use_parallel=False)
+    # Share TT data if provided
+    if tt_data:
+        _worker_engine.tt.table = tt_data
+
+
+def _worker_search(args):
+    """Worker function for parallel search."""
+    board_fen, depth, alpha, beta = args
+    global _worker_engine
+    
+    board = chess.Board(board_fen)
+    score = _worker_engine.alphabeta(board, depth, alpha, beta)
+    
+    # Get best move from TT
+    zobrist = chess.polyglot.zobrist_hash(board)
+    tt_entry = _worker_engine.tt.probe(zobrist)
+    best_move = tt_entry[4].uci() if tt_entry and tt_entry[4] else None
+    
+    return score, best_move, _worker_engine.nodes_searched
+
+
 class MinimaxAI:
-    def __init__(self, openings, color, depth=6):
+    def __init__(self, openings, color, depth=6, use_parallel=True, num_workers=None):
         """
         Initialize the Minimax AI.
         
@@ -30,11 +62,19 @@ class MinimaxAI:
             openings: Dictionary of opening names to chess.pgn.Game objects
             color: 'w' or 'b', indicating AI's color
             depth: Search depth (default 6)
+            use_parallel: Whether to use Lazy SMP parallel search
+            num_workers: Number of worker processes (default: 3 for i5-8th gen)
         """
         self.openings = openings
         self.color = chess.WHITE if color == 'w' else chess.BLACK
         self.depth = depth
         self.opening_moves = self.process_openings()
+        
+        # Parallel search settings - tuned for i5-8th gen (4C/8T)
+        self.use_parallel = use_parallel
+        # Use 3 workers: leaves 1 core for main thread + OS
+        # More workers cause context switching overhead on 4-core CPU
+        self.num_workers = num_workers if num_workers else 3
         
         # Transposition table
         self.tt = TranspositionTable(size=2**20)
@@ -626,6 +666,7 @@ class MinimaxAI:
     def get_best_move(self, board):
         """
         Get the best move using iterative deepening with aspiration windows.
+        Uses Lazy SMP parallel search if enabled.
         """
         # Clear stats
         self.nodes_searched = 0
@@ -643,6 +684,14 @@ class MinimaxAI:
         if len(self.history) > 10000:
             self.history = {k: v // 2 for k, v in self.history.items() if v > 10}
         
+        # Use parallel or single-threaded search
+        if self.use_parallel and self.num_workers > 1:
+            return self._parallel_search(board)
+        else:
+            return self._single_search(board)
+    
+    def _single_search(self, board):
+        """Standard single-threaded iterative deepening search."""
         best_move = None
         prev_score = 0
         
@@ -681,6 +730,91 @@ class MinimaxAI:
                 best_move = tt_entry[4]
             
             print(f"Depth {depth}: score={score}, move={best_move}, nodes={self.nodes_searched}, tt_hits={self.tt_hits}")
+        
+        # Fallback
+        if not best_move or best_move not in board.legal_moves:
+            best_move = random.choice(list(board.legal_moves))
+        
+        return best_move
+    
+    def _parallel_search(self, board):
+        """
+        Lazy SMP parallel search using multiprocessing.
+        
+        This spawns multiple worker processes that search the same position
+        with slightly different parameters. The best result wins.
+        This bypasses the GIL completely since each worker is a separate process.
+        """
+        print(f"Starting Lazy SMP search with {self.num_workers} workers...")
+        
+        best_move = None
+        prev_score = 0
+        color_str = 'w' if self.color == chess.WHITE else 'b'
+        
+        # For lower depths, single-threaded is faster (process overhead)
+        for depth in range(1, min(4, self.depth + 1)):
+            score = self.alphabeta(board, depth, -100000, 100000)
+            prev_score = score
+            
+            zobrist = chess.polyglot.zobrist_hash(board)
+            tt_entry = self.tt.probe(zobrist)
+            if tt_entry and tt_entry[4]:
+                best_move = tt_entry[4]
+            
+            print(f"Depth {depth}: score={score}, move={best_move}, nodes={self.nodes_searched}")
+        
+        # For deeper searches, use parallel workers
+        if self.depth >= 4:
+            try:
+                # Create worker pool
+                with Pool(
+                    processes=self.num_workers,
+                    initializer=_init_worker,
+                    initargs=(self.openings, color_str, self.depth, None)
+                ) as pool:
+                    
+                    for depth in range(4, self.depth + 1):
+                        # Aspiration window
+                        window = 50
+                        alpha = prev_score - window
+                        beta = prev_score + window
+                        
+                        # Create search tasks with slightly varied windows (Lazy SMP style)
+                        tasks = []
+                        board_fen = board.fen()
+                        
+                        for i in range(self.num_workers):
+                            # Vary the search slightly for each worker
+                            worker_alpha = alpha - (i * 10)
+                            worker_beta = beta + (i * 10)
+                            tasks.append((board_fen, depth, worker_alpha, worker_beta))
+                        
+                        # Run parallel searches
+                        results = pool.map(_worker_search, tasks)
+                        
+                        # Collect results - pick the best
+                        total_nodes = 0
+                        best_result = None
+                        
+                        for score, move_uci, nodes in results:
+                            total_nodes += nodes
+                            if best_result is None or (alpha < score < beta):
+                                best_result = (score, move_uci)
+                        
+                        if best_result:
+                            prev_score, move_uci = best_result
+                            if move_uci:
+                                try:
+                                    best_move = chess.Move.from_uci(move_uci)
+                                except:
+                                    pass
+                        
+                        self.nodes_searched += total_nodes
+                        print(f"Depth {depth} (parallel): score={prev_score}, move={best_move}, nodes={total_nodes}")
+                        
+            except Exception as e:
+                print(f"Parallel search failed: {e}, falling back to single-threaded")
+                return self._single_search(board)
         
         # Fallback
         if not best_move or best_move not in board.legal_moves:

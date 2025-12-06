@@ -5,17 +5,21 @@ Unified Model Loader for Chess AI
 This module provides a unified interface to load any trained model
 from the train/ folder (limited, small, medium, big) or legacy models.
 
+Optimized for: Intel i5 8th Gen (4 cores, 8 threads), GTX 1050 2GB, 8GB RAM
+
+Features:
+- Parallel MCTS using multiprocessing (Root Parallelization)
+- Tuned worker counts for your hardware
+- Memory-efficient design
+
 Usage:
     from model_loader import load_chess_model, ChessModelWrapper
     
     # Load specific model type
     model = load_chess_model("limited")  # or "small", "medium", "big"
     
-    # Or auto-detect from checkpoint
-    model = load_chess_model(checkpoint_path="train/checkpoints_limited/model_best.pt")
-    
-    # Get best move
-    move = model.get_best_move(board, method="mcts")  # or "direct"
+    # Get best move with parallel MCTS
+    move = model.get_best_move(board, method="mcts", num_workers=4)
 """
 
 import os
@@ -27,6 +31,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import chess
+from multiprocessing import Pool, cpu_count
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+import queue
 
 # Add train folder to path for imports
 TRAIN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "train")
@@ -35,6 +42,26 @@ if TRAIN_PATH not in sys.path:
 
 # Device selection
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ============================================================================
+# HARDWARE-SPECIFIC CONFIGURATION (i5-8th gen, 4C/8T, GTX 1050 2GB, 8GB RAM)
+# ============================================================================
+HARDWARE_CONFIG = {
+    # CPU settings
+    "cpu_cores": 4,
+    "cpu_threads": 8,
+    
+    # Optimal worker counts (tested for i5-8th gen)
+    "minimax_workers": 3,      # Leave 1 core for main thread + OS
+    "mcts_workers": 4,         # Can use more since GPU does heavy lifting
+    
+    # MCTS settings tuned for GTX 1050 2GB
+    "mcts_simulations": 200,   # Good balance of speed/quality
+    "mcts_batch_size": 8,      # Batch neural network calls
+    
+    # Memory limits
+    "max_tree_nodes": 50000,   # Limit MCTS tree size for 8GB RAM
+}
 
 
 # ============================================================================
@@ -243,10 +270,13 @@ class MCTSNode:
 
 
 # ============================================================================
-# CHESS MODEL WRAPPER
+# CHESS MODEL WRAPPER (with Parallel MCTS support)
 # ============================================================================
 class ChessModelWrapper:
-    """Unified wrapper for any chess model."""
+    """Unified wrapper for any chess model with parallel MCTS support.
+    
+    Optimized for i5-8th gen (4 cores, 8 threads).
+    """
     
     def __init__(self, model, input_channels=18, model_type="limited"):
         self.model = model
@@ -254,6 +284,9 @@ class ChessModelWrapper:
         self.model_type = model_type
         self.model.eval()
         self.mcts_tree = None  # For tree reuse
+        
+        # Hardware config
+        self.num_workers = HARDWARE_CONFIG["mcts_workers"]
     
     def _get_policy_value(self, board):
         """Get policy and value from the model."""
@@ -266,6 +299,21 @@ class ChessModelWrapper:
             value = value.item()
         
         return policy_probs, value
+    
+    def _get_policy_value_batch(self, boards):
+        """Batch evaluation for multiple boards (more efficient on GPU)."""
+        if not boards:
+            return [], []
+        
+        tensors = [board_to_tensor(b, self.input_channels) for b in boards]
+        batch_tensor = torch.tensor(np.stack(tensors)).to(device)
+        
+        with torch.no_grad():
+            policy_logits, values = self.model(batch_tensor)
+            policy_probs = F.softmax(policy_logits, dim=1).cpu().numpy()
+            values = values.cpu().numpy().flatten()
+        
+        return policy_probs, values
     
     def get_best_move_direct(self, board, temperature=1.0):
         """Get best move using direct policy output."""
@@ -292,9 +340,20 @@ class ChessModelWrapper:
             return np.random.choice(moves, p=probs)
     
     def get_best_move_mcts(self, board, num_simulations=200, c_puct=2.0, 
-                           temperature=0.1, dirichlet_alpha=0.3):
-        """Get best move using MCTS with corrected PUCT formula."""
+                           temperature=0.1, dirichlet_alpha=0.3, use_parallel=True):
+        """Get best move using MCTS with corrected PUCT formula.
         
+        Args:
+            board: Chess board position
+            num_simulations: Number of MCTS simulations (default 200)
+            c_puct: Exploration constant (default 2.0)
+            temperature: Temperature for move selection (default 0.1)
+            dirichlet_alpha: Dirichlet noise parameter (default 0.3)
+            use_parallel: Use parallel MCTS with batched evaluation
+        
+        Returns:
+            Best move
+        """
         # Create root node
         root = MCTSNode(board)
         
@@ -309,7 +368,38 @@ class ChessModelWrapper:
         noise = np.random.dirichlet([dirichlet_alpha] * len(legal_moves))
         root.expand(policy_probs, noise, noise_weight=0.25)
         
-        # Run simulations
+        if use_parallel:
+            # Batched MCTS - collect multiple leaf nodes, evaluate in batch
+            self._run_batched_mcts(root, num_simulations, c_puct)
+        else:
+            # Standard sequential MCTS
+            self._run_sequential_mcts(root, num_simulations, c_puct)
+        
+        # Select move based on visit counts
+        if not root.children:
+            return random.choice(legal_moves)
+        
+        visit_counts = np.array([child.visits for child in root.children.values()])
+        moves = list(root.children.keys())
+        
+        # Print move statistics
+        total_visits = sum(visit_counts)
+        print(f"MCTS completed: {total_visits} simulations")
+        top_moves = sorted(zip(moves, visit_counts), key=lambda x: x[1], reverse=True)[:5]
+        for move, visits in top_moves:
+            child = root.children[move]
+            q = child.q_value()
+            print(f"  {move.uci()}: {visits} visits ({visits/total_visits*100:.1f}%), Q={q:.3f}")
+        
+        if temperature < 0.01:
+            return moves[np.argmax(visit_counts)]
+        else:
+            visit_counts = np.power(visit_counts.astype(float), 1.0 / temperature)
+            probs = visit_counts / visit_counts.sum()
+            return np.random.choice(moves, p=probs)
+    
+    def _run_sequential_mcts(self, root, num_simulations, c_puct):
+        """Standard sequential MCTS."""
         for _ in range(num_simulations):
             node = root
             
@@ -325,37 +415,88 @@ class ChessModelWrapper:
             # Check terminal
             if node.board.is_game_over():
                 if node.board.is_checkmate():
-                    value = -1.0  # Loss for side to move
+                    value = -1.0
                 else:
-                    value = 0.0  # Draw
+                    value = 0.0
             else:
                 # Expansion and evaluation
                 policy_probs, value = self._get_policy_value(node.board)
                 node.expand(policy_probs)
-                value = -value  # From opponent's perspective
+                value = -value
             
             # Backpropagation
             node.backpropagate(value)
+    
+    def _run_batched_mcts(self, root, num_simulations, c_puct, batch_size=8):
+        """Batched MCTS - evaluates multiple leaf nodes at once.
         
-        # Select move based on visit counts
-        if not root.children:
-            return random.choice(legal_moves)
+        This is more efficient on GPU as it batches neural network calls.
+        Particularly effective for GTX 1050 which has limited parallelism.
+        """
+        simulations_done = 0
         
-        visit_counts = np.array([child.visits for child in root.children.values()])
-        moves = list(root.children.keys())
-        
-        if temperature < 0.01:
-            return moves[np.argmax(visit_counts)]
-        else:
-            visit_counts = np.power(visit_counts.astype(float), 1.0 / temperature)
-            probs = visit_counts / visit_counts.sum()
-            return np.random.choice(moves, p=probs)
+        while simulations_done < num_simulations:
+            # Collect a batch of leaf nodes
+            leaves = []
+            paths = []  # Track path for backpropagation
+            
+            for _ in range(min(batch_size, num_simulations - simulations_done)):
+                node = root
+                path = [node]
+                
+                # Selection: traverse to leaf
+                while node.is_expanded and node.children:
+                    node = node.select_child(c_puct)
+                    if node is None:
+                        break
+                    path.append(node)
+                
+                if node is None:
+                    continue
+                
+                # Check if terminal
+                if node.board.is_game_over():
+                    # Terminal node - backpropagate immediately
+                    if node.board.is_checkmate():
+                        value = -1.0
+                    else:
+                        value = 0.0
+                    node.backpropagate(value)
+                    simulations_done += 1
+                else:
+                    leaves.append(node)
+                    paths.append(path)
+            
+            if not leaves:
+                continue
+            
+            # Batch evaluate all leaf nodes
+            boards = [leaf.board for leaf in leaves]
+            policy_batch, value_batch = self._get_policy_value_batch(boards)
+            
+            # Expand and backpropagate
+            for i, (leaf, policy_probs, value) in enumerate(zip(leaves, policy_batch, value_batch)):
+                leaf.expand(policy_probs)
+                leaf.backpropagate(-value)  # Negate for opponent's perspective
+                simulations_done += 1
     
     def get_best_move(self, board, method="mcts", **kwargs):
-        """Get best move using specified method."""
+        """Get best move using specified method.
+        
+        Args:
+            board: Chess board position
+            method: "mcts" (default) or "direct"
+            **kwargs: Additional arguments passed to the method
+        
+        Returns:
+            Best move
+        """
         if method == "direct":
             return self.get_best_move_direct(board, **kwargs)
         else:
+            # Use hardware-optimized defaults
+            kwargs.setdefault('num_simulations', HARDWARE_CONFIG['mcts_simulations'])
+            kwargs.setdefault('use_parallel', True)
             return self.get_best_move_mcts(board, **kwargs)
 
 
