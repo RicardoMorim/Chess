@@ -19,9 +19,18 @@ import pygame
 sys.stdout = orig_stdout
 sys.stderr = orig_stderr
 import chess
-from pytorch_model import PytorchModel
-from old_model import OldPytorchModel
-from Minimax import MinimaxAI
+from Minimax_improved import MinimaxAI  # Use improved version
+
+# Try to import the new unified model loader, fallback to legacy
+try:
+    from model_loader import load_chess_model, list_available_models, ChessModelWrapper
+    NEW_MODEL_LOADER = True
+except ImportError:
+    from pytorch_model import PytorchModel
+    from old_model import OldPytorchModel
+    NEW_MODEL_LOADER = False
+    print("Warning: Using legacy model loader")
+
 
 class Main:
     piece_images = None
@@ -42,17 +51,24 @@ class Main:
         self.dragging = False
         self.AI_turn = False
         self.color = "w"
-        self.AI_type = "minimax"
+        self.AI_type = "minimax"  # Default AI type
+        self.neural_model_type = "limited"  # Default neural model
         pygame.display.set_caption("Chess Game")
-        self.openings_folder = "./oppenings"
+        
+        # Fix typo: oppenings -> openings
+        self.openings_folder = "./openings"
+        if not os.path.exists(self.openings_folder):
+            self.openings_folder = "./oppenings"  # Fallback to old name
+        
         self.openings = {}
         self.load_openings()
-        self.pytorch_engine = PytorchModel()
-        self.new_old = OldPytorchModel("chess_model/old/100000games/chess_model.pth")
-        self.old_pytorch_engine = OldPytorchModel()
+        
+        # Lazy load models - only load what's needed
+        self._neural_engine = None
+        self._minimax_engine = None
+        
+        # Show selection screen
         self.select_side_screen()
-
-        self.minimax_engine = MinimaxAI(self.openings, "w" if self.color == "b" else "b", 6)
 
         # New flags for human input
         self.human_moved = False
@@ -62,6 +78,25 @@ class Main:
         # New flags for two-click support
         self.waiting_for_second_click = False
         self.ignore_release = False
+    
+    @property
+    def neural_engine(self):
+        """Lazy load neural engine only when needed."""
+        if self._neural_engine is None:
+            print(f"Loading {self.neural_model_type} neural network...")
+            if NEW_MODEL_LOADER:
+                self._neural_engine = load_chess_model(self.neural_model_type)
+            else:
+                self._neural_engine = PytorchModel()
+        return self._neural_engine
+    
+    @property
+    def minimax_engine(self):
+        """Lazy load minimax engine only when needed."""
+        if self._minimax_engine is None:
+            ai_color = "w" if self.color == "b" else "b"
+            self._minimax_engine = MinimaxAI(self.openings, ai_color, depth=6)
+        return self._minimax_engine
 
 
     @classmethod
@@ -290,25 +325,50 @@ class Main:
             print("Engine made an illegal move!")
 
     def play_engine_move(self, max_depth, color):
-        print("engine: " + self.AI_type)
-        if self.AI_turn:
-
-            print ("Minimax AI thinking...")
+        """Play a move using the selected AI engine."""
+        print(f"Engine: {self.AI_type}")
+        
+        if self.AI_type == "minimax":
+            print("Minimax AI thinking...")
             best_move = self.minimax_engine.get_best_move(self.board)
             self.push_move(best_move)
-            print("MOVE BY MINIMAX:", best_move)
-            return
-            # print("The engine is thinking OLD with MTCS for color: " + self.color)
-            # best_move = self.old_pytorch_engine.get_best_move_mtcs(self.board)
-            # self.push_move(best_move)
-            # print("MOVE BY OLD:", best_move)
-            # return
+            print(f"MINIMAX MOVE: {best_move}")
         
-        print("The engine is thinking with new trained OLD for color: " + self.color)
-        best_move = self.new_old.get_best_move_mtcs(self.board)
-        self.push_move(best_move)
-        print("MOVE BY NEW:", best_move)
-        return
+        elif self.AI_type == "neural_mcts":
+            print(f"Neural MCTS ({self.neural_model_type}) thinking...")
+            # Use MCTS for stronger play
+            if NEW_MODEL_LOADER:
+                best_move = self.neural_engine.get_best_move(
+                    self.board, 
+                    method="mcts",
+                    num_simulations=200,  # Adjust based on hardware
+                    temperature=0.1
+                )
+            else:
+                best_move = self.neural_engine.get_best_move_mcts(self.board)
+            self.push_move(best_move)
+            print(f"NEURAL MCTS MOVE: {best_move}")
+        
+        elif self.AI_type == "neural_direct":
+            print(f"Neural Direct ({self.neural_model_type}) thinking...")
+            # Fast direct policy (weaker but instant)
+            if NEW_MODEL_LOADER:
+                best_move = self.neural_engine.get_best_move(
+                    self.board,
+                    method="direct",
+                    temperature=0.5
+                )
+            else:
+                best_move = self.neural_engine.best_move_direct(self.board)
+            self.push_move(best_move)
+            print(f"NEURAL DIRECT MOVE: {best_move}")
+        
+        else:
+            # Default to minimax
+            print("Unknown AI type, using minimax...")
+            best_move = self.minimax_engine.get_best_move(self.board)
+            self.push_move(best_move)
+            print(f"MOVE: {best_move}")
 
     def start_game(self):
         logging.basicConfig(level=logging.DEBUG)
@@ -404,104 +464,142 @@ class Main:
             pygame.time.Clock().tick(60)
 
     def select_side_screen(self):
-        font = pygame.font.Font(None, 36)
-        text = font.render("Select Your Side and AI Type:", True, (255, 255, 255))
-        text_rect = text.get_rect(center=(self.width // 2, self.height // 2 - 50))
-
-        white_button = pygame.Rect(self.width // 4 - 75, self.height // 2, 150, 50)
-        black_button = pygame.Rect(3 * self.width // 4 - 75, self.height // 2, 150, 50)
-        minimax_button = pygame.Rect(
-            self.width // 4 - 75, self.height // 2 + 75, 170, 50
-        )
-        monte_carlo_button = pygame.Rect(
-            self.width // 2.5 + 75, self.height // 2 + 75, 170, 50
-        )
-
+        """Selection screen for side, AI type, and model."""
+        font = pygame.font.Font(None, 32)
+        small_font = pygame.font.Font(None, 24)
+        
+        # Available AI types
+        ai_types = ["minimax", "neural_mcts", "neural_direct"]
+        ai_labels = ["Minimax", "Neural MCTS", "Neural Direct"]
+        
+        # Available neural model types
+        model_types = ["limited", "small", "medium", "big"]
+        model_labels = ["Limited (2GB)", "Small", "Medium", "Big"]
+        
+        selected_ai_idx = 0  # Default to minimax
+        selected_model_idx = 0  # Default to limited
+        
         while True:
-            self.screen.fill((0, 0, 0))
-            self.screen.blit(text, text_rect)
-
-            # Change the color of the buttons based on the selected AI type
-            minimax_color = (
-                (0, 255, 0) if self.AI_type == "minimax" else (255, 255, 255)
-            )
-            monte_carlo_color = (
-                (0, 255, 0) if self.AI_type == "monte_carlo" else (10, 10, 10)
-            )
-
-            pytorch_color = (0, 255, 0) if self.AI_type == "pytorch" else (10, 10, 10)
-
-            minimax_button = (
-                pygame.Rect(self.width // 4 - 75, self.height // 2 + 75, 200, 60)
-                if self.AI_type == "minimax"
-                else pygame.Rect(self.width // 4 - 75, self.height // 2 + 75, 170, 50)
-            )
-            monte_carlo_button = (
-                pygame.Rect(self.width // 2.5 + 75, self.height // 2 + 75, 200, 60)
-                if self.AI_type == "monte_carlo"
-                else pygame.Rect(self.width // 2.5 + 75, self.height // 2 + 75, 170, 50)
-            )
-      
-            pytorch_button = (
-                pygame.Rect(self.width // 2.5 + 75, self.height // 2 + 150, 200, 60)
-                if self.AI_type == "pytorch"
-                else pygame.Rect(
-                    self.width // 2.5 + 75, self.height // 2 + 150, 170, 50
-                )
-            )
-
-            pygame.draw.rect(self.screen, (255, 255, 255), white_button)
-            pygame.draw.rect(self.screen, (10, 10, 10), black_button)
-            pygame.draw.rect(self.screen, minimax_color, minimax_button)
-            pygame.draw.rect(self.screen, monte_carlo_color, monte_carlo_button)
-            pygame.draw.rect(self.screen, pytorch_color, pytorch_button)
-
-            white_text = font.render("White", True, (0, 0, 0))
-            white_text_rect = white_text.get_rect(center=white_button.center)
-
-            black_text = font.render("Black", True, (255, 255, 255))
-            black_text_rect = black_text.get_rect(center=black_button.center)
-
-            minimax_text = font.render("Minimax AI", True, (0, 0, 0))
-            minimax_text_rect = minimax_text.get_rect(center=minimax_button.center)
-
-            monte_carlo_text = font.render("Monte Carlo AI", True, (255, 255, 255))
-            monte_carlo_text_rect = monte_carlo_text.get_rect(
-                center=monte_carlo_button.center
-            )
-
-            pytorch_text = font.render("Pytorch AI", True, (255, 255, 255))
-            pytorch_text_rect = pytorch_text.get_rect(center=pytorch_button.center)
-
-            self.screen.blit(white_text, white_text_rect)
-            self.screen.blit(black_text, black_text_rect)
-            self.screen.blit(minimax_text, minimax_text_rect)
-            self.screen.blit(monte_carlo_text, monte_carlo_text_rect)
-            self.screen.blit(pytorch_text, pytorch_text_rect)
-
+            self.screen.fill((30, 30, 40))
+            
+            # Title
+            title = font.render("Chess AI Setup", True, (255, 255, 255))
+            self.screen.blit(title, (self.width // 2 - title.get_width() // 2, 20))
+            
+            # Section 1: Side selection
+            side_text = small_font.render("Choose Your Side:", True, (200, 200, 200))
+            self.screen.blit(side_text, (20, 60))
+            
+            white_button = pygame.Rect(20, 90, 100, 40)
+            black_button = pygame.Rect(130, 90, 100, 40)
+            
+            white_color = (100, 200, 100) if self.color == "w" else (80, 80, 80)
+            black_color = (100, 200, 100) if self.color == "b" else (40, 40, 40)
+            
+            pygame.draw.rect(self.screen, white_color, white_button, border_radius=5)
+            pygame.draw.rect(self.screen, black_color, black_button, border_radius=5)
+            pygame.draw.rect(self.screen, (255, 255, 255), white_button, 2, border_radius=5)
+            pygame.draw.rect(self.screen, (255, 255, 255), black_button, 2, border_radius=5)
+            
+            white_txt = small_font.render("White", True, (0, 0, 0) if self.color == "w" else (200, 200, 200))
+            black_txt = small_font.render("Black", True, (255, 255, 255))
+            self.screen.blit(white_txt, (white_button.centerx - white_txt.get_width()//2, white_button.centery - 8))
+            self.screen.blit(black_txt, (black_button.centerx - black_txt.get_width()//2, black_button.centery - 8))
+            
+            # Section 2: AI Type selection
+            ai_text = small_font.render("Choose AI Type:", True, (200, 200, 200))
+            self.screen.blit(ai_text, (20, 150))
+            
+            ai_buttons = []
+            for i, label in enumerate(ai_labels):
+                btn = pygame.Rect(20 + i * 155, 180, 145, 40)
+                ai_buttons.append(btn)
+                
+                color = (100, 200, 100) if i == selected_ai_idx else (60, 60, 70)
+                pygame.draw.rect(self.screen, color, btn, border_radius=5)
+                pygame.draw.rect(self.screen, (150, 150, 150), btn, 1, border_radius=5)
+                
+                txt = small_font.render(label, True, (0, 0, 0) if i == selected_ai_idx else (200, 200, 200))
+                self.screen.blit(txt, (btn.centerx - txt.get_width()//2, btn.centery - 8))
+            
+            # Section 3: Neural Model selection (only show if neural AI selected)
+            if selected_ai_idx > 0:  # Neural AI selected
+                model_text = small_font.render("Choose Neural Model:", True, (200, 200, 200))
+                self.screen.blit(model_text, (20, 240))
+                
+                model_buttons = []
+                for i, label in enumerate(model_labels):
+                    btn = pygame.Rect(20 + i * 118, 270, 110, 35)
+                    model_buttons.append(btn)
+                    
+                    color = (100, 150, 200) if i == selected_model_idx else (60, 60, 70)
+                    pygame.draw.rect(self.screen, color, btn, border_radius=5)
+                    pygame.draw.rect(self.screen, (150, 150, 150), btn, 1, border_radius=5)
+                    
+                    txt = small_font.render(label, True, (0, 0, 0) if i == selected_model_idx else (180, 180, 180))
+                    self.screen.blit(txt, (btn.centerx - txt.get_width()//2, btn.centery - 6))
+            else:
+                model_buttons = []
+            
+            # AI description
+            desc_y = 330
+            descriptions = {
+                "minimax": "Traditional search with alpha-beta pruning. Depth 6. Strong tactical play.",
+                "neural_mcts": "Neural network + MCTS search. 200 simulations. Best quality.",
+                "neural_direct": "Direct neural policy output. Fast but less accurate.",
+            }
+            desc = descriptions.get(ai_types[selected_ai_idx], "")
+            desc_lines = [desc[i:i+55] for i in range(0, len(desc), 55)]
+            for line in desc_lines:
+                desc_txt = small_font.render(line, True, (150, 150, 150))
+                self.screen.blit(desc_txt, (20, desc_y))
+                desc_y += 20
+            
+            # Start button
+            start_button = pygame.Rect(self.width // 2 - 75, self.height - 80, 150, 50)
+            pygame.draw.rect(self.screen, (50, 150, 50), start_button, border_radius=8)
+            pygame.draw.rect(self.screen, (100, 255, 100), start_button, 2, border_radius=8)
+            
+            start_txt = font.render("START", True, (255, 255, 255))
+            self.screen.blit(start_txt, (start_button.centerx - start_txt.get_width()//2, start_button.centery - 10))
+            
             pygame.display.flip()
-
+            
+            # Event handling
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     pygame.quit()
                     sys.exit()
-
+                
                 if event.type == pygame.MOUSEBUTTONDOWN:
-                    if white_button.collidepoint(event.pos):
+                    pos = event.pos
+                    
+                    # Side buttons
+                    if white_button.collidepoint(pos):
                         self.color = "w"
                         self.AI_turn = False
-                        return
-                    elif black_button.collidepoint(event.pos):
+                    elif black_button.collidepoint(pos):
                         self.color = "b"
                         self.AI_turn = True
+                    
+                    # AI type buttons
+                    for i, btn in enumerate(ai_buttons):
+                        if btn.collidepoint(pos):
+                            selected_ai_idx = i
+                    
+                    # Model buttons
+                    for i, btn in enumerate(model_buttons):
+                        if btn.collidepoint(pos):
+                            selected_model_idx = i
+                    
+                    # Start button
+                    if start_button.collidepoint(pos):
+                        self.AI_type = ai_types[selected_ai_idx]
+                        self.neural_model_type = model_types[selected_model_idx]
+                        print(f"Selected: Side={self.color}, AI={self.AI_type}, Model={self.neural_model_type}")
                         return
-                    elif minimax_button.collidepoint(event.pos):
-                        self.AI_type = "minimax"
-
-                    elif monte_carlo_button.collidepoint(event.pos):
-                        self.AI_type = "monte_carlo"
-                    elif pytorch_button.collidepoint(event.pos):
-                        self.AI_type = "pytorch"
+            
+            pygame.time.Clock().tick(60)
 
 
 # Create an instance and start a game
