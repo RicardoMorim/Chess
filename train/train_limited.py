@@ -42,8 +42,9 @@ import chess.pgn
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models import create_chess_model, load_model_with_compatibility
-from data import board_to_tensor, ChessDataset, load_games_from_folder
+from data import board_to_tensor, ChessDataset, load_games_in_batches, load_puzzles, load_lichess_puzzles, filter_and_prioritize_puzzles_cached, PuzzleDataset
 from mcts import select_move_with_mcts, generate_mcts_game
+import glob
 
 # ============================================================================
 # CONFIGURATION FOR LIMITED HARDWARE
@@ -73,10 +74,11 @@ LIMITED_CONFIG = {
     "checkpoint_every": 1,         # Save every epoch
     "keep_last_n": 5,              # Keep last 5 checkpoints
     
-    # Memory optimization
-    "num_workers": 0,              # No multiprocessing (saves RAM)
-    "pin_memory": False,           # Disable for low RAM
-    "prefetch_factor": None,
+    # Memory optimization - tuned for i5-8th gen
+    "num_workers": 3,              # Use workers for data loading (i5 has 4 cores)
+    "pin_memory": True,            # Enable for faster GPU transfer
+    "prefetch_factor": 2,          # Prefetch batches
+    "persistent_workers": True,    # Keep workers alive
     
     # Data paths
     "pgn_folder": "chess_pgns",
@@ -206,37 +208,68 @@ class TrainingState:
 # ============================================================================
 def load_tactical_data_limited(config):
     """Load tactical training data with memory constraints."""
-    from data import create_tactical_dataset
-    
     print("\n📁 Loading tactical training data...")
     
-    # Load PGN games
-    pgn_folder = Path(config["pgn_folder"])
-    if not pgn_folder.exists():
-        pgn_folder = Path(__file__).parent / config["pgn_folder"]
+    # Load puzzles first (most important for tactics)
+    puzzle_pgn = "./chess_pgns/puzzles/puzzles.pgn"
+    lichess_csv = "./chess_pgns/puzzles/lichess_db_puzzle.csv"
     
-    if pgn_folder.exists():
-        games = load_games_from_folder(str(pgn_folder))
-        print(f"  Loaded {len(games)} games from PGNs")
+    all_puzzles = []
+    
+    if os.path.exists(puzzle_pgn):
+        pgn_puzzles = load_puzzles(puzzle_pgn)
+        all_puzzles.extend(pgn_puzzles)
+        print(f"  Loaded {len(pgn_puzzles)} PGN puzzles")
+    
+    if os.path.exists(lichess_csv):
+        lichess_puzzles = load_lichess_puzzles(lichess_csv)
+        all_puzzles.extend(lichess_puzzles)
+        print(f"  Loaded {len(lichess_puzzles)} Lichess puzzles")
+    
+    if all_puzzles:
+        prioritized_puzzles = filter_and_prioritize_puzzles_cached(all_puzzles)
+        print(f"  Total puzzles after prioritization: {len(prioritized_puzzles)}")
+        dataset = PuzzleDataset(prioritized_puzzles, model_type="small")
     else:
-        games = []
-        print(f"  Warning: PGN folder not found at {pgn_folder}")
+        # Fallback to PGN games if no puzzles
+        print("  No puzzles found, loading PGN games instead...")
+        pgn_folder = Path(config["pgn_folder"])
+        if not pgn_folder.exists():
+            pgn_folder = Path(__file__).parent / config["pgn_folder"]
+        
+        pgn_files = list(glob.glob(str(pgn_folder / "*.pgn")))
+        
+        if pgn_files:
+            # Use a temporary state file for batch loading
+            state_file = str(Path(config["checkpoint_dir"]) / "game_load_state.json")
+            games = load_games_in_batches(pgn_files, state_file, batch_size=500)
+            print(f"  Loaded {len(games)} games from PGNs")
+            dataset = ChessDataset(games, augment=True, model_type="small")
+        else:
+            print(f"  Warning: No data found!")
+            return None
     
-    # Create dataset with limited model type
-    dataset = ChessDataset(games, augment=True, model_type="small")  # 18 channels
+    # Create data loader optimized for i5-8th gen
+    loader_kwargs = {
+        "batch_size": config["batch_size"],
+        "shuffle": True,
+        "drop_last": True,
+    }
     
-    # Create data loader optimized for low memory
-    dataloader = DataLoader(
-        dataset,
-        batch_size=config["batch_size"],
-        shuffle=True,
-        num_workers=config["num_workers"],
-        pin_memory=config["pin_memory"],
-        drop_last=True,
-    )
+    # Add multiprocessing if workers > 0
+    if config["num_workers"] > 0:
+        loader_kwargs.update({
+            "num_workers": config["num_workers"],
+            "pin_memory": config["pin_memory"],
+            "persistent_workers": config.get("persistent_workers", True),
+            "prefetch_factor": config.get("prefetch_factor", 2),
+        })
+    
+    dataloader = DataLoader(dataset, **loader_kwargs)
     
     print(f"  Dataset size: {len(dataset)} positions")
     print(f"  Batches per epoch: {len(dataloader)}")
+    print(f"  Workers: {config['num_workers']}, Pin Memory: {config['pin_memory']}")
     
     return dataloader
 
@@ -259,32 +292,44 @@ def train_epoch_limited(model, dataloader, optimizer, scheduler, config, device)
     policy_criterion = nn.CrossEntropyLoss()
     value_criterion = nn.MSELoss()
     
+    # Use AMP for faster training on supported GPUs
+    use_amp = torch.cuda.is_available() and device.type == 'cuda'
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
+    
     for batch_idx, batch in enumerate(dataloader):
-        positions = batch['position'].to(device)
-        policy_targets = batch['policy'].to(device)
-        value_targets = batch['value'].to(device)
+        positions = batch['position'].to(device, non_blocking=True)
+        policy_targets = batch['policy'].to(device, non_blocking=True)
+        value_targets = batch['value'].to(device, non_blocking=True)
         
-        # Forward pass
-        policy_out, value_out = model(positions)
-        
-        # Calculate losses
-        policy_loss = policy_criterion(policy_out, policy_targets)
-        value_loss = value_criterion(value_out.squeeze(), value_targets)
-        loss = policy_loss + value_loss
-        
-        # Scale loss by accumulation steps
-        loss = loss / accumulation_steps
-        
-        # Backward pass
-        loss.backward()
+        # Forward pass with optional AMP
+        if use_amp:
+            with torch.amp.autocast('cuda'):
+                policy_out, value_out = model(positions)
+                policy_loss = policy_criterion(policy_out, policy_targets)
+                value_loss = value_criterion(value_out.squeeze(), value_targets)
+                loss = policy_loss + value_loss
+                loss = loss / accumulation_steps
+            
+            # Backward pass with scaled gradients
+            scaler.scale(loss).backward()
+        else:
+            policy_out, value_out = model(positions)
+            policy_loss = policy_criterion(policy_out, policy_targets)
+            value_loss = value_criterion(value_out.squeeze(), value_targets)
+            loss = policy_loss + value_loss
+            loss = loss / accumulation_steps
+            loss.backward()
         
         # Accumulate gradients
         if (batch_idx + 1) % accumulation_steps == 0:
-            # Gradient clipping for stability
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            # Optimizer step
-            optimizer.step()
+            if use_amp:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
             optimizer.zero_grad()
         
         # Track losses (unscaled)
@@ -303,7 +348,11 @@ def train_epoch_limited(model, dataloader, optimizer, scheduler, config, device)
     
     # Handle remaining gradients
     if num_batches % accumulation_steps != 0:
-        optimizer.step()
+        if use_amp:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
         optimizer.zero_grad()
     
     # Step scheduler
@@ -316,7 +365,6 @@ def train_epoch_limited(model, dataloader, optimizer, scheduler, config, device)
         'policy_loss': total_policy_loss / num_batches,
         'value_loss': total_value_loss / num_batches,
     }
-
 
 # ============================================================================
 # SELF-PLAY TRAINING FOR LIMITED MODEL

@@ -19,12 +19,34 @@ from utils import clear_memory, test_tactical_recognition, get_optimal_batch_siz
 from self_play import generate_self_play_games, run_self_play_training
 from training import train_batch, train_tactical
 
+# Import optimizations
+try:
+    from optimizations import (
+        HARDWARE_CONFIG, 
+        create_optimized_dataloader,
+        AsyncDataPrefetcher,
+        aggressive_memory_cleanup,
+        print_memory_stats
+    )
+    HAS_OPTIMIZATIONS = True
+    print("✓ Training optimizations loaded")
+except ImportError:
+    HAS_OPTIMIZATIONS = False
+    print("⚠ Optimizations not available, using defaults")
+
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 if device.type == 'cuda':
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    
+    # Enable TF32 for faster training on Ampere+ GPUs (no effect on Pascal/GTX 1050)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    
+    # Enable cudnn benchmark for consistent input sizes
+    torch.backends.cudnn.benchmark = True
 
 
 # Signal handler 
@@ -207,13 +229,23 @@ def main():
     
     
     # Create puzzle dataloader once - puzzles are smaller and reused
-    puzzle_dataloader = DataLoader(
-        puzzle_dataset, 
-        batch_size=min(32, optimal_batch_size),
-        shuffle=True,
-        num_workers=2,
-        pin_memory=True
-    )
+    # Use optimized dataloader if available
+    if HAS_OPTIMIZATIONS:
+        puzzle_dataloader = create_optimized_dataloader(
+            puzzle_dataset,
+            batch_size=min(32, optimal_batch_size),
+            shuffle=True,
+            for_training=True
+        )
+        print(f"Using optimized DataLoader (workers={HARDWARE_CONFIG['dataloader_workers']})")
+    else:
+        puzzle_dataloader = DataLoader(
+            puzzle_dataset, 
+            batch_size=min(32, optimal_batch_size),
+            shuffle=True,
+            num_workers=2,
+            pin_memory=True
+        )
     
     # Determine training mode
     current_phase = "regular"  # Default mode
@@ -307,13 +339,22 @@ def main():
             
             # Create dataset and dataloader for this batch only
             game_dataset = ChessDataset(pro_games, augment=True, model_type=model_type)
-            game_dataloader = DataLoader(
-                game_dataset, 
-                batch_size=optimal_batch_size,
-                shuffle=True, 
-                num_workers=min(2, os.cpu_count() or 1),
-                pin_memory=True
-            )
+            
+            if HAS_OPTIMIZATIONS:
+                game_dataloader = create_optimized_dataloader(
+                    game_dataset,
+                    batch_size=optimal_batch_size,
+                    shuffle=True,
+                    for_training=True
+                )
+            else:
+                game_dataloader = DataLoader(
+                    game_dataset, 
+                    batch_size=optimal_batch_size,
+                    shuffle=True, 
+                    num_workers=min(2, os.cpu_count() or 1),
+                    pin_memory=True
+                )
             
             # Train on this batch
             train_batch(model, game_dataloader, puzzle_dataloader, save_path, state_file, 
@@ -324,7 +365,10 @@ def main():
             del game_dataset
             del game_dataloader
             gc.collect()
-            clear_memory()
+            if HAS_OPTIMIZATIONS:
+                aggressive_memory_cleanup()
+            else:
+                clear_memory()
             
             # Tactical training after professional batch
             print("Running quick tactical training phase...")
@@ -345,6 +389,8 @@ def main():
         # Regular games mode
         else:  # Regular games phase
             print("\n=== REGULAR GAMES TRAINING ===")
+            if HAS_OPTIMIZATIONS:
+                print_memory_stats("before loading")
             
             # Load one batch of regular games
             regular_games = load_games_in_batches(pgn_files, state_file, batch_size=regular_batch_size)
@@ -366,13 +412,22 @@ def main():
             
             # Create dataset and dataloader for this batch only
             game_dataset = ChessDataset(regular_games, augment=True)
-            game_dataloader = DataLoader(
-                game_dataset, 
-                batch_size=optimal_batch_size,
-                shuffle=True, 
-                num_workers=min(2, os.cpu_count() or 1),
-                pin_memory=True
-            )
+            
+            if HAS_OPTIMIZATIONS:
+                game_dataloader = create_optimized_dataloader(
+                    game_dataset,
+                    batch_size=optimal_batch_size,
+                    shuffle=True,
+                    for_training=True
+                )
+            else:
+                game_dataloader = DataLoader(
+                    game_dataset, 
+                    batch_size=optimal_batch_size,
+                    shuffle=True, 
+                    num_workers=min(2, os.cpu_count() or 1),
+                    pin_memory=True
+                )
             
             # Train on regular games
             train_batch(model, game_dataloader, puzzle_dataloader, save_path, state_file, 
@@ -383,7 +438,11 @@ def main():
             del game_dataset
             del game_dataloader
             gc.collect()
-            clear_memory()
+            if HAS_OPTIMIZATIONS:
+                aggressive_memory_cleanup()
+                print_memory_stats("after cleanup")
+            else:
+                clear_memory()
 
             print("Running enhanced tactical training phase for regular games...")
             tactical_optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
