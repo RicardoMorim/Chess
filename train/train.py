@@ -68,8 +68,8 @@ def parse_arguments():
                         help="Training mode: professional games, regular games, or self-play")
     
     # Model parameters
-    parser.add_argument("--model", default="big", choices=["small", "medium", "big"], 
-                        help="Model size: small (6 blocks), medium (10 blocks), or big (15 blocks)")
+    parser.add_argument("--model", default="big", choices=["limited", "small", "medium", "big"], 
+                        help="Model size: limited (low-VRAM), small (6 blocks), medium (10 blocks), or big (15 blocks)")
     
     parser.add_argument("--model-path", default=None, 
                         help="Path to save/load the model (default: ./chess_model/[model_size]_model.pth)")
@@ -119,7 +119,10 @@ def main():
     # Initialize model based on size
     use_se = not args.no_se
     
-    if args.model == "small":
+    if args.model == "limited":
+        print(f"Model: Limited (low-VRAM, 4 blocks, 64 filters, 18 channels, SE={use_se})")
+        model = create_chess_model("limited", use_se=use_se, legacy=args.legacy).to(device)
+    elif args.model == "small":
         print(f"Model: Small (6 blocks, 18 channels, SE={use_se})")
         model = create_chess_model("small", use_se=use_se, legacy=args.legacy).to(device)
     elif args.model == "medium":
