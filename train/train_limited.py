@@ -297,9 +297,39 @@ def train_epoch_limited(model, dataloader, optimizer, scheduler, config, device)
     scaler = torch.amp.GradScaler('cuda') if use_amp else None
     
     for batch_idx, batch in enumerate(dataloader):
-        positions = batch['position'].to(device, non_blocking=True)
-        policy_targets = batch['policy'].to(device, non_blocking=True)
-        value_targets = batch['value'].to(device, non_blocking=True)
+        # Support multiple batch formats:
+        # - dict with keys 'position','policy','value' (older custom collate)
+        # - tuple/list (positions, policy_targets, value_targets) (standard Dataset)
+        if isinstance(batch, dict):
+            positions = batch.get('position')
+            policy_targets = batch.get('policy')
+            value_targets = batch.get('value')
+        elif isinstance(batch, (list, tuple)) and len(batch) >= 3:
+            positions, policy_targets, value_targets = batch[0], batch[1], batch[2]
+        else:
+            # Fallback: try to coerce single-tensor batches
+            try:
+                positions = batch[0]
+                policy_targets = batch[1]
+                value_targets = batch[2]
+            except Exception:
+                raise TypeError(f"Unsupported batch format: {type(batch)}")
+
+        # Move tensors to device (support non-blocking when pinned memory)
+        if isinstance(positions, torch.Tensor):
+            positions = positions.to(device, non_blocking=True)
+        else:
+            positions = torch.stack([p if isinstance(p, torch.Tensor) else torch.tensor(p) for p in positions]).to(device)
+
+        if isinstance(policy_targets, torch.Tensor):
+            policy_targets = policy_targets.to(device, non_blocking=True)
+        else:
+            policy_targets = torch.tensor(policy_targets).to(device)
+
+        if isinstance(value_targets, torch.Tensor):
+            value_targets = value_targets.to(device, non_blocking=True)
+        else:
+            value_targets = torch.tensor(value_targets).to(device)
         
         # Forward pass with optional AMP
         if use_amp:
