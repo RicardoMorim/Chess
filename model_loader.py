@@ -552,8 +552,10 @@ def load_chess_model(model_type="limited", checkpoint_path=None, device_override
     else:
         # Try to find default checkpoint
         default_paths = [
+            f"chess_model/{model_type}_model.pth",
             f"train/checkpoints_{model_type}/model_best.pt",
             f"train/checkpoints_{model_type}/model_epoch_0100.pt",
+            f"train/chess_model/{model_type}_model.pth",  
             f"train/chess_model/chess_model_{model_type}.pth",
             "chess_model/chess_model.pth",
         ]
