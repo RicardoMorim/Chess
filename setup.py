@@ -7,7 +7,7 @@ extensions = [
         "minimax_cy",
         ["minimax_cy.pyx"],
         include_dirs=[numpy.get_include()],
-        extra_compile_args=["-O3", "-march=native"],  # Aggressive optimization
+        # Keep flags minimal for Windows/MSVC compatibility; /O2 is added by default
     )
 ]
 

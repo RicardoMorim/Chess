@@ -72,7 +72,7 @@ def parse_arguments():
                         help="Model size: limited (low-VRAM), small (6 blocks), medium (10 blocks), or big (15 blocks)")
     
     parser.add_argument("--model-path", default=None, 
-                        help="Path to save/load the model (default: ./chess_model/[model_size]_model.pth)")
+                        help="Path to save/load the model (default: ./checkpoints_[model_size]/model_best.pt)")
     
     parser.add_argument("--legacy", action="store_true",
                         help="Load legacy model architecture (for old checkpoints)")
@@ -96,9 +96,9 @@ def parse_arguments():
     
     args = parser.parse_args()
     
-    # Set defaults based on arguments
+    # Set defaults based on arguments - use checkpoints_{model}/ folder
     if args.model_path is None:
-        args.model_path = f"./chess_model/{args.model}_model.pth"
+        args.model_path = f"./checkpoints_{args.model}/model_best.pt"
         
     # Backward compatibility for positional arguments
     if len(sys.argv) > 1 and sys.argv[1] in ["pro", "regular", "self-play"] and args.mode is None:

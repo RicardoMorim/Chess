@@ -387,7 +387,7 @@ class Main:
                 best_move = self.neural_engine.get_best_move(
                     self.board, 
                     method="mcts",
-                    num_simulations=200,  # Adjust based on hardware
+                    num_simulations=1000,  # Adjust based on hardware
                     temperature=0.1
                 )
             else:
@@ -402,7 +402,7 @@ class Main:
                 best_move = self.neural_engine.get_best_move(
                     self.board,
                     method="direct",
-                    temperature=0.5
+                    temperature=0.1
                 )
             else:
                 best_move = self.neural_engine.best_move_direct(self.board)
@@ -441,7 +441,7 @@ class Main:
                 best_move = engine.get_best_move(
                     self.board, 
                     method="mcts",
-                    num_simulations=200,
+                    num_simulations=1000,
                     temperature=0.1
                 )
             else:
@@ -451,7 +451,7 @@ class Main:
                 best_move = engine.get_best_move(
                     self.board,
                     method="direct",
-                    temperature=0.3
+                    temperature=0.1
                 )
             else:
                 best_move = engine.best_move_direct(self.board)
@@ -467,7 +467,7 @@ class Main:
         ai_color = "w" if self.color == "b" else "b"
 
         # self.AI_turn = False  
-        max_depth = 3  # Set the initial max depth for the engine
+        max_depth = 6  # Set the initial max depth for the engine
 
         clock = pygame.time.Clock()
 

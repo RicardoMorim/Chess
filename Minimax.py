@@ -7,8 +7,8 @@ from TranspositionTable import TranspositionTable
 
 # Import Cython implementations if available
 try:
-    # import minimax_cy
-    CYTHON_AVAILABLE =  False
+    import minimax_cy
+    CYTHON_AVAILABLE = True
     print("Cython acceleration enabled!")
 except ImportError:
     CYTHON_AVAILABLE = False
@@ -201,7 +201,8 @@ class MinimaxAI:
             return minimax_cy.evaluate_static_cy(self.piece_value, 
                                                self.pst_white_flat,
                                                self.pst_black_flat,
-                                               board)
+                                               board,
+                                               self.evaluate_king_safety)
         
         # Original Python implementation
         material = 0

@@ -1,0 +1,33 @@
+# test_eval_parity.py
+import chess, random
+import Minimax as M
+
+def rand_board():
+    board = chess.Board()
+    # do a few random legal moves to change positions
+    for _ in range(random.randint(0, 40)):
+        if board.is_game_over(): break
+        moves = list(board.legal_moves)
+        board.push(random.choice(moves))
+    return board
+
+m = M.MinimaxAI({}, chess.WHITE, depth=4)
+
+orig_flag = M.CYTHON_AVAILABLE
+
+mismatches = 0
+N = 200
+for i in range(N):
+    b = rand_board()
+    # force python fallback
+    M.CYTHON_AVAILABLE = False
+    py_val = m.evaluate_static(b)
+    # force cython path (if compiled)
+    M.CYTHON_AVAILABLE = True
+    cy_val = m.evaluate_static(b)
+    if py_val != cy_val:
+        mismatches += 1
+        print("Mismatch", i, "py", py_val, "cy", cy_val)
+print(f"Checked {N} positions, mismatches = {mismatches}")
+
+M.CYTHON_AVAILABLE = orig_flag
