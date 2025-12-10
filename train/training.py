@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import math
+import gc
 
 # ============================================================================
 # TRAINING CONFIGURATION
@@ -178,11 +179,7 @@ def train_batch(model, game_dataloader, puzzle_dataloader, save_path, state_file
     puzzle_value_weight = TRAIN_CONFIG['puzzle_value_weight']
     puzzle_frequency = TRAIN_CONFIG['puzzle_frequency']
     puzzle_batches = TRAIN_CONFIG['puzzle_batches']
-    
-    # Puzzle iterator
-    import itertools
-    puzzle_iter = itertools.cycle(puzzle_dataloader)
-    
+
     # Load state
     if os.path.exists(state_file):
         with open(state_file, 'r') as f:
@@ -199,6 +196,10 @@ def train_batch(model, game_dataloader, puzzle_dataloader, save_path, state_file
         total_policy_loss = 0
         total_value_loss = 0
         game_batch_count = 0
+        
+        # Create fresh puzzle iterator for this epoch to allow garbage collection
+        import itertools
+        puzzle_iter = itertools.cycle(puzzle_dataloader)
         
         epoch_start = time.time()
         
@@ -278,6 +279,9 @@ def train_batch(model, game_dataloader, puzzle_dataloader, save_path, state_file
         # Update scheduler
         scheduler.step()
         
+        del puzzle_iter
+        gc.collect()
+
         # Logging
         epoch_time = time.time() - epoch_start
         avg_loss = total_loss / max(1, game_batch_count * (1 + puzzle_batches))
