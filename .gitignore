@@ -5,3 +5,5 @@ cache*
 
 /train/chess_pgns/**/*.pgn
 /train/chess_pgns/**/*.csv
+
+/stockfish/*

@@ -59,6 +59,8 @@ These libraries are specified in the requirements.txt file and will be installed
 4. (Optional) Add openings pgn files to the folder `/openings`.
 -> I used PGN Mentor to find the files.
 
+5. (Optional) Download Stockfish engine and place it in the `/stockfish` folder.
+
 # Usage
 1. Run the main.py script to start the chess game:
 -> python main.py 
