@@ -36,9 +36,9 @@ import numpy as np
 # Add parent directory for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from train.models import create_chess_model
-from train.data import board_to_tensor, get_move_index
-from train.utils import clear_memory, get_optimal_batch_size, test_tactical_recognition
+from models import create_chess_model
+from data import board_to_tensor, get_move_index
+from utils import clear_memory, get_optimal_batch_size, test_tactical_recognition
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
