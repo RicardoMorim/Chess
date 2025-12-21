@@ -145,14 +145,27 @@ class StockfishEvaluator:
 
 
 # ============================================================================
-# STOCKFISH-GUIDED GAME GENERATION
+# STOCKFISH-GUIDED GAME GENERATION (IMPROVED)
 # ============================================================================
 def generate_stockfish_guided_game(model, stockfish, device, max_moves=200, 
-                                   temperature=1.0, input_channels=18):
+                                   temperature=0.3, input_channels=18, 
+                                   exploration_rate=0.1):
     """
-    Generate a single game where:
-    - Model selects moves (learning)
-    - Stockfish evaluates each position (teaching)
+    Generate a training game where:
+    - Stockfish provides the BEST MOVE as policy target (teaching)
+    - Stockfish provides position evaluation as value target
+    - Model occasionally plays to explore (with low probability)
+    
+    Key improvement: Policy target is Stockfish's best move, not model's move!
+    
+    Args:
+        model: Neural network model
+        stockfish: StockfishEvaluator instance
+        device: Computation device
+        max_moves: Maximum moves per game
+        temperature: Temperature for model's exploration moves (lower = more greedy)
+        input_channels: Number of input channels for the model
+        exploration_rate: Probability of using model's move instead of Stockfish's
     
     Returns:
         List of (board_tensor, policy_target, stockfish_value) tuples
@@ -164,86 +177,116 @@ def generate_stockfish_guided_game(model, stockfish, device, max_moves=200,
     model.eval()
     
     while not board.is_game_over() and move_num < max_moves:
-        # Get model's move probabilities
+        legal_moves = list(board.legal_moves)
+        if not legal_moves:
+            break
+        
+        # Get board tensor for this position (BEFORE making move)
         board_tensor = torch.tensor(
             board_to_tensor(board, move_num + 1, input_channels=input_channels),
             dtype=torch.float32
         ).unsqueeze(0).to(device)
         
-        with torch.no_grad():
-            policy_logits, model_value = model(board_tensor)
-            policy = F.softmax(policy_logits / temperature, dim=1).cpu().numpy()[0]
+        # Get Stockfish's evaluation and best move
+        try:
+            # Get Stockfish analysis with best move
+            info = stockfish.engine.analyse(
+                board, 
+                chess.engine.Limit(depth=stockfish.depth),
+                multipv=3  # Get top 3 moves for soft targets
+            )
+            
+            # Handle both single PV and multi-PV results
+            if isinstance(info, list):
+                # Multi-PV result
+                best_info = info[0]
+                best_move = best_info.get("pv", [None])[0]
+                
+                # Create soft policy target from top moves
+                policy_target = np.zeros(4672, dtype=np.float32)
+                total_weight = 0
+                for i, pv_info in enumerate(info):
+                    pv_move = pv_info.get("pv", [None])[0]
+                    if pv_move and pv_move in legal_moves:
+                        # Weight: 1st move gets 0.7, 2nd gets 0.2, 3rd gets 0.1
+                        weight = [0.7, 0.2, 0.1][i] if i < 3 else 0.05
+                        move_idx = get_move_index(pv_move)
+                        policy_target[move_idx] = weight
+                        total_weight += weight
+                
+                # Normalize
+                if total_weight > 0:
+                    policy_target /= total_weight
+                else:
+                    # Fallback to uniform over legal moves
+                    for move in legal_moves:
+                        policy_target[get_move_index(move)] = 1.0 / len(legal_moves)
+            else:
+                # Single PV result
+                best_move = info.get("pv", [None])[0]
+                policy_target = np.zeros(4672, dtype=np.float32)
+                if best_move:
+                    policy_target[get_move_index(best_move)] = 1.0
+                else:
+                    for move in legal_moves:
+                        policy_target[get_move_index(move)] = 1.0 / len(legal_moves)
+            
+            # Get Stockfish evaluation (value target)
+            score = best_info["score"].relative if isinstance(info, list) else info["score"].relative
+            if score.is_mate():
+                mate_in = score.mate()
+                sf_value = 1.0 if mate_in > 0 else -1.0
+            else:
+                cp = score.score()
+                sf_value = np.tanh(cp / 400.0)  # Normalize: 400cp ≈ 0.76
+                
+        except Exception as e:
+            print(f"⚠ Stockfish error: {e}")
+            # Fallback: use model's prediction
+            with torch.no_grad():
+                policy_logits, value_pred = model(board_tensor)
+                policy = F.softmax(policy_logits, dim=1).cpu().numpy()[0]
+            
+            policy_target = np.zeros(4672, dtype=np.float32)
+            for move in legal_moves:
+                policy_target[get_move_index(move)] = policy[get_move_index(move)]
+            if policy_target.sum() > 0:
+                policy_target /= policy_target.sum()
+            else:
+                for move in legal_moves:
+                    policy_target[get_move_index(move)] = 1.0 / len(legal_moves)
+            
+            best_move = legal_moves[0]
+            sf_value = 0.0
         
-        legal_moves = list(board.legal_moves)
-        if not legal_moves:
-            break
-        
-        # Create policy target from legal moves
-        move_probs = np.zeros(len(legal_moves))
-        for i, move in enumerate(legal_moves):
-            move_idx = get_move_index(move)
-            move_probs[i] = policy[move_idx]
-        
-        # Normalize
-        if move_probs.sum() > 1e-10:
-            move_probs = move_probs / move_probs.sum()
-        else:
-            move_probs = np.ones(len(legal_moves)) / len(legal_moves)
-        
-        # Sample move (with temperature)
-        chosen_move = np.random.choice(legal_moves, p=move_probs)
-        
-        # Get Stockfish evaluation BEFORE move
-        sf_value_before = stockfish.evaluate(board, normalized=True)
-        
-        # Make move
-        board.push(chosen_move)
-        
-        # Get Stockfish evaluation AFTER move (from opponent's perspective)
-        sf_value_after = stockfish.evaluate(board, normalized=True)
-        
-        # TD target: value after move (flipped for opponent)
-        # If position improved for us, it got worse for opponent
-        td_target = -sf_value_after  # Flip perspective
-        
-        # Store sample with TD target
-        policy_target = np.zeros(4672, dtype=np.float32)
-        move_idx = get_move_index(chosen_move)
-        policy_target[move_idx] = 1.0  # One-hot for chosen move
-        
+        # Store the training sample
         samples.append((
             board_tensor.cpu().numpy()[0],
             policy_target,
-            td_target
+            sf_value
         ))
         
+        # Decide which move to play (mostly Stockfish, sometimes model for exploration)
+        if best_move and np.random.random() > exploration_rate:
+            # Play Stockfish's best move (90% of the time)
+            chosen_move = best_move
+        else:
+            # Play model's move for exploration (10% of the time)
+            with torch.no_grad():
+                policy_logits, _ = model(board_tensor)
+                policy = F.softmax(policy_logits / temperature, dim=1).cpu().numpy()[0]
+            
+            move_probs = np.array([policy[get_move_index(m)] for m in legal_moves])
+            if move_probs.sum() > 1e-10:
+                move_probs /= move_probs.sum()
+            else:
+                move_probs = np.ones(len(legal_moves)) / len(legal_moves)
+            
+            chosen_move = np.random.choice(legal_moves, p=move_probs)
+        
+        # Make the move
+        board.push(chosen_move)
         move_num += 1
-    
-    # Final game result (use as bonus signal)
-    result = board.result()
-    if result == "1-0":
-        game_outcome = 1.0
-    elif result == "0-1":
-        game_outcome = -1.0
-    else:
-        game_outcome = 0.0
-    
-    # Blend TD targets with final outcome (exponential decay)
-    gamma = 0.99
-    for i in range(len(samples) - 1, -1, -1):
-        board_t, policy_t, td_val = samples[i]
-        
-        # Blend: 80% TD, 20% final outcome (closer to end → more final outcome)
-        moves_from_end = len(samples) - i
-        blend_weight = 0.8 * (gamma ** moves_from_end)
-        
-        blended_value = blend_weight * td_val + (1 - blend_weight) * game_outcome
-        
-        # Flip value for alternate moves
-        if i % 2 == 1:
-            blended_value = -blended_value
-        
-        samples[i] = (board_t, policy_t, blended_value)
     
     return samples
 
@@ -260,6 +303,8 @@ def main():
     
     parser.add_argument("--games", type=int, default=1000,
                        help="Number of games to generate")
+    parser.add_argument("--infinite", action="store_true",
+                       help="Run indefinitely until stopped (overrides --games)")
     
     parser.add_argument("--stockfish-path", 
                        default="../stockfish/stockfish-windows-x86-64-avx2.exe",
@@ -278,6 +323,9 @@ def main():
                        help="Save checkpoint every N games")
     
     args = parser.parse_args()
+    # Enable infinite mode if games <= 0
+    if args.games is not None and args.games <= 0:
+        args.infinite = True
     
     print(f"""
 ╔═══════════════════════════════════════════════════════════════════╗
@@ -286,7 +334,7 @@ def main():
 ╚═══════════════════════════════════════════════════════════════════╝
 
 Model: {args.model}
-Games: {args.games}
+Games: {('infinite' if args.infinite else args.games)}
 Stockfish depth: {args.stockfish_depth}
 Device: {device}
 
@@ -329,11 +377,23 @@ Starting...
         hash_mb=256
     )
     
-    # Training setup
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+    # Use SGD for consistency with other training scripts (AlphaZero-style)
+    base_lr = 0.005  # Starting LR (will be modulated by scheduler)
+    optimizer = torch.optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=1e-4, nesterov=True)
     policy_loss_fn = PolicyLoss()
     value_loss_fn = ValueLoss(use_huber=True)
     
+    # Loss weights - value head slightly higher for better position understanding
+    policy_weight = 1.0
+    value_weight = 1.5
+    
+    # Mixed precision training for speed
+    scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+    
+    # LR scheduler state
+    training_cycles = 0
+    warmup_epochs = 2
+
     all_samples = []
     total_positions = 0
     games_completed = start_game
@@ -343,117 +403,326 @@ Starting...
         with open(state_file, 'r') as f:
             state = json.load(f)
             best_tactical_accuracy = state.get('best_tactical_accuracy', 0.0)
+            training_cycles = state.get('training_cycles', 0)
     
     try:
         # Generate games (resume from where we left off)
-        for game_num in range(start_game + 1, start_game + args.games + 1):
-            print(f"\n[{game_num - start_game}/{args.games}] (Total: {game_num}) Generating...")
-            
-            start_time = time.time()
-            samples = generate_stockfish_guided_game(
-                model, stockfish, device,
-                max_moves=200,
-                temperature=0.8,
-                input_channels=input_channels
-            )
-            gen_time = time.time() - start_time
-            
-            all_samples.extend(samples)
-            total_positions += len(samples)
-            games_completed += 1
-            
-            print(f"   {len(samples)} positions in {gen_time:.1f}s | Buffer: {len(all_samples)}")
-            
-            # Train every N games or when buffer full
-            should_train = (game_num - start_game) % args.save_every == 0
-            buffer_full = len(all_samples) >= 50000
-            is_last = (game_num - start_game) == args.games
-            
-            if should_train or buffer_full or is_last:
-                print(f"\n{'='*70}")
-                print(f"Training on {len(all_samples)} positions...")
-                print(f"{'='*70}")
-                
-                # Prepare dataset
-                boards = torch.tensor([s[0] for s in all_samples], dtype=torch.float32)
-                policies = torch.tensor([s[1] for s in all_samples], dtype=torch.float32)
-                values = torch.tensor([s[2] for s in all_samples], dtype=torch.float32)
-                
-                dataset = TensorDataset(boards, policies, values)
-                dataloader = DataLoader(
-                    dataset, 
-                    batch_size=args.batch_size,
-                    shuffle=True,
-                    num_workers=2,
-                    pin_memory=True
+        if args.infinite:
+            print("\nRunning in infinite mode. Press Ctrl+C to stop.")
+            game_num = start_game
+            while True:
+                game_num += 1
+                print(f"\n[{games_completed - start_game + 1}/∞] (Total: {game_num}) Generating...")
+
+                start_time = time.time()
+                samples = generate_stockfish_guided_game(
+                    model, stockfish, device,
+                    max_moves=200,
+                    temperature=0.8,
+                    input_channels=input_channels
                 )
-                
-                # Train
-                model.train()
-                for epoch in range(args.epochs):
-                    total_loss = 0
-                    total_policy_loss = 0
-                    total_value_loss = 0
-                    batch_count = 0
+                gen_time = time.time() - start_time
+
+                all_samples.extend(samples)
+                total_positions += len(samples)
+                games_completed += 1
+
+                print(f"   {len(samples)} positions in {gen_time:.1f}s | Buffer: {len(all_samples)}")
+
+                # Train every N games or when buffer full
+                should_train = (games_completed % args.save_every == 0)
+                buffer_full = len(all_samples) >= 50000
+
+                if should_train or buffer_full:
+                    print(f"\n{'='*70}")
+                    print(f"Training on {len(all_samples)} positions...")
+                    print(f"{'='*70}")
+
+                    # Prepare dataset
+                    boards = torch.tensor([s[0] for s in all_samples], dtype=torch.float32)
+                    policies = torch.tensor([s[1] for s in all_samples], dtype=torch.float32)
+                    values = torch.tensor([s[2] for s in all_samples], dtype=torch.float32)
+
+                    dataset = TensorDataset(boards, policies, values)
+                    dataloader = DataLoader(
+                        dataset,
+                        batch_size=args.batch_size,
+                        shuffle=True,
+                        num_workers=2,
+                        pin_memory=True
+                    )
+
+                    # Train with improvements
+                    model.train()
+                    training_cycles += 1
                     
-                    for batch in dataloader:
-                        b_boards, b_policies, b_values = batch
-                        b_boards = b_boards.to(device)
-                        b_policies = b_policies.to(device)
-                        b_values = b_values.to(device)
+                    # Learning rate schedule: warmup then cosine decay
+                    for epoch in range(args.epochs):
+                        # Calculate LR with warmup
+                        if training_cycles <= warmup_epochs:
+                            # Linear warmup
+                            current_lr = base_lr * training_cycles / warmup_epochs
+                        else:
+                            # Cosine decay after warmup
+                            progress = (training_cycles - warmup_epochs) / max(1, 100)  # Decay over ~100 cycles
+                            current_lr = base_lr * 0.5 * (1 + np.cos(np.pi * min(progress, 1.0)))
+                            current_lr = max(current_lr, 1e-5)  # Minimum LR
                         
-                        optimizer.zero_grad()
+                        # Update optimizer LR
+                        for param_group in optimizer.param_groups:
+                            param_group['lr'] = current_lr
                         
-                        policy_logits, value_pred = model(b_boards)
-                        
-                        policy_loss = policy_loss_fn(policy_logits, b_policies)
-                        value_loss = value_loss_fn(value_pred, b_values)
-                        
-                        loss = policy_loss + value_loss
-                        
-                        loss.backward()
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                        optimizer.step()
-                        
-                        total_loss += loss.item()
-                        total_policy_loss += policy_loss.item()
-                        total_value_loss += value_loss.item()
-                        batch_count += 1
+                        total_loss = 0
+                        total_policy_loss = 0
+                        total_value_loss = 0
+                        batch_count = 0
+
+                        for batch in dataloader:
+                            b_boards, b_policies, b_values = batch
+                            b_boards = b_boards.to(device)
+                            b_policies = b_policies.to(device)
+                            b_values = b_values.to(device)
+
+                            optimizer.zero_grad()
+
+                            # Mixed precision forward pass
+                            if scaler:
+                                with torch.cuda.amp.autocast():
+                                    policy_logits, value_pred = model(b_boards)
+                                    policy_loss = policy_loss_fn(policy_logits, b_policies)
+                                    value_loss = value_loss_fn(value_pred, b_values)
+                                    loss = policy_weight * policy_loss + value_weight * value_loss
+                                
+                                scaler.scale(loss).backward()
+                                scaler.unscale_(optimizer)
+                                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                                scaler.step(optimizer)
+                                scaler.update()
+                            else:
+                                policy_logits, value_pred = model(b_boards)
+                                policy_loss = policy_loss_fn(policy_logits, b_policies)
+                                value_loss = value_loss_fn(value_pred, b_values)
+                                loss = policy_weight * policy_loss + value_weight * value_loss
+                                
+                                loss.backward()
+                                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                                optimizer.step()
+
+                            total_loss += loss.item()
+                            total_policy_loss += policy_loss.item()
+                            total_value_loss += value_loss.item()
+                            batch_count += 1
+
+                        avg_loss = total_loss / batch_count
+                        avg_policy = total_policy_loss / batch_count
+                        avg_value = total_value_loss / batch_count
+
+                        print(f"Epoch {epoch+1}/{args.epochs} (LR={current_lr:.6f}): "
+                              f"Loss={avg_loss:.4f} (policy={avg_policy:.4f}, value={avg_value:.4f})")
+
+                    # Validate
+                    print(f"\nEvaluating...")
+                    model.eval()
+                    tact_acc = test_tactical_recognition(model, device)
+                    print(f"Tactical: {tact_acc:.2%}")
+
+                    # Save
+                    torch.save(model.state_dict(), checkpoint_path)
+
+                    state = {
+                        'games_completed': games_completed,
+                        'total_positions': total_positions,
+                        'tactical_accuracy': tact_acc,
+                        'best_tactical_accuracy': max(best_tactical_accuracy, tact_acc),
+                        'training_cycles': training_cycles
+                    }
+                    with open(state_file, 'w') as f:
+                        json.dump(state, f)
+
+                    if tact_acc > best_tactical_accuracy:
+                        best_tactical_accuracy = tact_acc
+                        torch.save(model.state_dict(), f"{checkpoint_dir}/model_stockfish_best.pt")
+                        print(f"✓ New best: {tact_acc:.2%}")
+
+                    all_samples = []
+                    gc.collect()
+                    clear_memory()
+        else:
+            # Finite mode
+            for game_num in range(start_game + 1, start_game + args.games + 1):
+                print(f"\n[{game_num - start_game}/{args.games}] (Total: {game_num}) Generating...")
+
+                start_time = time.time()
+                samples = generate_stockfish_guided_game(
+                    model, stockfish, device,
+                    max_moves=200,
+                    temperature=0.8,
+                    input_channels=input_channels
+                )
+                gen_time = time.time() - start_time
+
+                all_samples.extend(samples)
+                total_positions += len(samples)
+                games_completed += 1
+
+                print(f"   {len(samples)} positions in {gen_time:.1f}s | Buffer: {len(all_samples)}")
+
+                # Train every N games or when buffer full
+                should_train = (game_num - start_game) % args.save_every == 0
+                buffer_full = len(all_samples) >= 50000
+                is_last = (game_num - start_game) == args.games
+
+                if should_train or buffer_full or is_last:
+                    print(f"\n{'='*70}")
+                    print(f"Training on {len(all_samples)} positions...")
+                    print(f"{'='*70}")
+
+                    # Prepare dataset
+                    boards = torch.tensor([s[0] for s in all_samples], dtype=torch.float32)
+                    policies = torch.tensor([s[1] for s in all_samples], dtype=torch.float32)
+                    values = torch.tensor([s[2] for s in all_samples], dtype=torch.float32)
+
+                    dataset = TensorDataset(boards, policies, values)
+                    dataloader = DataLoader(
+                        dataset,
+                        batch_size=args.batch_size,
+                        shuffle=True,
+                        num_workers=2,
+                        pin_memory=True
+                    )
+
+                    # Train with improvements
+                    model.train()
+                    training_cycles += 1
                     
-                    avg_loss = total_loss / batch_count
-                    avg_policy = total_policy_loss / batch_count
-                    avg_value = total_value_loss / batch_count
-                    
-                    print(f"Epoch {epoch+1}/{args.epochs}: "
-                          f"Loss={avg_loss:.4f} (policy={avg_policy:.4f}, value={avg_value:.4f})")
-                
-                # Validate
-                print(f"\nEvaluating...")
-                model.eval()
-                tact_acc = test_tactical_recognition(model, device)
-                print(f"Tactical: {tact_acc:.2%}")
-                
-                # Save
-                torch.save(model.state_dict(), checkpoint_path)
-                
-                state = {
-                    'games_completed': games_completed,
-                    'total_positions': total_positions,
-                    'tactical_accuracy': tact_acc,
-                    'best_tactical_accuracy': max(best_tactical_accuracy, tact_acc)
-                }
-                with open(state_file, 'w') as f:
-                    json.dump(state, f)
-                
-                if tact_acc > best_tactical_accuracy:
-                    best_tactical_accuracy = tact_acc
-                    torch.save(model.state_dict(), f"{checkpoint_dir}/model_stockfish_best.pt")
-                    print(f"✓ New best: {tact_acc:.2%}")
-                
-                all_samples = []
-                gc.collect()
-                clear_memory()
-    
+                    # Learning rate schedule: warmup then cosine decay
+                    for epoch in range(args.epochs):
+                        # Calculate LR with warmup
+                        if training_cycles <= warmup_epochs:
+                            current_lr = base_lr * training_cycles / warmup_epochs
+                        else:
+                            progress = (training_cycles - warmup_epochs) / max(1, 100)
+                            current_lr = base_lr * 0.5 * (1 + np.cos(np.pi * min(progress, 1.0)))
+                            current_lr = max(current_lr, 1e-5)
+                        
+                        for param_group in optimizer.param_groups:
+                            param_group['lr'] = current_lr
+                        
+                        total_loss = 0
+                        total_policy_loss = 0
+                        total_value_loss = 0
+                        batch_count = 0
+
+                        for batch in dataloader:
+                            b_boards, b_policies, b_values = batch
+                            b_boards = b_boards.to(device)
+                            b_policies = b_policies.to(device)
+                            b_values = b_values.to(device)
+
+                            optimizer.zero_grad()
+
+                            if scaler:
+                                with torch.cuda.amp.autocast():
+                                    policy_logits, value_pred = model(b_boards)
+                                    policy_loss = policy_loss_fn(policy_logits, b_policies)
+                                    value_loss = value_loss_fn(value_pred, b_values)
+                                    loss = policy_weight * policy_loss + value_weight * value_loss
+                                
+                                scaler.scale(loss).backward()
+                                scaler.unscale_(optimizer)
+                                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                                scaler.step(optimizer)
+                                scaler.update()
+                            else:
+                                policy_logits, value_pred = model(b_boards)
+                                policy_loss = policy_loss_fn(policy_logits, b_policies)
+                                value_loss = value_loss_fn(value_pred, b_values)
+                                loss = policy_weight * policy_loss + value_weight * value_loss
+                                
+                                loss.backward()
+                                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                                optimizer.step()
+
+                            total_loss += loss.item()
+                            total_policy_loss += policy_loss.item()
+                            total_value_loss += value_loss.item()
+                            batch_count += 1
+
+                        avg_loss = total_loss / batch_count
+                        avg_policy = total_policy_loss / batch_count
+                        avg_value = total_value_loss / batch_count
+
+                        print(f"Epoch {epoch+1}/{args.epochs} (LR={current_lr:.6f}): "
+                              f"Loss={avg_loss:.4f} (policy={avg_policy:.4f}, value={avg_value:.4f})")
+
+                    # Validate
+                    print(f"\nEvaluating...")
+                    model.eval()
+                    tact_acc = test_tactical_recognition(model, device)
+                    print(f"Tactical: {tact_acc:.2%}")
+
+                    # Save
+                    torch.save(model.state_dict(), checkpoint_path)
+
+                    state = {
+                        'games_completed': games_completed,
+                        'total_positions': total_positions,
+                        'tactical_accuracy': tact_acc,
+                        'best_tactical_accuracy': max(best_tactical_accuracy, tact_acc),
+                        'training_cycles': training_cycles
+                    }
+                    with open(state_file, 'w') as f:
+                        json.dump(state, f)
+
+                    if tact_acc > best_tactical_accuracy:
+                        best_tactical_accuracy = tact_acc
+                        torch.save(model.state_dict(), f"{checkpoint_dir}/model_stockfish_best.pt")
+                        print(f"✓ New best: {tact_acc:.2%}")
+
+                    all_samples = []
+                    gc.collect()
+                    clear_memory()
+    except KeyboardInterrupt:
+        print("\n⚠ Interrupted. Saving state and checkpoint...")
+        # Train on any remaining buffer before exit
+        if len(all_samples) > 0:
+            boards = torch.tensor([s[0] for s in all_samples], dtype=torch.float32)
+            policies = torch.tensor([s[1] for s in all_samples], dtype=torch.float32)
+            values = torch.tensor([s[2] for s in all_samples], dtype=torch.float32)
+
+            dataset = TensorDataset(boards, policies, values)
+            dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
+
+            model.train()
+            for epoch in range(max(1, args.epochs // 2)):
+                for batch in dataloader:
+                    b_boards, b_policies, b_values = batch
+                    b_boards = b_boards.to(device)
+                    b_policies = b_policies.to(device)
+                    b_values = b_values.to(device)
+
+                    optimizer.zero_grad()
+                    policy_logits, value_pred = model(b_boards)
+                    policy_loss = policy_loss_fn(policy_logits, b_policies)
+                    value_loss = value_loss_fn(value_pred, b_values)
+                    loss = policy_loss + value_loss
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+
+        # Save latest
+        model.eval()
+        torch.save(model.state_dict(), checkpoint_path)
+        # Keep previous best if it's better
+        state = {
+            'games_completed': games_completed,
+            'total_positions': total_positions,
+            'tactical_accuracy': state.get('tactical_accuracy', 0.0) if 'state' in locals() else 0.0,
+            'best_tactical_accuracy': best_tactical_accuracy
+        }
+        with open(state_file, 'w') as f:
+            json.dump(state, f)
+        print("✓ State saved. Exiting...")
     finally:
         stockfish.close()
         print("\n✓ Stockfish closed")

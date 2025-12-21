@@ -15,7 +15,7 @@ MODEL_CONFIG = {
     'medium': {
         'num_blocks': 10,
         'channels': 256,
-        'input_channels': 22,
+        'input_channels': 20,
         'use_se': True,
     },
     # Big model (best quality)
@@ -33,7 +33,7 @@ MODEL_CONFIG = {
 TRAINING_CONFIG = {
     # Optimizer (AlphaZero uses SGD)
     'optimizer': 'sgd',
-    'sgd_lr': 0.2,
+    'sgd_lr': 0.01,
     'sgd_momentum': 0.9,
     'weight_decay': 1e-4,
     

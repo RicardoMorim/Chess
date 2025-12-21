@@ -105,7 +105,14 @@ class ChessDataset(Dataset):
         self.positions = []
         self.augment = augment
         self.model_type = model_type
-        self.input_channels = 18 if model_type.lower() == "small" else 20
+        # Channel configuration: small/limited=18, medium=20, big=22
+        model_lower = model_type.lower()
+        if model_lower in ["small", "limited"]:
+            self.input_channels = 18
+        elif model_lower == "medium":
+            self.input_channels = 20
+        else:  # big
+            self.input_channels = 22
         
         for game in games:
             result_str = game.headers.get("Result", "*")
@@ -155,7 +162,14 @@ class PuzzleDataset(Dataset):
     def __init__(self, puzzles, model_type="big"):
         self.puzzles = puzzles
         self.model_type = model_type
-        self.input_channels = 18 if model_type.lower() == "small" else 20
+        # Channel configuration: small/limited=18, medium=20, big=22
+        model_lower = model_type.lower()
+        if model_lower in ["small", "limited"]:
+            self.input_channels = 18
+        elif model_lower == "medium":
+            self.input_channels = 20
+        else:  # big
+            self.input_channels = 22
 
     def __len__(self):
         return len(self.puzzles)
@@ -176,7 +190,14 @@ class SelfPlayDataset(Dataset):
     def __init__(self, samples, model_type="big"):
         self.samples = samples
         self.model_type = model_type
-        self.input_channels = 18 if model_type.lower() == "small" else 20
+        # Channel configuration: small/limited=18, medium=20, big=22
+        model_lower = model_type.lower()
+        if model_lower in ["small", "limited"]:
+            self.input_channels = 18
+        elif model_lower == "medium":
+            self.input_channels = 20
+        else:  # big
+            self.input_channels = 22
 
     def __len__(self):
         return len(self.samples)
@@ -187,14 +208,14 @@ class SelfPlayDataset(Dataset):
         # Make sure the tensor has the right dimensions for the model type
         if isinstance(board_tensor, np.ndarray) and board_tensor.shape[0] != self.input_channels:
             print(f"Warning: Converting tensor from {board_tensor.shape[0]} to {self.input_channels} channels")
-            if self.input_channels == 18 and board_tensor.shape[0] == 20:
-                # Convert from 20 to 18 channels by trimming
+            if self.input_channels == 18 and board_tensor.shape[0] > 18:
+                # Convert from 20/22 to 18 channels by trimming
                 board_tensor = board_tensor[:18]
-            elif self.input_channels == 20 and board_tensor.shape[0] == 18:
-                # Convert from 18 to 20 channels by padding
-                padded = np.zeros((20, 8, 8), dtype=np.float32)
-                padded[:18] = board_tensor
-                padded[18:, :, :] = 0.0  # Zero the extra channels
+            elif self.input_channels == 22 and board_tensor.shape[0] < 22:
+                # Convert from 18/20 to 22 channels by padding
+                padded = np.zeros((22, 8, 8), dtype=np.float32)
+                padded[:board_tensor.shape[0]] = board_tensor
+                # Note: Attack maps (channels 20-21) will be zeros - ideally regenerate from board
                 board_tensor = padded
         
         return (torch.tensor(board_tensor, dtype=torch.float32),

@@ -323,7 +323,7 @@ def create_chess_model(model_type="big", use_se=True, legacy=False):
     Model configurations:
     - limited: 4 blocks, 64 channels, 18 inputs (for 2GB VRAM GPUs)
     - small: 6 blocks, 256 channels, 18 inputs (fast, for testing)
-    - medium: 10 blocks, 256 channels, 22 inputs (balanced)
+    - medium: 10 blocks, 256 channels, 20 inputs (balanced)
     - big: 15 blocks, 256 channels, 22 inputs (best quality)
     """
     if model_type.lower() == "limited":
@@ -341,7 +341,7 @@ def create_chess_model(model_type="big", use_se=True, legacy=False):
     if model_type.lower() == "small":
         return ChessNet(num_blocks=6, channels=256, input_channels=18, use_se=use_se)
     elif model_type.lower() == "medium":
-        return ChessNet(num_blocks=10, channels=256, input_channels=22, use_se=use_se)
+        return ChessNet(num_blocks=10, channels=256, input_channels=20, use_se=use_se)
     else:  # big
         return ChessNet(num_blocks=15, channels=256, input_channels=22, use_se=use_se)
 

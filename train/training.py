@@ -16,7 +16,7 @@ import gc
 TRAIN_CONFIG = {
     # Optimizer settings (AlphaZero-style)
     'optimizer': 'sgd',           # 'sgd' or 'adam'
-    'sgd_lr': 0.2,                # Initial LR for SGD
+    'sgd_lr': 0.01,                # Initial LR for SGD (reduced from 0.2)
     'sgd_momentum': 0.9,          # Momentum for SGD
     'adam_lr': 0.001,             # Initial LR for Adam
     'weight_decay': 1e-4,         # L2 regularization
@@ -33,7 +33,7 @@ TRAIN_CONFIG = {
     'policy_weight': 1.0,         # Policy loss weight
     'value_weight': 1.0,          # Value loss weight
     'puzzle_policy_weight': 2.0,  # Higher weight for puzzles
-    'puzzle_value_weight': 1.5,   # Higher weight for puzzle values
+    'puzzle_value_weight': 2.0,   # Value weight for puzzles (increased)
     
     # Training dynamics
     'puzzle_frequency': 1,        # Train on puzzles every N game batches
@@ -110,13 +110,32 @@ def create_optimizer(model, config=None):
     return optimizer
 
 
-def create_scheduler(optimizer, num_epochs, config=None):
-    """Create learning rate scheduler."""
+def create_scheduler(optimizer, num_epochs, config=None, warmup_epochs=5):
+    """Create learning rate scheduler with optional warmup.
+    
+    Args:
+        optimizer: The optimizer
+        num_epochs: Total training epochs
+        config: Training config
+        warmup_epochs: Number of warmup epochs (linear ramp)
+    """
     if config is None:
         config = TRAIN_CONFIG
     
+    # Get warmup from config if specified
+    warmup = config.get('lr_warmup_epochs', warmup_epochs)
+    
     if config['lr_schedule'] == 'cosine':
-        scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+        # Cosine annealing with warmup
+        def lr_lambda(epoch):
+            if epoch < warmup:
+                # Linear warmup
+                return (epoch + 1) / warmup
+            else:
+                # Cosine annealing after warmup
+                progress = (epoch - warmup) / max(1, num_epochs - warmup)
+                return max(0.01, 0.5 * (1 + math.cos(math.pi * progress)))
+        scheduler = LambdaLR(optimizer, lr_lambda)
     elif config['lr_schedule'] == 'onecycle':
         # OneCycleLR is good for training from scratch
         scheduler = OneCycleLR(
@@ -154,7 +173,7 @@ def train_batch(model, game_dataloader, puzzle_dataloader, save_path, state_file
     if use_sgd:
         optimizer = torch.optim.SGD(
             model.parameters(), 
-            lr=0.01,  # Start lower, let scheduler handle
+            lr=TRAIN_CONFIG['sgd_lr'],  # Use config value
             momentum=0.9, 
             weight_decay=1e-4,
             nesterov=True
@@ -162,7 +181,8 @@ def train_batch(model, game_dataloader, puzzle_dataloader, save_path, state_file
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
     
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    # Use scheduler with warmup
+    scheduler = create_scheduler(optimizer, epochs, TRAIN_CONFIG)
     
     # Loss functions
     policy_loss_fn = PolicyLoss()

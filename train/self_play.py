@@ -840,8 +840,8 @@ def run_self_play_training(model, device, save_path, state_file, puzzle_dataload
             if puzzle_dataloader is not None:
                 print("\n=== INTEGRATED TACTICAL TRAINING PHASE ===")
                 
-                # Create optimizer specifically for tactics
-                tactical_optimizer = torch.optim.Adam(model.parameters(), lr=0.0008)
+                # Create optimizer specifically for tactics (SGD for consistency)
+                tactical_optimizer = torch.optim.SGD(model.parameters(), lr=0.0008, momentum=0.9, weight_decay=1e-4)
                 
                 # Calculate dynamic epochs based on progress - more later in training
                 tactical_epochs = 2 + int(iteration / num_iterations * 3)  # 2-5 epochs

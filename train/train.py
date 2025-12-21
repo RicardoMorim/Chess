@@ -215,8 +215,13 @@ def main():
     all_puzzles = pgn_puzzles + lichess_puzzles
     prioritized_puzzles = filter_and_prioritize_puzzles_cached(all_puzzles)
     
-    # Add this line to determine model type based on the loaded model
-    model_type = "small" if model.is_small_model() else "big"
+    # Determine model type based on input channels (small=18, medium=20, big=22)
+    if model.input_channels == 18:
+        model_type = "small"
+    elif model.input_channels == 20:
+        model_type = "medium"
+    else:  # 22 channels
+        model_type = "big"
     
     # Pass model_type to puzzle_dataset to ensure matching channels
     puzzle_dataset = PuzzleDataset(prioritized_puzzles, model_type=model_type)
@@ -303,7 +308,7 @@ def main():
             
             # Run tactical training after self-play to maintain tactical awareness
             print("Running tactical training phase...")
-            tactical_optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
+            tactical_optimizer = torch.optim.SGD(model.parameters(), lr=0.0005, momentum=0.9, weight_decay=1e-4)
             tactical_epochs = min(6 + iterations // 5, 20)  # Start with 6, gradually increase
             train_tactical(model, tactical_optimizer, puzzle_dataloader, device, epochs=tactical_epochs)
             
@@ -375,7 +380,7 @@ def main():
             
             # Tactical training after professional batch
             print("Running quick tactical training phase...")
-            tactical_optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+            tactical_optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9, weight_decay=1e-4)
             train_tactical(model, tactical_optimizer, puzzle_dataloader, device, epochs=6)
             
             
@@ -448,7 +453,7 @@ def main():
                 clear_memory()
 
             print("Running enhanced tactical training phase for regular games...")
-            tactical_optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
+            tactical_optimizer = torch.optim.SGD(model.parameters(), lr=0.0005, momentum=0.9, weight_decay=1e-4)
             train_tactical(model, tactical_optimizer, puzzle_dataloader, device, epochs=6)
             
             # Generate some self-play games after regular batch
