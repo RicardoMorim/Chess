@@ -466,18 +466,17 @@ def run_self_play_training(model, device, save_path, state_file, puzzle_dataload
     input_channels = model.input_channels if hasattr(model, 'input_channels') else 22
     
     # Use SGD with momentum (AlphaZero-style) for better convergence
+    base_lr = 0.01
     optimizer = torch.optim.SGD(
         model.parameters(), 
-        lr=0.01,  # Will be scheduled
+        lr=base_lr,
         momentum=0.9, 
         weight_decay=1e-4,
         nesterov=True
     )
     
-    # Learning rate scheduler
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=num_iterations, eta_min=1e-5
-    )
+    # Warmup settings
+    warmup_iterations = min(3, num_iterations // 3)  # Warmup for first 3 iterations or 1/3
     
     # Loss functions with improvements
     from training import PolicyLoss, ValueLoss
@@ -507,14 +506,27 @@ def run_self_play_training(model, device, save_path, state_file, puzzle_dataload
     for iteration in range(num_iterations):
         print(f"\n--- Iteration {iteration+1}/{num_iterations} ---")
         
+        # Learning rate with warmup then cosine decay
+        if iteration < warmup_iterations:
+            # Linear warmup
+            current_lr = base_lr * (iteration + 1) / warmup_iterations
+        else:
+            # Cosine decay after warmup
+            progress = (iteration - warmup_iterations) / max(1, num_iterations - warmup_iterations)
+            current_lr = base_lr * 0.5 * (1 + math.cos(math.pi * progress))
+            current_lr = max(current_lr, 1e-5)
+        
+        # Update optimizer LR
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = current_lr
+        
         # Progressive training adjustments
         progress_factor = iteration / max(1, num_iterations - 1)
         
-        # Increase value weight over time (initially focus on policy)
+        # Value weight: start at 1.5, increase to 2.0
         policy_weight = 1.0
-        value_weight = 1.0 + progress_factor * 1.0  # 1.0 -> 2.0
+        value_weight = 1.5 + progress_factor * 0.5  # 1.5 -> 2.0
         
-        current_lr = scheduler.get_last_lr()[0]
         print(f"LR: {current_lr:.6f}, Policy weight: {policy_weight:.2f}, Value weight: {value_weight:.2f}")
         
         # Monitor memory usage before generation

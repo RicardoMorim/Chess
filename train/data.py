@@ -8,6 +8,7 @@ import pickle
 import hashlib
 import random
 import glob
+import time
 from torch.utils.data import Dataset
 
 from constants import promotion_moves
@@ -158,42 +159,134 @@ class ChessDataset(Dataset):
                 torch.tensor(value_target, dtype=torch.float32))
 
 class PuzzleDataset(Dataset):
-    """Dataset for chess puzzles with category support for weighted training."""
-    def __init__(self, puzzles, model_type="big"):
+    """
+    Optimized puzzle dataset with disk-based tensor caching.
+    
+    Pre-computes all tensors ONCE and saves to disk cache.
+    Subsequent runs load from cache instantly with minimal RAM usage.
+    Uses numpy memmap for memory-efficient disk access.
+    """
+    def __init__(self, puzzles, model_type="big", cache_dir="./cache"):
         self.puzzles = puzzles
         self.model_type = model_type
-        # Channel configuration: small/limited=18, medium=20, big=22
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # Channel configuration
         model_lower = model_type.lower()
         if model_lower in ["small", "limited"]:
             self.input_channels = 18
         elif model_lower == "medium":
             self.input_channels = 20
-        else:  # big
+        else:
             self.input_channels = 22
+        
+        # Generate cache key based on puzzle count and model type
+        cache_key = hashlib.md5(f"{len(puzzles)}_{model_type}_{self.input_channels}".encode()).hexdigest()[:12]
+        self.tensor_cache_file = os.path.join(cache_dir, f"puzzle_tensors_{cache_key}.npy")
+        self.policy_cache_file = os.path.join(cache_dir, f"puzzle_policies_{cache_key}.npy")
+        self.value_cache_file = os.path.join(cache_dir, f"puzzle_values_{cache_key}.npy")
+        self.category_cache_file = os.path.join(cache_dir, f"puzzle_categories_{cache_key}.pkl")
+        
+        # Load or create cache
+        if self._cache_exists():
+            self._load_cache()
+        else:
+            self._create_cache()
+    
+    def _cache_exists(self):
+        return (os.path.exists(self.tensor_cache_file) and 
+                os.path.exists(self.policy_cache_file) and
+                os.path.exists(self.value_cache_file) and
+                os.path.exists(self.category_cache_file))
+    
+    def _load_cache(self):
+        """Load pre-computed tensors from disk cache (memory-mapped for low RAM)."""
+        print(f"Loading cached tensors from {self.cache_dir}...")
+        
+        # Memory-map the tensor file (doesn't load into RAM until accessed)
+        self.tensors = np.load(self.tensor_cache_file, mmap_mode='r')
+        self.policies = np.load(self.policy_cache_file, mmap_mode='r')
+        self.values = np.load(self.value_cache_file, mmap_mode='r')
+        
+        with open(self.category_cache_file, 'rb') as f:
+            self.categories = pickle.load(f)
+        
+        print(f"✓ Loaded {len(self.tensors)} cached puzzles (memory-mapped)")
+    
+    def _create_cache(self):
+        """Pre-compute all tensors and save to disk cache."""
+        n_puzzles = len(self.puzzles)
+        print(f"Pre-computing {n_puzzles} puzzle tensors (one-time operation)...")
+        print("This will be cached for instant loading next time.")
+        
+        # Pre-allocate arrays
+        tensors = np.zeros((n_puzzles, self.input_channels, 8, 8), dtype=np.float32)
+        policies = np.zeros(n_puzzles, dtype=np.int64)
+        values = np.zeros(n_puzzles, dtype=np.float32)
+        categories = []
+        
+        # Process in batches to show progress
+        batch_size = 1000
+        start_time = time.time()
+        
+        for i in range(0, n_puzzles, batch_size):
+            batch_end = min(i + batch_size, n_puzzles)
+            
+            for j in range(i, batch_end):
+                puzzle = self.puzzles[j]
+                
+                # Handle both 3-tuple and 4-tuple formats
+                if len(puzzle) == 4:
+                    fen, move_uci, value_target, category = puzzle
+                else:
+                    fen, move_uci, value_target = puzzle
+                    category = "other"
+                
+                try:
+                    board = chess.Board(fen)
+                    move = chess.Move.from_uci(move_uci)
+                    
+                    tensors[j] = board_to_tensor(board, 0, self.input_channels)
+                    policies[j] = get_move_index(move)
+                    values[j] = value_target
+                    categories.append(category)
+                except Exception as e:
+                    # Use zeros for invalid puzzles
+                    categories.append("other")
+            
+            # Progress update
+            elapsed = time.time() - start_time
+            rate = (i + batch_size) / elapsed if elapsed > 0 else 0
+            eta = (n_puzzles - i - batch_size) / rate if rate > 0 else 0
+            print(f"  {batch_end}/{n_puzzles} ({100*batch_end/n_puzzles:.1f}%) - {rate:.0f} puzzles/sec - ETA: {eta:.0f}s")
+        
+        # Save to disk
+        print("Saving to cache...")
+        np.save(self.tensor_cache_file, tensors)
+        np.save(self.policy_cache_file, policies)
+        np.save(self.value_cache_file, values)
+        with open(self.category_cache_file, 'wb') as f:
+            pickle.dump(categories, f)
+        
+        # Load as memory-mapped
+        self.tensors = np.load(self.tensor_cache_file, mmap_mode='r')
+        self.policies = np.load(self.policy_cache_file, mmap_mode='r')
+        self.values = np.load(self.value_cache_file, mmap_mode='r')
+        self.categories = categories
+        
+        total_time = time.time() - start_time
+        print(f"✓ Cached {n_puzzles} puzzles in {total_time:.1f}s")
 
     def __len__(self):
-        return len(self.puzzles)
+        return len(self.tensors)
 
     def __getitem__(self, idx):
-        puzzle = self.puzzles[idx]
-        
-        # Handle both 3-tuple (legacy) and 4-tuple (with category) formats
-        if len(puzzle) == 4:
-            fen, move_uci, value_target, category = puzzle
-        else:
-            fen, move_uci, value_target = puzzle
-            category = "other"  # Default category for legacy puzzles
-        
-        board = chess.Board(fen)
-        move = chess.Move.from_uci(move_uci)
-        # Use the appropriate tensor representation based on model type
-        input_tensor = board_to_tensor(board, 0, self.input_channels)
-        policy_target = get_move_index(move)
-        
-        return (torch.tensor(input_tensor, dtype=torch.float32),
-                torch.tensor(policy_target, dtype=torch.long),
-                torch.tensor(value_target, dtype=torch.float32),
-                category)  # Return category for weighted training
+        # Fast access from cache - no computation needed!
+        return (torch.from_numpy(self.tensors[idx].copy()),
+                torch.tensor(self.policies[idx], dtype=torch.long),
+                torch.tensor(self.values[idx], dtype=torch.float32),
+                self.categories[idx])
 
 class SelfPlayDataset(Dataset):
     """Dataset for self-play reinforcement learning samples with model type support"""
@@ -473,8 +566,8 @@ def filter_and_prioritize_puzzles_cached(puzzles, cache_dir="./cache"):
     # Shuffle to mix categories
     random.shuffle(prioritized_puzzles)
     
-    # Limit to reasonable size
-    max_puzzles = 300000
+    # Limit to reasonable size (smaller dataset = faster training)
+    max_puzzles = 100000  # Reduced for faster training
     if len(prioritized_puzzles) > max_puzzles:
         print(f"Too many puzzles ({len(prioritized_puzzles)}), sampling {max_puzzles}")
         prioritized_puzzles = prioritized_puzzles[:max_puzzles]

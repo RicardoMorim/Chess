@@ -237,22 +237,25 @@ def main():
     
     
     # Create puzzle dataloader once - puzzles are smaller and reused
-    # Use optimized dataloader if available
+    # With cached tensors, we can use larger batch sizes for speed
+    puzzle_batch_size = min(128, optimal_batch_size)  # Larger batch for faster training
+    
     if HAS_OPTIMIZATIONS:
         puzzle_dataloader = create_optimized_dataloader(
             puzzle_dataset,
-            batch_size=min(32, optimal_batch_size),
+            batch_size=puzzle_batch_size,
             shuffle=True,
             for_training=True
         )
-        print(f"Using optimized DataLoader (workers={HARDWARE_CONFIG['dataloader_workers']})")
+        print(f"Using optimized DataLoader (workers={HARDWARE_CONFIG['dataloader_workers']}, batch={puzzle_batch_size})")
     else:
         puzzle_dataloader = DataLoader(
             puzzle_dataset, 
-            batch_size=min(32, optimal_batch_size),
+            batch_size=puzzle_batch_size,
             shuffle=True,
-            num_workers=2,
-            pin_memory=True
+            num_workers=4,  # More workers for faster data loading
+            pin_memory=True,
+            persistent_workers=True  # Keep workers alive between epochs
         )
     
     # Determine training mode
