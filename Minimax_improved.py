@@ -582,8 +582,12 @@ class MinimaxAI:
         board.pop()
         return see_score
     
-    def quiescence(self, board, alpha, beta, ply=0):
+    def quiescence(self, board, alpha, beta, ply=0, max_ply=8):
         """Quiescence search - only searches captures at leaf nodes."""
+        # Depth limit to prevent explosion in tactical positions
+        if ply >= max_ply:
+            return self.evaluate_static(board)
+        
         stand_pat = self.evaluate_static(board)
         
         if board.turn == chess.WHITE:
@@ -595,9 +599,20 @@ class MinimaxAI:
                 return alpha
             beta = min(beta, stand_pat)
         
-        # Only search captures and promotions
+        # Collect and sort captures/promotions by SEE
+        capture_moves = []
         for move in board.legal_moves:
-            if not (board.is_capture(move) or move.promotion):
+            if board.is_capture(move) or move.promotion:
+                see_val = self._see(board, move) if board.is_capture(move) else 800
+                capture_moves.append((see_val, move))
+        
+        # Sort by SEE (best captures first)
+        capture_moves.sort(reverse=True, key=lambda x: x[0])
+        
+        for see_val, move in capture_moves:
+            # === SEE PRUNING IN QSEARCH ===
+            # Skip bad captures (losing exchanges) in quiescence
+            if see_val < -50:
                 continue
             
             # Delta pruning
@@ -612,7 +627,7 @@ class MinimaxAI:
                     continue
             
             board.push(move)
-            score = self.quiescence(board, alpha, beta, ply + 1)
+            score = self.quiescence(board, alpha, beta, ply + 1, max_ply)
             board.pop()
             
             if board.turn == chess.WHITE:
@@ -680,6 +695,20 @@ class MinimaxAI:
                 if null_score >= beta:
                     return beta
         
+        # === REVERSE FUTILITY PRUNING (Static Null Move Pruning) ===
+        # If we're so far ahead that even losing a queen wouldn't drop us below beta, prune
+        # SAFE: Only at shallow depths, never in check or PV node
+        if depth <= 3 and not in_check:
+            static_eval = self.evaluate_static(board)
+            rfp_margin = 120 * depth  # 120, 240, 360 for depths 1,2,3
+            
+            if maximizing:
+                if static_eval - rfp_margin >= beta:
+                    return beta
+            else:
+                if static_eval + rfp_margin <= alpha:
+                    return alpha
+        
         # Get and sort moves
         moves = list(board.legal_moves)
         if not moves:
@@ -687,29 +716,87 @@ class MinimaxAI:
                 return -99999 + ply if maximizing else 99999 - ply
             return 0
         
-        # Sort moves
+        # Sort moves (critical for good pruning!)
         moves.sort(key=lambda m: self.score_move(board, m, ply, tt_move, prev_move), reverse=True)
+        
+        # === FUTILITY PRUNING MARGIN ===
+        # Pre-compute if we're in a futile position (too far from alpha)
+        futility_margin = [0, 200, 350, 550]  # Margins for depths 0,1,2,3
+        can_futility_prune = False
+        if depth <= 3 and not in_check:
+            static_eval = self.evaluate_static(board)
+            if maximizing:
+                can_futility_prune = static_eval + futility_margin[depth] < alpha
+            else:
+                can_futility_prune = static_eval - futility_margin[depth] > beta
+        
+        # === LATE MOVE PRUNING LIMITS ===
+        # Only search top N moves at shallow depths for quiet moves
+        # More generous limits to avoid missing good moves
+        lmp_limits = {1: 5, 2: 8, 3: 12, 4: 18, 5: 25}  # depth -> max quiet moves
+        quiet_moves_searched = 0
         
         best_move = None
         best_score = -float('inf') if maximizing else float('inf')
         
         for i, move in enumerate(moves):
+            # === MOVE CLASSIFICATION (for safe pruning) ===
+            is_capture = board.is_capture(move)
+            is_promotion = move.promotion is not None
+            is_killer = (ply < len(self.killer_moves) and 
+                        move in self.killer_moves[ply])
+            is_tt_move = (tt_move and move == tt_move)
+            
+            board.push(move)
+            gives_check = board.is_check()
+            board.pop()
+            
+            # === IDENTIFY "IMPORTANT" MOVES THAT SHOULD NEVER BE PRUNED ===
+            is_important = (is_capture or is_promotion or is_killer or 
+                          is_tt_move or gives_check or i < 3)
+            
+            # === LATE MOVE PRUNING ===
+            # Skip quiet moves after we've searched enough of them
+            # SAFE: Never skip important moves (captures, checks, killers, etc.)
+            if not is_important and depth in lmp_limits:
+                if quiet_moves_searched >= lmp_limits[depth]:
+                    continue  # Skip this move entirely
+                quiet_moves_searched += 1
+            
+            # === FUTILITY PRUNING ===
+            # Skip quiet moves that can't possibly improve alpha
+            # SAFE: Never skip captures, checks, promotions, killers
+            if can_futility_prune and not is_important:
+                continue
+            
             board.push(move)
             
-            # Late Move Reductions
+            # === LATE MOVE REDUCTIONS ===
+            # More aggressive reductions for later quiet moves
             reduction = 0
-            if i >= 3 and depth >= 3 and not in_check and not board.is_capture(move) and not move.promotion:
+            if i >= 3 and depth >= 3 and not in_check and not is_capture and not is_promotion:
+                # Base reduction
                 reduction = 1
                 if i >= 6:
                     reduction = 2
+                if i >= 12:
+                    reduction = 3
+                # Reduce less for killer moves
+                if is_killer:
+                    reduction = max(0, reduction - 1)
+                # Reduce less for moves with good history
+                move_key = (move.from_square, move.to_square)
+                if self.history.get(move_key, 0) > 1000:
+                    reduction = max(0, reduction - 1)
             
             # PVS: first move with full window, others with null window
             if i == 0:
                 score = self.alphabeta(board, depth - 1, alpha, beta, ply + 1, move)
             else:
-                # Null window search
+                # Null window search with reduction
                 if maximizing:
                     score = self.alphabeta(board, depth - 1 - reduction, alpha, alpha + 1, ply + 1, move)
+                    # Re-search if we got a surprising result
                     if alpha < score < beta:
                         score = self.alphabeta(board, depth - 1, alpha, beta, ply + 1, move)
                 else:
