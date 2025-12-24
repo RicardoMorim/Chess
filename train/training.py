@@ -435,12 +435,12 @@ def train_on_self_play(model, samples, device, optimizer=None, epochs=3,
     
     if use_soft_targets:
         # Soft targets (probability distributions)
-        policies = torch.stack([torch.tensor(s[1], dtype=torch.float32) for s in samples])
+        policies = torch.from_numpy(np.array([s[1] for s in samples], dtype=np.float32))
     else:
         # Hard targets (indices)
-        policies = torch.tensor([s[1] for s in samples], dtype=torch.long)
+        policies = torch.from_numpy(np.array([s[1] for s in samples], dtype=np.int64))
     
-    values = torch.tensor([s[2] for s in samples], dtype=torch.float32)
+    values = torch.from_numpy(np.array([s[2] for s in samples], dtype=np.float32))
     
     dataset = TensorDataset(boards, policies, values)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)

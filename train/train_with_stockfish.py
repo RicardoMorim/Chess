@@ -438,10 +438,10 @@ Starting...
                     print(f"Training on {len(all_samples)} positions...")
                     print(f"{'='*70}")
 
-                    # Prepare dataset
-                    boards = torch.tensor([s[0] for s in all_samples], dtype=torch.float32)
-                    policies = torch.tensor([s[1] for s in all_samples], dtype=torch.float32)
-                    values = torch.tensor([s[2] for s in all_samples], dtype=torch.float32)
+                    # Prepare dataset (use numpy for faster tensor creation)
+                    boards = torch.from_numpy(np.array([s[0] for s in all_samples], dtype=np.float32))
+                    policies = torch.from_numpy(np.array([s[1] for s in all_samples], dtype=np.float32))
+                    values = torch.from_numpy(np.array([s[2] for s in all_samples], dtype=np.float32))
 
                     dataset = TensorDataset(boards, policies, values)
                     dataloader = DataLoader(
@@ -577,10 +577,10 @@ Starting...
                     print(f"Training on {len(all_samples)} positions...")
                     print(f"{'='*70}")
 
-                    # Prepare dataset
-                    boards = torch.tensor([s[0] for s in all_samples], dtype=torch.float32)
-                    policies = torch.tensor([s[1] for s in all_samples], dtype=torch.float32)
-                    values = torch.tensor([s[2] for s in all_samples], dtype=torch.float32)
+                    # Prepare dataset (use numpy for faster tensor creation)
+                    boards = torch.from_numpy(np.array([s[0] for s in all_samples], dtype=np.float32))
+                    policies = torch.from_numpy(np.array([s[1] for s in all_samples], dtype=np.float32))
+                    values = torch.from_numpy(np.array([s[2] for s in all_samples], dtype=np.float32))
 
                     dataset = TensorDataset(boards, policies, values)
                     dataloader = DataLoader(
@@ -686,9 +686,9 @@ Starting...
         print("\n⚠ Interrupted. Saving state and checkpoint...")
         # Train on any remaining buffer before exit
         if len(all_samples) > 0:
-            boards = torch.tensor([s[0] for s in all_samples], dtype=torch.float32)
-            policies = torch.tensor([s[1] for s in all_samples], dtype=torch.float32)
-            values = torch.tensor([s[2] for s in all_samples], dtype=torch.float32)
+            boards = torch.from_numpy(np.array([s[0] for s in all_samples], dtype=np.float32))
+            policies = torch.from_numpy(np.array([s[1] for s in all_samples], dtype=np.float32))
+            values = torch.from_numpy(np.array([s[2] for s in all_samples], dtype=np.float32))
 
             dataset = TensorDataset(boards, policies, values)
             dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
