@@ -334,15 +334,27 @@ def train_tactical(model, optimizer, dataloader, device, epochs=3, grad_clip=1.0
     value_loss_fn = ValueLoss(use_huber=True)
     model.train()
     
-    # Category weights - prioritize critical tactics
+    # Category weights - HEAVILY prioritize checkmate patterns
     category_weights = {
-        'mate_in_one': 5.0,
-        'mate_in_two': 4.0,
-        'endgame': 3.0,
-        'knight_fork': 2.5,
+        # Mate puzzles (highest priority - model needs to learn checkmates!)
+        'mate_in_one': 10.0,
+        'mate_in_two': 8.0,
+        'mate_in_three': 6.0,
+        'mate_longer': 5.0,
+        'backrank_mate': 8.0,
+        'smothered_mate': 8.0,
+        # Endgame (important for finishing games)
+        'endgame': 5.0,
+        'promotion': 4.0,
+        # Tactics
+        'fork': 3.0,
+        'double_attack': 3.0,
         'pin': 2.5,
         'skewer': 2.5,
         'discovered': 2.5,
+        'sacrifice': 2.0,
+        # Default
+        'other': 1.0,
         'default': 1.0
     }
     

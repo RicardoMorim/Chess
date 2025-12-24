@@ -64,8 +64,8 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description="Chess AI Training Script (Improved)")
     
     # Training mode
-    parser.add_argument("mode", nargs="?", default=None, choices=["pro", "regular", "self-play"], 
-                        help="Training mode: professional games, regular games, or self-play")
+    parser.add_argument("mode", nargs="?", default=None, choices=["pro", "regular", "self-play", "puzzles"], 
+                        help="Training mode: professional games, regular games, self-play, or puzzles (for checkmate training)")
     
     # Model parameters
     parser.add_argument("--model", default="big", choices=["limited", "small", "medium", "big"], 
@@ -276,6 +276,55 @@ def main():
     while iterations < max_iterations:
         iterations += 1
         print(f"\n--- Training Iteration {iterations} ---")
+        
+        # Puzzle-only mode (intensive checkmate/tactical training)
+        if current_phase == "puzzles":
+            print("\n=== PUZZLE TRAINING MODE (Checkmate Focus) ===")
+            
+            # Intensive puzzle training with higher learning rate initially
+            if iterations <= 3:
+                puzzle_lr = 0.005  # Higher LR for first few iterations
+            elif iterations <= 10:
+                puzzle_lr = 0.002  # Medium LR
+            else:
+                puzzle_lr = 0.001  # Lower LR for fine-tuning
+                
+            print(f"Puzzle LR: {puzzle_lr}")
+            
+            puzzle_optimizer = torch.optim.SGD(
+                model.parameters(), 
+                lr=puzzle_lr, 
+                momentum=0.9, 
+                weight_decay=1e-4
+            )
+            
+            # Train on puzzles for multiple epochs per iteration
+            puzzle_epochs = 10  # More epochs for intensive learning
+            print(f"Training on puzzles for {puzzle_epochs} epochs...")
+            
+            train_tactical(model, puzzle_optimizer, puzzle_dataloader, device, epochs=puzzle_epochs)
+            
+            # Save checkpoint
+            torch.save(model.state_dict(), save_path)
+            print(f"Saved checkpoint to {save_path}")
+            
+            # Test tactical recognition every iteration
+            test_accuracy = test_tactical_recognition(model, device)
+            print(f"\nTactical recognition accuracy: {test_accuracy:.2%}")
+            
+            # Save state
+            with open(state_file, 'w') as f:
+                state = {
+                    "puzzle_iterations": iterations,
+                    "tactical_accuracy": test_accuracy,
+                    "mode": "puzzles"
+                }
+                json.dump(state, f)
+            
+            # Memory cleanup
+            clear_memory()
+            
+            continue  # Continue puzzle training
         
         # Self-play mode
         if current_phase == "self-play":

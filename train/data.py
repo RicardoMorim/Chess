@@ -158,7 +158,7 @@ class ChessDataset(Dataset):
                 torch.tensor(value_target, dtype=torch.float32))
 
 class PuzzleDataset(Dataset):
-    """Dataset for chess puzzles with model type support"""
+    """Dataset for chess puzzles with category support for weighted training."""
     def __init__(self, puzzles, model_type="big"):
         self.puzzles = puzzles
         self.model_type = model_type
@@ -175,15 +175,25 @@ class PuzzleDataset(Dataset):
         return len(self.puzzles)
 
     def __getitem__(self, idx):
-        fen, move_uci, value_target = self.puzzles[idx]
+        puzzle = self.puzzles[idx]
+        
+        # Handle both 3-tuple (legacy) and 4-tuple (with category) formats
+        if len(puzzle) == 4:
+            fen, move_uci, value_target, category = puzzle
+        else:
+            fen, move_uci, value_target = puzzle
+            category = "other"  # Default category for legacy puzzles
+        
         board = chess.Board(fen)
         move = chess.Move.from_uci(move_uci)
         # Use the appropriate tensor representation based on model type
         input_tensor = board_to_tensor(board, 0, self.input_channels)
         policy_target = get_move_index(move)
+        
         return (torch.tensor(input_tensor, dtype=torch.float32),
                 torch.tensor(policy_target, dtype=torch.long),
-                torch.tensor(value_target, dtype=torch.float32))
+                torch.tensor(value_target, dtype=torch.float32),
+                category)  # Return category for weighted training
 
 class SelfPlayDataset(Dataset):
     """Dataset for self-play reinforcement learning samples with model type support"""
@@ -223,7 +233,14 @@ class SelfPlayDataset(Dataset):
                 torch.tensor(value_target, dtype=torch.float32))
 
 def load_puzzles(pgn_file):
-    """Load puzzles from PGN file"""
+    """Load puzzles from PGN file with category extraction.
+    
+    Extracts puzzle type from the 'White' header tag.
+    Examples: 'Mate in one', 'Mate in two', 'Fork', 'Pin', etc.
+    
+    Returns:
+        List of (fen, move_uci, value_target, category) tuples
+    """
     puzzles = []
     with open(pgn_file, encoding='ISO-8859-1') as pgn:
         while True:
@@ -235,114 +252,251 @@ def load_puzzles(pgn_file):
                 best_move = list(game.mainline_moves())[0]
                 fen = board.fen()
                 move_uci = best_move.uci()
-                puzzles.append((fen, move_uci, 1.0))
+                
+                # Extract category from White header
+                white_header = game.headers.get("White", "").lower()
+                
+                # Determine category and value based on puzzle type
+                if "mate in one" in white_header or "mate in 1" in white_header:
+                    category = "mate_in_one"
+                    value_target = 1.0
+                elif "mate in two" in white_header or "mate in 2" in white_header:
+                    category = "mate_in_two"
+                    value_target = 1.0
+                elif "mate in three" in white_header or "mate in 3" in white_header:
+                    category = "mate_in_three"
+                    value_target = 1.0
+                elif "mate" in white_header:
+                    category = "mate_longer"
+                    value_target = 1.0
+                elif "fork" in white_header:
+                    category = "fork"
+                    value_target = 0.9
+                elif "pin" in white_header:
+                    category = "pin"
+                    value_target = 0.85
+                elif "skewer" in white_header:
+                    category = "skewer"
+                    value_target = 0.85
+                elif "discovered" in white_header:
+                    category = "discovered"
+                    value_target = 0.85
+                elif "double" in white_header:
+                    category = "double_attack"
+                    value_target = 0.85
+                elif "endgame" in white_header or "ending" in white_header:
+                    category = "endgame"
+                    value_target = 0.8
+                else:
+                    category = "other"
+                    value_target = 0.7
+                
+                puzzles.append((fen, move_uci, value_target, category))
             except IndexError:
                 continue
+    
+    print(f"Loaded {len(puzzles)} puzzles from PGN")
     return puzzles
 
 def load_lichess_puzzles(csv_file):
-    """Load puzzles from Lichess CSV file"""
+    """Load puzzles from Lichess CSV file with category extraction.
+    
+    Extracts puzzle type from the 'Themes' column.
+    Lichess themes include: mateIn1, mateIn2, fork, pin, skewer, etc.
+    
+    Returns:
+        List of (fen, move_uci, value_target, category) tuples
+    """
     puzzles = []
+    category_counts = {}
+    
     with open(csv_file, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         for row in reader:
             fen = row['FEN']
             moves = row['Moves'].split()
-            if moves:
-                move_uci = moves[0]
-                value_target = 1.0 if 'mate' in row['Themes'].lower() else 0.5
-                puzzles.append((fen, move_uci, value_target))
+            if not moves:
+                continue
+                
+            move_uci = moves[0]
+            themes = row.get('Themes', '').lower()
+            
+            # Determine category from Lichess themes (prioritize mate puzzles)
+            if 'matein1' in themes or 'mate in 1' in themes:
+                category = "mate_in_one"
+                value_target = 1.0
+            elif 'matein2' in themes or 'mate in 2' in themes:
+                category = "mate_in_two"
+                value_target = 1.0
+            elif 'matein3' in themes or 'mate in 3' in themes:
+                category = "mate_in_three"
+                value_target = 1.0
+            elif 'matein4' in themes or 'matein5' in themes or 'mate' in themes:
+                category = "mate_longer"
+                value_target = 1.0
+            elif 'backrankmatepattern' in themes or 'backrankmatemate' in themes:
+                category = "backrank_mate"
+                value_target = 1.0
+            elif 'smotheredmate' in themes:
+                category = "smothered_mate"
+                value_target = 1.0
+            elif 'fork' in themes or 'doubleatack' in themes:
+                category = "fork"
+                value_target = 0.9
+            elif 'pin' in themes:
+                category = "pin"
+                value_target = 0.85
+            elif 'skewer' in themes:
+                category = "skewer"
+                value_target = 0.85
+            elif 'discoveredattack' in themes:
+                category = "discovered"
+                value_target = 0.85
+            elif 'endgame' in themes:
+                category = "endgame"
+                value_target = 0.8
+            elif 'promotion' in themes or 'queening' in themes:
+                category = "promotion"
+                value_target = 0.85
+            elif 'sacrifice' in themes:
+                category = "sacrifice"
+                value_target = 0.8
+            else:
+                category = "other"
+                value_target = 0.7
+            
+            puzzles.append((fen, move_uci, value_target, category))
+            category_counts[category] = category_counts.get(category, 0) + 1
+    
+    # Print category distribution
+    print(f"Loaded {len(puzzles)} puzzles from Lichess CSV")
+    print("Category distribution:")
+    for cat, count in sorted(category_counts.items(), key=lambda x: -x[1])[:10]:
+        print(f"  {cat}: {count}")
+    
     return puzzles
 
 def filter_and_prioritize_puzzles_cached(puzzles, cache_dir="./cache"):
-    """Filter puzzles with caching to avoid repeated work"""
+    """Filter and prioritize puzzles, with heavy emphasis on mate puzzles.
+    
+    Properly handles both 3-tuple (legacy) and 4-tuple (with category) formats.
+    Prioritizes mate puzzles for checkmate pattern learning.
+    """
     # Create cache directory if it doesn't exist
     os.makedirs(cache_dir, exist_ok=True)
     
     # Generate a hash based on the puzzles to use as cache key
     puzzles_hash = hashlib.md5(str(len(puzzles)).encode()).hexdigest()[:10]
-    cache_file = os.path.join(cache_dir, f"puzzle_cache_{puzzles_hash}.pkl")
+    cache_file = os.path.join(cache_dir, f"puzzle_cache_v2_{puzzles_hash}.pkl")
     
     # If cache exists, load from it
     if os.path.exists(cache_file):
-        print(f"Loading {len(puzzles)} prioritized puzzles from cache...")
+        print(f"Loading prioritized puzzles from cache...")
         try:
             with open(cache_file, 'rb') as f:
                 prioritized_puzzles = pickle.load(f)
             
-            print(f"Loaded prioritized puzzles from cache: {len(prioritized_puzzles)} puzzles")
-            # Return early if we successfully loaded from cache
+            print(f"Loaded {len(prioritized_puzzles)} puzzles from cache")
             return prioritized_puzzles
         except Exception as e:
             print(f"Error loading cache: {e}. Rebuilding...")
     
-    # If we get here, we need to prioritize puzzles
     print(f"Prioritizing {len(puzzles)} puzzles (this may take a while)...")
     
-    # Continue with your existing prioritization code
-    mate_puzzles = []
+    # Categorize puzzles
+    mate_in_one = []
+    mate_in_two = []
+    mate_in_three = []
+    mate_longer = []
     fork_puzzles = []
     pin_puzzles = []
+    endgame_puzzles = []
     other_puzzles = []
     
-    # Process puzzles in batches to avoid memory issues
-    batch_size = 10000
-    for i in range(0, len(puzzles), batch_size):
-        batch = puzzles[i:i+batch_size]
-        
-        for fen, move_uci, value_target in batch:
-            # Try to identify puzzle type from FEN or other properties
-            board = chess.Board(fen)
-            
-            # Check if this is a checkmate puzzle
-            future_board = board.copy()
+    # Process puzzles
+    for puzzle in puzzles:
+        # Handle both 3-tuple and 4-tuple formats
+        if len(puzzle) == 4:
+            fen, move_uci, value_target, category = puzzle
+        else:
+            fen, move_uci, value_target = puzzle
+            # Try to detect category from position
             try:
+                board = chess.Board(fen)
                 move = chess.Move.from_uci(move_uci)
-                future_board.push(move)
-                
-                if future_board.is_checkmate():
-                    mate_puzzles.append((fen, move_uci, 1.0))  # Higher value for mate puzzles
-                elif "fork" in fen.lower() or detect_fork(board, move):
-                    fork_puzzles.append((fen, move_uci, 0.9))
-                elif "pin" in fen.lower() or detect_pin(board, move):
-                    pin_puzzles.append((fen, move_uci, 0.8))
+                test_board = board.copy()
+                test_board.push(move)
+                if test_board.is_checkmate():
+                    category = "mate_in_one"
+                elif detect_fork(board, move):
+                    category = "fork"
+                elif detect_pin(board, move):
+                    category = "pin"
                 else:
-                    other_puzzles.append((fen, move_uci, value_target))
-            except Exception:
-                # Skip invalid puzzles
-                continue
+                    category = "other"
+            except:
+                category = "other"
         
-        # Show progress
-        if (i + batch_size) % 100000 == 0 or (i + batch_size) >= len(puzzles):
-            print(f"Processed {min(i + batch_size, len(puzzles))}/{len(puzzles)} puzzles...")
+        # Create 4-tuple for consistency
+        puzzle_4 = (fen, move_uci, value_target, category)
+        
+        # Sort into category buckets
+        if category == "mate_in_one":
+            mate_in_one.append(puzzle_4)
+        elif category == "mate_in_two":
+            mate_in_two.append(puzzle_4)
+        elif category == "mate_in_three":
+            mate_in_three.append(puzzle_4)
+        elif category in ["mate_longer", "backrank_mate", "smothered_mate"]:
+            mate_longer.append(puzzle_4)
+        elif category == "fork":
+            fork_puzzles.append(puzzle_4)
+        elif category in ["pin", "skewer", "discovered"]:
+            pin_puzzles.append(puzzle_4)
+        elif category == "endgame":
+            endgame_puzzles.append(puzzle_4)
+        else:
+            other_puzzles.append(puzzle_4)
     
-    # Combine with priority - duplicate tactical puzzles to increase their frequency  
+    # Combine with heavy priority on mate puzzles (the user's model needs this!)
     prioritized_puzzles = (
-        mate_puzzles * 5 +  # Repeat mate puzzles 5x
-        fork_puzzles * 3 +  # Repeat fork puzzles 3x
-        pin_puzzles * 3 +   # Repeat pin puzzles 3x
-        other_puzzles
+        mate_in_one * 10 +      # Mate-in-1: 10x (most important for learning checkmates)
+        mate_in_two * 8 +       # Mate-in-2: 8x
+        mate_in_three * 6 +     # Mate-in-3: 6x
+        mate_longer * 4 +       # Longer mates: 4x
+        endgame_puzzles * 4 +   # Endgames: 4x (important for finishing)
+        fork_puzzles * 2 +      # Forks: 2x
+        pin_puzzles * 2 +       # Pins: 2x
+        other_puzzles           # Others: 1x
     )
     
-    # Store only a reasonable subset for training if there are too many
-    max_puzzles = 200000  # Set a reasonable limit
+    # Shuffle to mix categories
+    random.shuffle(prioritized_puzzles)
+    
+    # Limit to reasonable size
+    max_puzzles = 300000
     if len(prioritized_puzzles) > max_puzzles:
-        print(f"Too many puzzles ({len(prioritized_puzzles)}), randomly sampling {max_puzzles}")
-        random.shuffle(prioritized_puzzles)
+        print(f"Too many puzzles ({len(prioritized_puzzles)}), sampling {max_puzzles}")
         prioritized_puzzles = prioritized_puzzles[:max_puzzles]
     
-    print(f"Prioritized puzzles: {len(prioritized_puzzles)} (from {len(puzzles)} original puzzles)")
-    print(f"  - Mate puzzles: {len(mate_puzzles)}")
-    print(f"  - Fork puzzles: {len(fork_puzzles)}")
-    print(f"  - Pin puzzles: {len(pin_puzzles)}")
+    # Print statistics
+    print(f"\nPrioritized puzzles: {len(prioritized_puzzles)} (from {len(puzzles)} original)")
+    print(f"  Mate-in-1: {len(mate_in_one)} (x10 = {len(mate_in_one)*10})")
+    print(f"  Mate-in-2: {len(mate_in_two)} (x8 = {len(mate_in_two)*8})")
+    print(f"  Mate-in-3: {len(mate_in_three)} (x6 = {len(mate_in_three)*6})")
+    print(f"  Longer mates: {len(mate_longer)} (x4 = {len(mate_longer)*4})")
+    print(f"  Endgames: {len(endgame_puzzles)} (x4 = {len(endgame_puzzles)*4})")
+    print(f"  Forks: {len(fork_puzzles)} (x2)")
+    print(f"  Pins: {len(pin_puzzles)} (x2)")
+    print(f"  Others: {len(other_puzzles)}")
     
     # Cache the results
     try:
         with open(cache_file, 'wb') as f:
             pickle.dump(prioritized_puzzles, f)
-        print(f"Cached prioritized puzzles to {cache_file}")
+        print(f"Cached to {cache_file}")
     except Exception as e:
-        print(f"Error caching results: {e}")
+        print(f"Error caching: {e}")
     
     return prioritized_puzzles
 
