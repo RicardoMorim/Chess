@@ -19,7 +19,7 @@ import pygame
 sys.stdout = orig_stdout
 sys.stderr = orig_stderr
 import chess
-from Minimax_improved import MinimaxAI  # Use improved version
+from Minimax_improved import MinimaxAI  
 
 # Try to import the new unified model loader, fallback to legacy
 try:

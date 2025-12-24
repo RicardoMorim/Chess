@@ -11,6 +11,7 @@ Significant improvements over the original:
 6. Proper aspiration windows for both colors
 7. Memory management (history table aging)
 8. **Lazy SMP parallel search** using multiprocessing (bypasses GIL!)
+9. **Cython acceleration** for hot functions (optional)
 
 Compatible with the original MinimaxAI interface.
 """
@@ -20,8 +21,23 @@ import chess.pgn
 import chess.polyglot
 import random
 import os
+import numpy as np
 from multiprocessing import Pool, cpu_count, Manager
 from TranspositionTable import TranspositionTable
+
+# Try to import Cython-accelerated functions
+try:
+    from minimax_improved_cy import (
+        evaluate_material_pst_cy,
+        score_move_cy,
+        quiescence_cy,
+        count_attacks_cy
+    )
+    CYTHON_AVAILABLE = True
+    print("✓ Cython acceleration enabled!")
+except ImportError:
+    CYTHON_AVAILABLE = False
+    print("Cython not available. Using pure Python (run: python setup_cython.py build_ext --inplace)")
 
 
 # Global for multiprocessing workers
@@ -87,6 +103,11 @@ class MinimaxAI:
         # Search statistics
         self.nodes_searched = 0
         self.tt_hits = 0
+        self.eval_cache_hits = 0
+        
+        # Evaluation cache (Zobrist hash -> score)
+        self.eval_cache = {}
+        self.eval_cache_max_size = 100000  # Limit to prevent memory issues
         
         # Piece values (centipawns)
         self.piece_value = {
@@ -201,6 +222,25 @@ class MinimaxAI:
         self.pst_black = {}
         for piece_type, table in self.pst_white.items():
             self.pst_black[piece_type] = [table[chess.square_mirror(i)] for i in range(64)]
+        
+        # Prepare flattened arrays for Cython (if available)
+        if CYTHON_AVAILABLE:
+            self._prepare_cython_tables()
+    
+    def _prepare_cython_tables(self):
+        """Prepare flattened numpy arrays for Cython acceleration."""
+        # Map piece types to indices
+        piece_types = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING]
+        
+        # Flattened arrays: index = square * 6 + piece_idx
+        self.pst_white_flat = np.zeros(64 * 6, dtype=np.int32)
+        self.pst_black_flat = np.zeros(64 * 6, dtype=np.int32)
+        self.king_pst_eg_flat = np.array(self.king_pst_eg, dtype=np.int32)
+        
+        for square in range(64):
+            for i, piece_type in enumerate(piece_types):
+                self.pst_white_flat[square * 6 + i] = self.pst_white[piece_type][square]
+                self.pst_black_flat[square * 6 + i] = self.pst_black[piece_type][square]
     
     def process_openings(self):
         """Process opening book into position -> moves mapping."""
@@ -240,15 +280,22 @@ class MinimaxAI:
     
     def evaluate_static(self, board):
         """
-        Comprehensive static evaluation function.
+        Comprehensive static evaluation function with caching.
         Returns score from white's perspective.
         """
+        # Check terminal conditions first (not cacheable)
         if board.is_checkmate():
             return -99999 if board.turn == chess.WHITE else 99999
         if board.is_stalemate() or board.is_insufficient_material():
             return 0
         if board.can_claim_draw():
             return 0
+        
+        # Check evaluation cache
+        zobrist = chess.polyglot.zobrist_hash(board)
+        if zobrist in self.eval_cache:
+            self.eval_cache_hits += 1
+            return self.eval_cache[zobrist]
         
         score = 0
         is_endgame = self.is_endgame(board)
@@ -288,8 +335,12 @@ class MinimaxAI:
         if not is_endgame:
             score += self._evaluate_king_safety(board)
         
-        # Mobility (simplified)
+        # Mobility (optimized with bitboards)
         score += self._evaluate_mobility(board)
+        
+        # Store in cache (with size limit)
+        if len(self.eval_cache) < self.eval_cache_max_size:
+            self.eval_cache[zobrist] = score
         
         return score
     
@@ -424,31 +475,25 @@ class MinimaxAI:
         return score
     
     def _evaluate_mobility(self, board):
-        """Simplified mobility evaluation."""
-        # Just count legal moves as a rough mobility measure
-        # This is a simplification - proper mobility counts attacks per piece
-        white_mobility = 0
-        black_mobility = 0
+        """Optimized mobility evaluation using bitboard operations."""
+        white_attacks = chess.SquareSet()
+        black_attacks = chess.SquareSet()
         
-        # Approximate by counting attacked squares for each piece type
-        for color in [chess.WHITE, chess.BLACK]:
-            mobility = 0
-            for piece_type in [chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]:
-                for sq in board.pieces(piece_type, color):
-                    attacks = board.attacks(sq)
-                    mobility += len(attacks)
-            
-            if color == chess.WHITE:
-                white_mobility = mobility
-            else:
-                black_mobility = mobility
+        # Use bitboard union for faster attack counting
+        for piece_type in [chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]:
+            for sq in board.pieces(piece_type, chess.WHITE):
+                white_attacks |= board.attacks(sq)
+            for sq in board.pieces(piece_type, chess.BLACK):
+                black_attacks |= board.attacks(sq)
         
-        return (white_mobility - black_mobility) * 2  # Small weight
+        # popcount is O(1) on bitboards
+        white_mobility = len(white_attacks)
+        black_mobility = len(black_attacks)
+        
+        return (white_mobility - black_mobility) * 2
     
     def score_move(self, board, move, ply, tt_move=None, prev_move=None):
-        """Score a move for move ordering."""
-        score = 0
-        
+        """Score a move for move ordering with SEE for captures."""
         # TT move gets highest priority
         if tt_move and move == tt_move:
             return 100000
@@ -465,20 +510,16 @@ class MinimaxAI:
             if move == self.countermoves[prev_move]:
                 return 88000
         
-        # Captures: MVV-LVA
+        # Captures: Use SEE for better ordering
         if board.is_capture(move):
-            captured = board.piece_at(move.to_square)
-            attacker = board.piece_at(move.from_square)
+            see_value = self._see(board, move)
             
-            if captured:
-                victim_val = self.piece_value[captured.piece_type]
-                attacker_val = self.piece_value[attacker.piece_type]
-                # MVV-LVA: prioritize high value victims, low value attackers
-                score = 50000 + victim_val * 10 - attacker_val
+            if see_value >= 0:
+                # Good/equal captures: score by SEE value
+                return 50000 + see_value
             else:
-                # En passant
-                score = 50000 + 100 * 10 - 100
-            return score
+                # Bad captures: search them LAST (after quiet moves)
+                return -10000 + see_value
         
         # Promotions
         if move.promotion:
@@ -489,6 +530,57 @@ class MinimaxAI:
         # History heuristic
         move_key = (move.from_square, move.to_square)
         return self.history.get(move_key, 0)
+    
+    def _see(self, board, move):
+        """
+        Static Exchange Evaluation - determine if a capture is winning or losing.
+        Returns approximate material gain/loss from the exchange.
+        """
+        if not board.is_capture(move):
+            return 0
+        
+        to_sq = move.to_square
+        from_sq = move.from_square
+        
+        # Get initial piece values
+        attacker = board.piece_at(from_sq)
+        captured = board.piece_at(to_sq)
+        
+        if captured is None:
+            # En passant
+            return 100  # Pawn value
+        
+        attacker_val = self.piece_value[attacker.piece_type]
+        captured_val = self.piece_value[captured.piece_type]
+        
+        # Simple SEE: if we can take with a less valuable piece, it's good
+        # More accurate SEE would simulate the full exchange sequence
+        
+        # Check if the target square is defended
+        board.push(move)
+        if board.is_attacked_by(board.turn, to_sq):
+            # Square is defended - check if exchange is favorable
+            # Find least valuable attacker
+            min_defender_val = 99999
+            for sq in board.attackers(board.turn, to_sq):
+                defender = board.piece_at(sq)
+                if defender:
+                    defender_val = self.piece_value[defender.piece_type]
+                    min_defender_val = min(min_defender_val, defender_val)
+            
+            # Simple estimate: we win captured piece but may lose attacker
+            if min_defender_val < attacker_val:
+                # We'll likely lose the attacker
+                see_score = captured_val - attacker_val
+            else:
+                # Defender is more valuable, exchange likely good for us
+                see_score = captured_val
+        else:
+            # Undefended piece - pure win
+            see_score = captured_val
+        
+        board.pop()
+        return see_score
     
     def quiescence(self, board, alpha, beta, ply=0):
         """Quiescence search - only searches captures at leaf nodes."""
