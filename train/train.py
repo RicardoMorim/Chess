@@ -12,12 +12,13 @@ import argparse
 
 
 from models import ChessNet, create_chess_model, load_model_with_compatibility
-from data import (ChessDataset, PuzzleDataset, load_puzzles, load_lichess_puzzles, 
-                 filter_and_prioritize_puzzles_cached, load_professional_games, 
-                 load_games_in_batches)
+from data import (ChessDataset, PuzzleDataset, CurriculumPuzzleDataset, load_puzzles, 
+                 load_lichess_puzzles, filter_and_prioritize_puzzles_cached, 
+                 load_professional_games, load_games_in_batches, expand_mate_sequences)
 from utils import clear_memory, test_tactical_recognition, get_optimal_batch_size, model_summary
-from self_play import generate_self_play_games, run_self_play_training
+from self_play import generate_self_play_games, run_self_play_training, generate_self_play_games_from_endgame
 from training import train_batch, train_tactical
+from checkmate_training import run_checkmate_bootcamp, run_checkmate_reinforcement
 
 # Import optimizations
 try:
@@ -86,6 +87,19 @@ def parse_arguments():
     
     parser.add_argument("--fast-mcts", action="store_true", 
                         help="Use fast MCTS for self-play (balanced speed/quality)")
+    
+    # Checkmate training parameters
+    parser.add_argument("--checkmate-bootcamp", action="store_true",
+                        help="Run intensive checkmate training before main training (one-time)")
+    
+    parser.add_argument("--checkmate-interval", type=int, default=3,
+                        help="Run checkmate reinforcement every N iterations (default: 3, 0=disabled)")
+    
+    parser.add_argument("--curriculum", action="store_true",
+                        help="Use curriculum learning for puzzles (progressive difficulty)")
+    
+    parser.add_argument("--endgame-start", action="store_true",
+                        help="Start self-play games from endgame positions near checkmate")
     
     # Self-play parameters when in self-play mode
     parser.add_argument("games", nargs="?", type=int, default=None,
@@ -211,6 +225,10 @@ def main():
     if os.path.exists(lichess_csv):
         lichess_puzzles = load_lichess_puzzles(lichess_csv)
         print(f"Loaded {len(lichess_puzzles)} Lichess puzzles")
+        
+        # Expand mate sequences to include intermediate positions
+        # This teaches the model the SETUP moves, not just the final checkmate
+        lichess_puzzles = expand_mate_sequences(lichess_puzzles)
 
     all_puzzles = pgn_puzzles + lichess_puzzles
     prioritized_puzzles = filter_and_prioritize_puzzles_cached(all_puzzles)
@@ -249,13 +267,18 @@ def main():
         )
         print(f"Using optimized DataLoader (workers={HARDWARE_CONFIG['dataloader_workers']}, batch={puzzle_batch_size})")
     else:
+        # Windows has issues with multiprocessing DataLoader (uses spawn instead of fork)
+        # Use num_workers=0 on Windows to avoid pickle errors
+        import platform
+        use_workers = 0 if platform.system() == 'Windows' else 4
+        
         puzzle_dataloader = DataLoader(
             puzzle_dataset, 
             batch_size=puzzle_batch_size,
             shuffle=True,
-            num_workers=4,  # More workers for faster data loading
+            num_workers=use_workers,
             pin_memory=True,
-            persistent_workers=True  # Keep workers alive between epochs
+            persistent_workers=use_workers > 0  # Only if using workers
         )
     
     # Determine training mode
@@ -272,17 +295,57 @@ def main():
     pro_batch_size = 1000
     regular_batch_size = 1000
     
+    # Run checkmate bootcamp if requested (one-time intensive training)
+    if args.checkmate_bootcamp:
+        print("\n" + "="*60)
+        print("STARTING CHECKMATE BOOT CAMP")
+        print("="*60)
+        run_checkmate_bootcamp(model, puzzle_dataset, device, save_path)
+    
     # Main training loop
     max_iterations = 1000000  # Very high limit (essentially unlimited)
     iterations = 0
+    checkmate_interval = args.checkmate_interval
     
     while iterations < max_iterations:
         iterations += 1
         print(f"\n--- Training Iteration {iterations} ---")
         
+        # Periodic checkmate reinforcement (every N iterations)
+        if checkmate_interval > 0 and iterations % checkmate_interval == 0:
+            run_checkmate_reinforcement(model, puzzle_dataset, device, epochs=5)
+        
         # Puzzle-only mode (intensive checkmate/tactical training)
         if current_phase == "puzzles":
             print("\n=== PUZZLE TRAINING MODE (Checkmate Focus) ===")
+            
+            # Use curriculum learning if enabled
+            if args.curriculum:
+                # Create curriculum dataset on first iteration
+                if not hasattr(args, '_curriculum_dataset'):
+                    print("Initializing curriculum learning...")
+                    args._curriculum_dataset = CurriculumPuzzleDataset(
+                        prioritized_puzzles, model_type=model_type
+                    )
+                    # Create dataloader for curriculum
+                    import platform
+                    from torch.utils.data import DataLoader as TorchDataLoader
+                    use_workers = 0 if platform.system() == 'Windows' else 2
+                    args._curriculum_loader = TorchDataLoader(
+                        args._curriculum_dataset,
+                        batch_size=optimal_batch_size,
+                        shuffle=True,
+                        num_workers=use_workers,
+                        pin_memory=True
+                    )
+                
+                curriculum_dataset = args._curriculum_dataset
+                curriculum_loader = args._curriculum_loader
+                
+                stage_info = curriculum_dataset.get_stage_info()
+                print(f"Curriculum stage {stage_info['index']}: {stage_info['name']}")
+                print(f"  {stage_info['description']}")
+                print(f"  Active puzzles: {stage_info['num_puzzles']}")
             
             # Intensive puzzle training with higher learning rate initially
             if iterations <= 3:
@@ -302,10 +365,14 @@ def main():
             )
             
             # Train on puzzles for multiple epochs per iteration
-            puzzle_epochs = 10  # More epochs for intensive learning
+            puzzle_epochs = 15  # More epochs for intensive learning (was 10)
             print(f"Training on puzzles for {puzzle_epochs} epochs...")
             
-            train_tactical(model, puzzle_optimizer, puzzle_dataloader, device, epochs=puzzle_epochs)
+            # Use curriculum loader if enabled, otherwise standard
+            if args.curriculum:
+                train_tactical(model, puzzle_optimizer, curriculum_loader, device, epochs=puzzle_epochs)
+            else:
+                train_tactical(model, puzzle_optimizer, puzzle_dataloader, device, epochs=puzzle_epochs)
             
             # Save checkpoint
             torch.save(model.state_dict(), save_path)
@@ -315,6 +382,21 @@ def main():
             test_accuracy = test_tactical_recognition(model, device)
             print(f"\nTactical recognition accuracy: {test_accuracy:.2%}")
             
+            # Check curriculum advancement
+            if args.curriculum:
+                if curriculum_dataset.check_and_advance(test_accuracy):
+                    # Recreate dataloader with new active indices
+                    import platform
+                    from torch.utils.data import DataLoader as TorchDataLoader
+                    use_workers = 0 if platform.system() == 'Windows' else 2
+                    args._curriculum_loader = TorchDataLoader(
+                        curriculum_dataset,
+                        batch_size=optimal_batch_size,
+                        shuffle=True,
+                        num_workers=use_workers,
+                        pin_memory=True
+                    )
+            
             # Save state
             with open(state_file, 'w') as f:
                 state = {
@@ -322,6 +404,8 @@ def main():
                     "tactical_accuracy": test_accuracy,
                     "mode": "puzzles"
                 }
+                if args.curriculum:
+                    state["curriculum_stage"] = curriculum_dataset.current_stage
                 json.dump(state, f)
             
             # Memory cleanup
@@ -346,7 +430,60 @@ def main():
                 
             print(f"Running {iterations_per_cycle} iterations with {games_per_batch} games per iteration")
             
-            # Run self-play training for this batch
+            # If endgame-start is enabled, alternate between regular and endgame games
+            if hasattr(args, 'endgame_start') and args.endgame_start:
+                print("Using endgame starting positions for checkmate training")
+                
+                # Generate endgame games
+                endgame_games = generate_self_play_games_from_endgame(
+                    model, device, 
+                    num_games=games_per_batch // 2,  # Half endgame games
+                    use_mcts=use_mcts
+                )
+                
+                if endgame_games:
+                    # Convert endgame games to training samples
+                    from data import board_to_tensor, get_move_index, SelfPlayDataset
+                    from self_play import create_training_samples_from_game
+                    
+                    input_channels = model.input_channels if hasattr(model, 'input_channels') else 22
+                    endgame_samples = []
+                    
+                    for game in endgame_games:
+                        board = chess.Board(game.headers.get("FEN", chess.STARTING_FEN))
+                        result_str = game.headers.get("Result", "*")
+                        result_value = 1.0 if result_str == "1-0" else (-1.0 if result_str == "0-1" else 0.0)
+                        
+                        move_history = []
+                        board_history = []
+                        
+                        for move in game.mainline_moves():
+                            board_history.append(board_to_tensor(board, 1, input_channels))
+                            move_history.append(get_move_index(move))
+                            board.push(move)
+                        
+                        samples = create_training_samples_from_game(
+                            board_history, move_history, result_value, True
+                        )
+                        endgame_samples.extend(samples)
+                    
+                    if endgame_samples:
+                        # Train on endgame samples
+                        print(f"Training on {len(endgame_samples)} endgame positions")
+                        endgame_dataset = SelfPlayDataset(endgame_samples, "big" if model.input_channels == 22 else "small")
+                        from torch.utils.data import DataLoader
+                        import platform
+                        num_workers = 0 if platform.system() == 'Windows' else 2
+                        endgame_loader = DataLoader(
+                            endgame_dataset, batch_size=32, shuffle=True,
+                            num_workers=num_workers, pin_memory=True
+                        )
+                        
+                        # Quick training on endgame positions
+                        optimizer = torch.optim.SGD(model.parameters(), lr=0.002, momentum=0.9)
+                        train_tactical(model, optimizer, endgame_loader, device, epochs=3)
+            
+            # Run regular self-play training for this batch
             model = run_self_play_training(
                 model, 
                 device,
@@ -408,11 +545,14 @@ def main():
                     for_training=True
                 )
             else:
+                # Windows fix: use num_workers=0 to avoid pickle errors
+                import platform
+                use_workers = 0 if platform.system() == 'Windows' else min(2, os.cpu_count() or 1)
                 game_dataloader = DataLoader(
                     game_dataset, 
                     batch_size=optimal_batch_size,
                     shuffle=True, 
-                    num_workers=min(2, os.cpu_count() or 1),
+                    num_workers=use_workers,
                     pin_memory=True
                 )
             
@@ -431,9 +571,9 @@ def main():
                 clear_memory()
             
             # Tactical training after professional batch
-            print("Running quick tactical training phase...")
-            tactical_optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9, weight_decay=1e-4)
-            train_tactical(model, tactical_optimizer, puzzle_dataloader, device, epochs=6)
+            print("Running enhanced tactical training phase...")
+            tactical_optimizer = torch.optim.SGD(model.parameters(), lr=0.002, momentum=0.9, weight_decay=1e-4)
+            train_tactical(model, tactical_optimizer, puzzle_dataloader, device, epochs=12)
             
             
             # Test tactical recognition occasionally
@@ -481,11 +621,14 @@ def main():
                     for_training=True
                 )
             else:
+                # Windows fix: use num_workers=0 to avoid pickle errors
+                import platform
+                use_workers = 0 if platform.system() == 'Windows' else min(2, os.cpu_count() or 1)
                 game_dataloader = DataLoader(
                     game_dataset, 
                     batch_size=optimal_batch_size,
                     shuffle=True, 
-                    num_workers=min(2, os.cpu_count() or 1),
+                    num_workers=use_workers,
                     pin_memory=True
                 )
             
@@ -505,8 +648,8 @@ def main():
                 clear_memory()
 
             print("Running enhanced tactical training phase for regular games...")
-            tactical_optimizer = torch.optim.SGD(model.parameters(), lr=0.0005, momentum=0.9, weight_decay=1e-4)
-            train_tactical(model, tactical_optimizer, puzzle_dataloader, device, epochs=6)
+            tactical_optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9, weight_decay=1e-4)
+            train_tactical(model, tactical_optimizer, puzzle_dataloader, device, epochs=10)
             
             # Generate some self-play games after regular batch
             self_play_count = min(5 + iterations // 2, 10)
@@ -516,11 +659,14 @@ def main():
             
             if self_play_games:
                 self_play_dataset = ChessDataset(self_play_games, augment=True)
+                # Windows fix: use num_workers=0 to avoid pickle errors
+                import platform
+                use_workers = 0 if platform.system() == 'Windows' else 1
                 self_play_dataloader = DataLoader(
                     self_play_dataset,
                     batch_size=optimal_batch_size,
                     shuffle=True,
-                    num_workers=1,
+                    num_workers=use_workers,
                     pin_memory=True
                 )
                 train_batch(model, self_play_dataloader, puzzle_dataloader, save_path, state_file, 

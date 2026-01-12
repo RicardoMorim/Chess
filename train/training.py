@@ -32,12 +32,12 @@ TRAIN_CONFIG = {
     # Loss weights
     'policy_weight': 1.0,         # Policy loss weight
     'value_weight': 1.0,          # Value loss weight
-    'puzzle_policy_weight': 2.0,  # Higher weight for puzzles
-    'puzzle_value_weight': 2.0,   # Value weight for puzzles (increased)
+    'puzzle_policy_weight': 3.0,  # Higher weight for puzzles (was 2.0)
+    'puzzle_value_weight': 2.5,   # Value weight for puzzles (was 2.0)
     
     # Training dynamics
     'puzzle_frequency': 1,        # Train on puzzles every N game batches
-    'puzzle_batches': 5,          # Number of puzzle batches per game batch
+    'puzzle_batches': 8,          # Number of puzzle batches per game batch (was 5)
 }
 
 

@@ -28,12 +28,16 @@ from multiprocessing import Process, Queue, Event
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from functools import lru_cache
 from typing import List, Tuple, Dict, Optional, Any
+import platform
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 from torch.cuda.amp import autocast, GradScaler
+
+# Windows has issues with multiprocessing DataLoader (uses spawn instead of fork)
+IS_WINDOWS = platform.system() == 'Windows'
 
 # Try to import numba for JIT compilation
 try:
@@ -169,9 +173,14 @@ def create_optimized_dataloader(dataset: Dataset, batch_size: int,
     """
     config = HARDWARE_CONFIG
     
-    # Adjust workers based on dataset size
-    num_workers = min(config["dataloader_workers"], len(dataset) // 100 + 1)
-    num_workers = max(0, num_workers)  # At least 0
+    # Windows has issues with multiprocessing DataLoader workers (pickle errors)
+    # Force num_workers=0 on Windows to avoid these issues
+    if IS_WINDOWS:
+        num_workers = 0
+    else:
+        # Adjust workers based on dataset size
+        num_workers = min(config["dataloader_workers"], len(dataset) // 100 + 1)
+        num_workers = max(0, num_workers)  # At least 0
     
     loader_kwargs = {
         "batch_size": batch_size,

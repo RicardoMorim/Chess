@@ -288,6 +288,221 @@ class PuzzleDataset(Dataset):
                 torch.tensor(self.values[idx], dtype=torch.float32),
                 self.categories[idx])
 
+
+class CurriculumPuzzleDataset(Dataset):
+    """Puzzle dataset with curriculum learning - progressive difficulty stages.
+    
+    Implements staged training where the model starts with easy puzzles
+    (mate-in-1) and progressively trains on harder puzzles as it improves.
+    
+    Stages:
+    1. mate_basics: Only mate-in-1 puzzles (easiest pattern recognition)
+    2. mate_extended: All mate puzzles (mate-in-1, 2, 3, longer)
+    3. tactics: Mates + tactical puzzles (forks, pins, etc.)
+    4. full: Complete puzzle set
+    
+    The curriculum advances automatically when accuracy threshold is met,
+    or can be manually advanced via advance_stage().
+    """
+    
+    # Stage definitions: name, categories to include, accuracy threshold to advance
+    STAGES = [
+        {
+            "name": "mate_basics",
+            "categories": {"mate_in_one"},
+            "threshold": 0.70,
+            "description": "Mate-in-1 only (pattern recognition)"
+        },
+        {
+            "name": "mate_extended", 
+            "categories": {"mate_in_one", "mate_in_two", "mate_in_three", 
+                          "mate_longer", "backrank_mate", "smothered_mate"},
+            "threshold": 0.60,
+            "description": "All mate puzzles"
+        },
+        {
+            "name": "tactics",
+            "categories": {"mate_in_one", "mate_in_two", "mate_in_three",
+                          "mate_longer", "backrank_mate", "smothered_mate",
+                          "fork", "pin", "skewer", "discovered", "double_attack"},
+            "threshold": 0.50,
+            "description": "Mates + tactical puzzles"
+        },
+        {
+            "name": "full",
+            "categories": None,  # None means all categories
+            "threshold": None,   # No advancement (final stage)
+            "description": "Complete puzzle set"
+        }
+    ]
+    
+    def __init__(self, puzzles, model_type="big", cache_dir="./cache", start_stage=0):
+        """Initialize curriculum dataset.
+        
+        Args:
+            puzzles: List of puzzle tuples (fen, move, value, category)
+            model_type: Model size for tensor generation
+            cache_dir: Directory for caching tensors
+            start_stage: Initial curriculum stage (0-3)
+        """
+        self.all_puzzles = puzzles
+        self.model_type = model_type
+        self.cache_dir = cache_dir
+        self.current_stage = min(start_stage, len(self.STAGES) - 1)
+        
+        # Channel configuration
+        model_lower = model_type.lower()
+        if model_lower in ["small", "limited"]:
+            self.input_channels = 18
+        elif model_lower == "medium":
+            self.input_channels = 20
+        else:
+            self.input_channels = 22
+        
+        # Build category -> puzzle indices mapping
+        self._build_category_index()
+        
+        # Set initial stage
+        self._update_active_puzzles()
+        
+        print(f"Curriculum initialized at stage {self.current_stage}: {self.STAGES[self.current_stage]['name']}")
+        print(f"  {self.STAGES[self.current_stage]['description']}")
+        print(f"  Active puzzles: {len(self.active_indices)}")
+    
+    def _build_category_index(self):
+        """Build index mapping categories to puzzle indices."""
+        self.category_indices = {}
+        
+        for i, puzzle in enumerate(self.all_puzzles):
+            category = puzzle[3] if len(puzzle) >= 4 else "other"
+            if category not in self.category_indices:
+                self.category_indices[category] = []
+            self.category_indices[category].append(i)
+        
+        # Print category summary
+        print("Curriculum puzzle categories:")
+        for cat, indices in sorted(self.category_indices.items(), 
+                                   key=lambda x: -len(x[1]))[:8]:
+            print(f"  {cat}: {len(indices)}")
+    
+    def _update_active_puzzles(self):
+        """Update active puzzle indices based on current stage."""
+        stage = self.STAGES[self.current_stage]
+        allowed_categories = stage["categories"]
+        
+        if allowed_categories is None:
+            # Full stage - use all puzzles
+            self.active_indices = list(range(len(self.all_puzzles)))
+        else:
+            # Filter to allowed categories
+            self.active_indices = []
+            for category in allowed_categories:
+                if category in self.category_indices:
+                    self.active_indices.extend(self.category_indices[category])
+        
+        # Shuffle for better training
+        import random
+        random.shuffle(self.active_indices)
+    
+    def advance_stage(self):
+        """Advance to next curriculum stage.
+        
+        Returns:
+            bool: True if advanced, False if already at final stage
+        """
+        if self.current_stage >= len(self.STAGES) - 1:
+            return False
+        
+        self.current_stage += 1
+        self._update_active_puzzles()
+        
+        stage = self.STAGES[self.current_stage]
+        print(f"\n🎓 CURRICULUM ADVANCED to stage {self.current_stage}: {stage['name']}")
+        print(f"   {stage['description']}")
+        print(f"   Active puzzles: {len(self.active_indices)}")
+        
+        return True
+    
+    def check_and_advance(self, accuracy):
+        """Check if accuracy meets threshold and advance if so.
+        
+        Args:
+            accuracy: Current accuracy (0.0-1.0)
+            
+        Returns:
+            bool: True if stage was advanced
+        """
+        stage = self.STAGES[self.current_stage]
+        threshold = stage.get("threshold")
+        
+        if threshold is not None and accuracy >= threshold:
+            print(f"✓ Accuracy {accuracy:.2%} meets threshold {threshold:.0%}")
+            return self.advance_stage()
+        
+        return False
+    
+    def get_stage_info(self):
+        """Get information about current stage."""
+        stage = self.STAGES[self.current_stage]
+        return {
+            "index": self.current_stage,
+            "name": stage["name"],
+            "description": stage["description"],
+            "num_puzzles": len(self.active_indices),
+            "threshold": stage.get("threshold"),
+            "is_final": self.current_stage >= len(self.STAGES) - 1
+        }
+    
+    def __len__(self):
+        return len(self.active_indices)
+    
+    def __getitem__(self, idx):
+        """Get puzzle at index (from active set only).
+        
+        Applies random augmentation (horizontal mirroring) 50% of the time
+        to increase effective training data diversity and reduce overfitting.
+        """
+        puzzle_idx = self.active_indices[idx]
+        puzzle = self.all_puzzles[puzzle_idx]
+        
+        # Handle 3-tuple and 4-tuple formats
+        if len(puzzle) >= 4:
+            fen, move_uci, value_target, category = puzzle[:4]
+        else:
+            fen, move_uci, value_target = puzzle[:3]
+            category = "other"
+        
+        try:
+            board = chess.Board(fen)
+            move = chess.Move.from_uci(move_uci)
+            
+            # Random augmentation: horizontal mirror 50% of the time
+            # This doubles effective training data and improves generalization
+            import random
+            if random.random() < 0.5:
+                # Mirror the board horizontally (flip a-h to h-a)
+                board = board.mirror()
+                move = chess.Move(
+                    chess.square_mirror(move.from_square),
+                    chess.square_mirror(move.to_square),
+                    move.promotion
+                )
+            
+            input_tensor = board_to_tensor(board, 0, self.input_channels)
+            policy_target = get_move_index(move)
+            
+            return (torch.tensor(input_tensor, dtype=torch.float32),
+                    torch.tensor(policy_target, dtype=torch.long),
+                    torch.tensor(value_target, dtype=torch.float32),
+                    category)
+        except Exception as e:
+            # Return dummy data on error (will be rare)
+            return (torch.zeros(self.input_channels, 8, 8),
+                    torch.tensor(0, dtype=torch.long),
+                    torch.tensor(0.0, dtype=torch.float32),
+                    "error")
+
+
 class SelfPlayDataset(Dataset):
     """Dataset for self-play reinforcement learning samples with model type support"""
     def __init__(self, samples, model_type="big"):
@@ -398,7 +613,10 @@ def load_lichess_puzzles(csv_file):
     Lichess themes include: mateIn1, mateIn2, fork, pin, skewer, etc.
     
     Returns:
-        List of (fen, move_uci, value_target, category) tuples
+        List of tuples. For mate puzzles, returns 5-tuple:
+        (fen, first_move_uci, value_target, category, full_moves_list)
+        For non-mate puzzles, returns 4-tuple:
+        (fen, move_uci, value_target, category)
     """
     puzzles = []
     category_counts = {}
@@ -415,24 +633,31 @@ def load_lichess_puzzles(csv_file):
             themes = row.get('Themes', '').lower()
             
             # Determine category from Lichess themes (prioritize mate puzzles)
+            is_mate_puzzle = False
             if 'matein1' in themes or 'mate in 1' in themes:
                 category = "mate_in_one"
                 value_target = 1.0
+                is_mate_puzzle = True
             elif 'matein2' in themes or 'mate in 2' in themes:
                 category = "mate_in_two"
                 value_target = 1.0
+                is_mate_puzzle = True
             elif 'matein3' in themes or 'mate in 3' in themes:
                 category = "mate_in_three"
                 value_target = 1.0
+                is_mate_puzzle = True
             elif 'matein4' in themes or 'matein5' in themes or 'mate' in themes:
                 category = "mate_longer"
                 value_target = 1.0
+                is_mate_puzzle = True
             elif 'backrankmatepattern' in themes or 'backrankmatemate' in themes:
                 category = "backrank_mate"
                 value_target = 1.0
+                is_mate_puzzle = True
             elif 'smotheredmate' in themes:
                 category = "smothered_mate"
                 value_target = 1.0
+                is_mate_puzzle = True
             elif 'fork' in themes or 'doubleatack' in themes:
                 category = "fork"
                 value_target = 0.9
@@ -458,7 +683,13 @@ def load_lichess_puzzles(csv_file):
                 category = "other"
                 value_target = 0.7
             
-            puzzles.append((fen, move_uci, value_target, category))
+            # For mate puzzles, store the full move sequence (5-tuple)
+            # This allows us to expand into intermediate positions later
+            if is_mate_puzzle and len(moves) > 1:
+                puzzles.append((fen, move_uci, value_target, category, moves))
+            else:
+                puzzles.append((fen, move_uci, value_target, category))
+            
             category_counts[category] = category_counts.get(category, 0) + 1
     
     # Print category distribution
@@ -468,6 +699,122 @@ def load_lichess_puzzles(csv_file):
         print(f"  {cat}: {count}")
     
     return puzzles
+
+
+def expand_mate_sequences(puzzles, max_expand_depth=4):
+    """Expand mate-in-N puzzles to include all intermediate positions.
+    
+    This is crucial for teaching checkmate patterns because the model needs
+    to learn the SETUP moves, not just the final checkmate move.
+    
+    For a mate-in-3 sequence: pos1 → m1 → pos2 → opp1 → pos3 → m2 → pos4 → opp2 → pos5 → m3 (checkmate)
+    We generate training samples for positions pos1, pos3, pos5 (our moves only).
+    
+    Value targets are graduated based on distance to mate:
+    - Final checkmate move: 1.0
+    - One move before: 0.98
+    - Two moves before: 0.95
+    - Three moves before: 0.92
+    
+    Args:
+        puzzles: List of puzzle tuples (some may be 5-tuples with full move sequences)
+        max_expand_depth: Maximum number of positions to expand per puzzle
+        
+    Returns:
+        List of expanded puzzle tuples (fen, move_uci, value_target, category)
+    """
+    expanded = []
+    expanded_count = 0
+    
+    # Value targets based on distance to checkmate (closer = higher)
+    value_by_distance = {
+        0: 1.0,    # Final checkmate move
+        1: 0.98,   # One move before checkmate
+        2: 0.95,   # Two moves before
+        3: 0.92,   # Three moves before
+        4: 0.88,   # Four moves before
+    }
+    
+    for puzzle in puzzles:
+        # Check if this is a mate puzzle with full move sequence (5-tuple)
+        if len(puzzle) == 5:
+            fen, first_move, base_value, category, moves = puzzle
+            
+            # Only expand mate puzzles with multiple moves
+            if category not in ('mate_in_one', 'mate_in_two', 'mate_in_three', 
+                               'mate_longer', 'backrank_mate', 'smothered_mate'):
+                # Not a mate puzzle, keep as 4-tuple
+                expanded.append((fen, first_move, base_value, category))
+                continue
+            
+            try:
+                board = chess.Board(fen)
+                positions_generated = 0
+                
+                # Calculate total moves to checkmate
+                # Lichess puzzles: moves[0] is our first move, moves[1] is opponent response, etc.
+                our_moves = [(i, moves[i]) for i in range(0, len(moves), 2)]  # Even indices are our moves
+                total_our_moves = len(our_moves)
+                
+                # Generate position for each of our moves
+                for move_idx, (seq_idx, move_uci) in enumerate(our_moves):
+                    if positions_generated >= max_expand_depth:
+                        break
+                    
+                    # Calculate distance from checkmate (0 = checkmate move)
+                    distance_to_mate = total_our_moves - move_idx - 1
+                    value_target = value_by_distance.get(distance_to_mate, 0.85)
+                    
+                    # Determine category based on distance
+                    if distance_to_mate == 0:
+                        sub_category = "mate_in_one"  # This IS the checkmate move
+                    elif distance_to_mate == 1:
+                        sub_category = "mate_in_two"  # One move before checkmate
+                    else:
+                        sub_category = category  # Keep original category
+                    
+                    # Get current position FEN
+                    current_fen = board.fen()
+                    
+                    # Add this position as a training sample
+                    expanded.append((current_fen, move_uci, value_target, sub_category))
+                    positions_generated += 1
+                    
+                    # Apply the move and opponent's response to get to next position
+                    try:
+                        move = chess.Move.from_uci(move_uci)
+                        if move in board.legal_moves:
+                            board.push(move)
+                            
+                            # Apply opponent's response if there is one
+                            opp_idx = seq_idx + 1
+                            if opp_idx < len(moves):
+                                opp_move = chess.Move.from_uci(moves[opp_idx])
+                                if opp_move in board.legal_moves:
+                                    board.push(opp_move)
+                        else:
+                            break  # Invalid move, stop expanding
+                    except:
+                        break  # Error, stop expanding
+                
+                if positions_generated > 1:
+                    expanded_count += positions_generated - 1
+                    
+            except Exception as e:
+                # If expansion fails, just add the original puzzle as 4-tuple
+                expanded.append((fen, first_move, base_value, category))
+        else:
+            # Regular 4-tuple or 3-tuple puzzle, keep as-is
+            if len(puzzle) == 4:
+                expanded.append(puzzle)
+            else:  # 3-tuple
+                fen, move_uci, value_target = puzzle
+                expanded.append((fen, move_uci, value_target, "other"))
+    
+    print(f"Mate sequence expansion: {len(puzzles)} puzzles → {len(expanded)} samples (+{expanded_count} intermediate positions)")
+    
+    return expanded
+
 
 def filter_and_prioritize_puzzles_cached(puzzles, cache_dir="./cache"):
     """Filter and prioritize puzzles, with heavy emphasis on mate puzzles.

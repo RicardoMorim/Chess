@@ -48,6 +48,290 @@ SELF_PLAY_CONFIG = {
 }
 
 
+# ============================================================================
+# ENDGAME POSITION GENERATOR
+# ============================================================================
+# Known endgame patterns that are 2-5 moves from checkmate
+# These teach the model to finish games efficiently
+
+ENDGAME_POSITIONS = {
+    # KQ vs K - Queen can force checkmate
+    "kq_vs_k": [
+        # White to move, mate in 2-3
+        "8/8/8/4k3/8/3Q4/8/4K3 w - - 0 1",
+        "8/8/8/8/4k3/8/8/3QK3 w - - 0 1",
+        "8/8/4k3/8/8/8/3Q4/4K3 w - - 0 1",
+        "8/8/8/8/8/2k5/1Q6/4K3 w - - 0 1",
+        "8/1k6/8/8/8/8/1Q6/4K3 w - - 0 1",
+    ],
+    
+    # KR vs K - Rook can force checkmate (longer but important)
+    "kr_vs_k": [
+        "8/8/8/4k3/8/8/3R4/4K3 w - - 0 1",
+        "8/8/1k6/8/8/8/1R6/4K3 w - - 0 1",
+        "8/8/8/8/4k3/8/8/3RK3 w - - 0 1",
+    ],
+    
+    # Back rank mate patterns (very common in real games)
+    "back_rank": [
+        # White to move, back rank mate in 1-2
+        "6k1/5ppp/8/8/8/8/8/R3K3 w - - 0 1",
+        "6k1/5ppp/8/8/8/8/8/4K2R w - - 0 1",
+        "r5k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1",
+        # Black's back rank is weak
+        "6k1/5ppp/8/8/8/8/1Q6/4K3 w - - 0 1",
+        "6k1/5ppp/8/8/8/3Q4/8/4K3 w - - 0 1",
+    ],
+    
+    # Smothered mate patterns (knight checkmate)
+    "smothered_mate": [
+        # Classic knight fork leading to smothered mate
+        "6rk/6pp/8/8/8/5N2/8/4K3 w - - 0 1",
+        "r4rk1/5ppp/8/8/8/5N2/5PPP/4K2R w K - 0 1",
+    ],
+    
+    # Queen + King coordination mates
+    "qk_coordination": [
+        "8/8/8/8/8/1k6/8/QK6 w - - 0 1",
+        "8/8/8/8/8/1k6/1Q6/1K6 w - - 0 1",
+        "8/8/8/8/1k6/8/8/QK6 w - - 0 1",
+    ],
+    
+    # Two rook checkmate patterns
+    "two_rooks": [
+        "8/8/8/8/1k6/8/8/RR2K3 w - - 0 1",
+        "8/8/1k6/8/8/8/8/RR2K3 w - - 0 1",
+        "8/1k6/8/8/8/8/8/RR2K3 w - - 0 1",
+    ],
+}
+
+
+def generate_endgame_starting_positions(num_positions=50, include_reverse=True):
+    """Generate endgame positions that are 2-5 moves from checkmate.
+    
+    These positions are used to start self-play games so the model
+    learns to actually finish games with checkmate.
+    
+    Args:
+        num_positions: Number of positions to generate
+        include_reverse: Also include positions with colors reversed
+        
+    Returns:
+        List of chess.Board objects ready for self-play
+    """
+    positions = []
+    
+    # Collect all endgame FENs
+    all_fens = []
+    for category, fens in ENDGAME_POSITIONS.items():
+        for fen in fens:
+            all_fens.append((fen, category))
+    
+    print(f"Generating {num_positions} endgame starting positions from {len(all_fens)} patterns")
+    
+    # Generate positions
+    generated = 0
+    attempts = 0
+    max_attempts = num_positions * 3
+    
+    while generated < num_positions and attempts < max_attempts:
+        attempts += 1
+        
+        # Pick a random endgame pattern
+        fen, category = random.choice(all_fens)
+        
+        try:
+            board = chess.Board(fen)
+            
+            # Validate the position
+            if not board.is_valid():
+                continue
+            
+            # Make sure there are legal moves
+            if not list(board.legal_moves):
+                continue
+            
+            # Add this position
+            positions.append(board.copy())
+            generated += 1
+            
+            # Also add the mirror position (colors reversed) for variety
+            if include_reverse and generated < num_positions:
+                mirror_board = board.mirror()
+                if mirror_board.is_valid() and list(mirror_board.legal_moves):
+                    positions.append(mirror_board)
+                    generated += 1
+            
+            # Add slight variations by going back a move or two
+            if generated < num_positions and category in ["kq_vs_k", "kr_vs_k"]:
+                # Create a variation by moving pieces slightly
+                varied_board = _create_position_variation(board)
+                if varied_board and varied_board.is_valid():
+                    positions.append(varied_board)
+                    generated += 1
+                    
+        except Exception as e:
+            continue
+    
+    print(f"Generated {len(positions)} endgame positions")
+    
+    # Distribute by category
+    category_counts = {}
+    for fen, cat in all_fens:
+        category_counts[cat] = category_counts.get(cat, 0) + 1
+    print("Endgame categories available:", list(category_counts.keys()))
+    
+    return positions
+
+
+def _create_position_variation(board):
+    """Create a slight variation of an endgame position by moving pieces."""
+    try:
+        new_board = board.copy()
+        
+        # Find pieces we can move
+        for square in chess.SQUARES:
+            piece = new_board.piece_at(square)
+            if piece and piece.piece_type in [chess.QUEEN, chess.ROOK]:
+                # Try to move this piece to an adjacent square
+                file, rank = chess.square_file(square), chess.square_rank(square)
+                
+                for df, dr in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    new_file, new_rank = file + df, rank + dr
+                    if 0 <= new_file < 8 and 0 <= new_rank < 8:
+                        new_square = chess.square(new_file, new_rank)
+                        if not new_board.piece_at(new_square):
+                            # Move the piece
+                            new_board.remove_piece_at(square)
+                            new_board.set_piece_at(new_square, piece)
+                            
+                            # Check if still valid
+                            if new_board.is_valid():
+                                return new_board
+                            else:
+                                # Revert
+                                new_board.set_piece_at(square, piece)
+                                new_board.remove_piece_at(new_square)
+        
+        return None
+    except:
+        return None
+
+
+def generate_self_play_games_from_endgame(model, device, num_games=50, use_mcts=True):
+    """Generate self-play games starting from endgame positions.
+    
+    This trains the model to actually finish games with checkmate
+    rather than just playing well in the opening/middlegame.
+    
+    Args:
+        model: Neural network model
+        device: Computation device
+        num_games: Number of games to generate
+        use_mcts: Whether to use MCTS for move selection
+        
+    Returns:
+        List of completed games (as chess.pgn.Game objects)
+    """
+    print(f"\n{'='*50}")
+    print("ENDGAME SELF-PLAY")
+    print(f"{'='*50}")
+    
+    # Get endgame starting positions
+    starting_positions = generate_endgame_starting_positions(num_games)
+    
+    if not starting_positions:
+        print("Failed to generate endgame positions, falling back to regular games")
+        return generate_self_play_games(model, device, num_games, use_mcts)
+    
+    games = []
+    input_channels = model.input_channels if hasattr(model, 'input_channels') else 22
+    
+    model.eval()
+    
+    for i, start_board in enumerate(starting_positions[:num_games]):
+        if i % 10 == 0:
+            print(f"Generating endgame game {i+1}/{min(num_games, len(starting_positions))}")
+        
+        try:
+            # Create game with starting position
+            game = chess.pgn.Game()
+            game.headers["Event"] = "Endgame Training"
+            game.headers["SetUp"] = "1"
+            game.headers["FEN"] = start_board.fen()
+            
+            board = start_board.copy()
+            node = game
+            moves_played = 0
+            max_moves = 50  # Endgames should be short
+            
+            while not board.is_game_over() and moves_played < max_moves:
+                legal_moves = list(board.legal_moves)
+                if not legal_moves:
+                    break
+                
+                # Get model's policy
+                input_tensor = torch.tensor(
+                    board_to_tensor(board, 1, input_channels),
+                    dtype=torch.float32
+                ).unsqueeze(0).to(device)
+                
+                with torch.no_grad():
+                    policy_logits, value_pred = model(input_tensor)
+                
+                # Select move based on policy
+                policy = F.softmax(policy_logits, dim=1).cpu().numpy()[0]
+                
+                move_probs = np.zeros(len(legal_moves))
+                for idx, move in enumerate(legal_moves):
+                    move_index = get_move_index(move)
+                    move_probs[idx] = policy[move_index]
+                
+                # Normalize
+                if np.sum(move_probs) <= 1e-10:
+                    move_probs = np.ones(len(legal_moves)) / len(legal_moves)
+                else:
+                    move_probs = move_probs / np.sum(move_probs)
+                
+                # Select move (mostly greedy in endgames)
+                if moves_played < 5:
+                    # Some exploration early
+                    selected_idx = np.random.choice(len(legal_moves), p=move_probs)
+                else:
+                    # Greedy later
+                    selected_idx = np.argmax(move_probs)
+                
+                move = legal_moves[selected_idx]
+                board.push(move)
+                node = node.add_variation(move)
+                moves_played += 1
+            
+            # Set result
+            if board.is_checkmate():
+                result = "1-0" if not board.turn else "0-1"
+            elif board.is_stalemate() or board.is_insufficient_material():
+                result = "1/2-1/2"
+            else:
+                result = "*"
+            
+            game.headers["Result"] = result
+            games.append(game)
+            
+            # Cleanup periodically
+            if i % 10 == 0:
+                clear_memory()
+                
+        except Exception as e:
+            print(f"Error in endgame game {i}: {e}")
+            continue
+    
+    # Count checkmates
+    checkmate_count = sum(1 for g in games if g.headers.get("Result") in ["1-0", "0-1"])
+    print(f"Generated {len(games)} endgame games, {checkmate_count} ended in checkmate ({100*checkmate_count/max(1,len(games)):.0f}%)")
+    
+    return games
+
+
 def generate_reinforcement_learning_samples(model, device, num_games=100, reward_shaping=True, 
                                            iteration=0, total_iterations=5):
     """Generate self-play games with reinforcement learning objectives.

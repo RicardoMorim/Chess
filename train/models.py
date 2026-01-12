@@ -101,14 +101,16 @@ class ChessNet(nn.Module):
     - Global average pooling in value head
     - Larger value head for better position evaluation
     - More residual blocks for the big model (15 instead of 10)
+    - Dropout for regularization (prevents overfitting)
     
     Architecture:
     - Input: Board representation (18 or 22 channels)
     - Body: Residual tower with SE blocks
-    - Policy head: Conv -> BN -> Flatten (4672 outputs for move encoding)
-    - Value head: Conv -> Global Pool -> FC -> tanh (scalar output)
+    - Policy head: Conv -> BN -> Dropout -> Flatten (4672 outputs for move encoding)
+    - Value head: Conv -> Global Pool -> FC -> Dropout -> FC -> tanh (scalar output)
     """
-    def __init__(self, num_blocks=15, channels=256, input_channels=22, use_se=True, legacy_mode=False):
+    def __init__(self, num_blocks=15, channels=256, input_channels=22, use_se=True, 
+                 legacy_mode=False, policy_dropout=0.1, value_dropout=0.3):
         super(ChessNet, self).__init__()
         self.input_channels = input_channels
         self.num_blocks = num_blocks
@@ -132,12 +134,14 @@ class ChessNet(nn.Module):
         # Policy head - outputs 73 planes (AlphaZero-style move encoding)
         self.policy_conv = nn.Conv2d(channels, 73, kernel_size=1, bias=False)
         self.policy_bn = nn.BatchNorm2d(73)
+        self.policy_dropout = nn.Dropout2d(p=policy_dropout)  # Spatial dropout for conv layers
         
         # Improved value head with global average pooling
         self.value_conv = nn.Conv2d(channels, 32, kernel_size=1, bias=False)  # More channels
         self.value_bn = nn.BatchNorm2d(32)
         # Global average pooling reduces 32x8x8 -> 32
         self.value_fc1 = nn.Linear(32, 128)
+        self.value_dropout = nn.Dropout(p=value_dropout)  # Dropout after FC layer
         self.value_fc2 = nn.Linear(128, 1)
 
     def forward(self, x):
@@ -148,18 +152,60 @@ class ChessNet(nn.Module):
         for block in self.blocks:
             x = block(x)
         
-        # Policy head
+        # Policy head with dropout
         policy = self.policy_conv(x)
         policy = self.policy_bn(policy)
+        policy = self.policy_dropout(policy)  # Apply spatial dropout
         policy = policy.view(-1, 73 * 8 * 8)  # 4672 outputs
         
-        # Value head with global average pooling
+        # Value head with global average pooling and dropout
         value = F.relu(self.value_bn(self.value_conv(x)))
         value = value.mean(dim=[2, 3])  # Global average pooling: (B, 32, 8, 8) -> (B, 32)
         value = F.relu(self.value_fc1(value))
+        value = self.value_dropout(value)  # Apply dropout
         value = torch.tanh(self.value_fc2(value))
         
         return policy, value
+    
+    def freeze_backbone(self):
+        """Freeze the residual tower for fine-tuning only the heads.
+        
+        This is useful when training on a small dataset (like puzzles) to prevent
+        overfitting. The pretrained backbone features are preserved while only
+        the policy and value heads are updated.
+        """
+        # Freeze initial convolution
+        self.conv1.requires_grad_(False)
+        self.bn1.requires_grad_(False)
+        
+        # Freeze all residual blocks
+        for block in self.blocks:
+            for param in block.parameters():
+                param.requires_grad = False
+        
+        print(f"🔒 Backbone frozen: {self.num_blocks} residual blocks + initial conv")
+        return self
+    
+    def unfreeze_backbone(self):
+        """Unfreeze the residual tower to allow full training."""
+        # Unfreeze initial convolution
+        self.conv1.requires_grad_(True)
+        self.bn1.requires_grad_(True)
+        
+        # Unfreeze all residual blocks
+        for block in self.blocks:
+            for param in block.parameters():
+                param.requires_grad = True
+        
+        print(f"🔓 Backbone unfrozen: all layers trainable")
+        return self
+    
+    def get_trainable_params(self):
+        """Get count of trainable vs frozen parameters."""
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.parameters())
+        frozen = total - trainable
+        return {"trainable": trainable, "frozen": frozen, "total": total}
     
     def is_small_model(self):
         """Check if this is the small model architecture"""
