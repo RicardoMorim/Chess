@@ -536,8 +536,13 @@ class SelfPlayDataset(Dataset):
                 # Note: Attack maps (channels 20-21) will be zeros - ideally regenerate from board
                 board_tensor = padded
         
+        if isinstance(policy_target, (int, np.integer)):
+            policy_tensor = torch.tensor(policy_target, dtype=torch.long)
+        else:
+            policy_tensor = torch.tensor(policy_target, dtype=torch.float32)
+
         return (torch.tensor(board_tensor, dtype=torch.float32),
-                torch.tensor(policy_target, dtype=torch.long),
+                policy_tensor,
                 torch.tensor(value_target, dtype=torch.float32))
 
 def load_puzzles(pgn_file):

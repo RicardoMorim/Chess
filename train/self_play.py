@@ -738,7 +738,8 @@ def generate_reinforcement_learning_samples(model, device, num_games=100, reward
                     board_histories[i], 
                     move_histories[i], 
                     result_value,
-                    reward_shaping
+                    reward_shaping=True,
+                    policy_history=policy_histories[i]
                 )
                 samples.extend(game_samples)
                 
@@ -901,7 +902,7 @@ def generate_reinforcement_learning_samples(model, device, num_games=100, reward
 
 
 
-def create_training_samples_from_game(board_history, move_history, final_result, reward_shaping=True):
+def create_training_samples_from_game(board_history, move_history, final_result, reward_shaping=True, policy_history=None):
     """Create training samples from a completed self-play game
     
     This function applies reward shaping to emphasize learning from checkmate sequences
@@ -919,6 +920,12 @@ def create_training_samples_from_game(board_history, move_history, final_result,
         
         # The move that was actually played
         move_idx = move_history[i]
+        
+        # Policy target: use full distribution if available, otherwise just the move index
+        if policy_history is not None and i < len(policy_history) and policy_history[i] is not None:
+            policy_target = policy_history[i]
+        else:
+            policy_target = move_idx
         
         # Calculate shaped reward based on position in game 
         if reward_shaping:
@@ -939,11 +946,20 @@ def create_training_samples_from_game(board_history, move_history, final_result,
             shaped_value = final_result
             
         # Flip value target for black's perspective
-        is_white_to_move = np.sum(board_tensor[17]) > 0  # Check the turn channel
+        # Need to handle both 22-channel (legacy) and 119-channel (AlphaZero) formats
+        if len(board_tensor.shape) == 3 and board_tensor.shape[0] > 100:
+            # AlphaZero format: channel 101 is side to move
+            is_white_to_move = np.mean(board_tensor[101]) > 0.5
+        elif len(board_tensor.shape) == 3:
+            # Legacy format: channel 17 is side to move
+            is_white_to_move = np.mean(board_tensor[17]) > 0.5
+        else:
+            is_white_to_move = True # Default
+            
         if not is_white_to_move:
             shaped_value = -shaped_value
         
-        samples.append((board_tensor, move_idx, shaped_value))
+        samples.append((board_tensor, policy_target, shaped_value))
     
     return samples
 
@@ -1763,7 +1779,6 @@ def generate_simple_mcts_game(model, device, temperature=1.0, num_simulations=50
     """Generate a self-play game using the simplified MCTS (faster for training)"""
     # Get half the available CPU cores
     parallel_workers = math.ceil(max(1, multiprocessing.cpu_count() // 1.5))
-    print(f"Using {parallel_workers} CPU cores for simple MCTS")
     input_channels = model.input_channels if hasattr(model, 'input_channels') else 20
     
     game = chess.pgn.Game()
@@ -1771,10 +1786,17 @@ def generate_simple_mcts_game(model, device, temperature=1.0, num_simulations=50
     node = game
     move_number = 1
     
+    # Track history for replay buffer
+    board_history = []
+    policy_history = []
+    
     # Apply early termination for very long games
     max_moves = 80  # Limit to reasonable game length
     
     while not board.is_game_over() and move_number <= max_moves:
+        # Keep track of board state for replay buffer
+        board_history.append(board_to_tensor(board, move_number, input_channels))
+        
         # Temperature annealing - reduce temperature as game progresses  
         if board.fullmove_number < 10:
             current_temp = temperature
@@ -1785,13 +1807,23 @@ def generate_simple_mcts_game(model, device, temperature=1.0, num_simulations=50
             
         # Select move using simplified MCTS
         try:
-            move, _ = simple_mcts_for_training(
+            move, probs = simple_mcts_for_training(
                 board, 
                 model, 
                 device,
                 num_simulations=num_simulations,  # Default is now 100
                 temperature=current_temp
             )
+            
+            # Store full policy vector
+            policy_full = np.zeros(4672, dtype=np.float32)
+            legal_moves = list(board.legal_moves)
+            for i, m in enumerate(legal_moves):
+                idx = get_move_index(m)
+                if idx < 4672:
+                    policy_full[idx] = probs[i]
+            policy_history.append(policy_full)
+            
         except Exception as e:
             print(f"MCTS error: {e}. Falling back to direct move selection.")
             # Fallback to direct move selection if MCTS fails
@@ -1803,15 +1835,26 @@ def generate_simple_mcts_game(model, device, temperature=1.0, num_simulations=50
             legal_moves = list(board.legal_moves)
             move_probs = np.zeros(len(legal_moves))
             
+            # Store full policy from network
+            policy_full = np.zeros(4672, dtype=np.float32)
+            
             for move_idx, move in enumerate(legal_moves):
                 move_index = get_move_index(move)
                 if move_index < len(policy):
                     move_probs[move_idx] = policy[move_index]
-                    
+            
+            # Normalize
             if np.sum(move_probs) <= 1e-10:
                 move_probs = np.ones(len(legal_moves)) / len(legal_moves)
             else:
                 move_probs = move_probs / np.sum(move_probs)
+            
+            # Populate policy vector for replay buffer
+            for i, m in enumerate(legal_moves):
+                idx = get_move_index(m)
+                if idx < 4672:
+                    policy_full[idx] = move_probs[i]
+            policy_history.append(policy_full)
                 
             move = np.random.choice(legal_moves, p=move_probs)
             
@@ -1829,12 +1872,34 @@ def generate_simple_mcts_game(model, device, temperature=1.0, num_simulations=50
     
     # Set result header based on game outcome
     if board.is_checkmate():
-        game.headers["Result"] = "0-1" if board.turn == chess.WHITE else "1-0"
+        res_str = "0-1" if board.turn == chess.WHITE else "1-0"
+        result_val = -1.0 if board.turn == chess.WHITE else 1.0
     elif board.is_stalemate() or board.is_insufficient_material():
-        game.headers["Result"] = "1/2-1/2"
+        res_str = "1/2-1/2"
+        result_val = 0.0
     elif board.is_fifty_moves() or board.is_repetition(3) or move_number > max_moves:
-        game.headers["Result"] = "1/2-1/2"
+        res_str = "1/2-1/2"
+        result_val = 0.0
     else:
-        game.headers["Result"] = "*"  # Unfinished
+        res_str = "*"  # Unfinished
+        result_val = 0.0
+        
+    game.headers["Result"] = res_str
+    
+    # Add to replay buffer
+    if len(board_history) > 5:
+        try:
+            replay_buffer = get_replay_buffer()
+            # Convert tensors to numpy if needed
+            board_np_list = []
+            for b_tensor in board_history:
+                if hasattr(b_tensor, 'cpu'):
+                    board_np_list.append(b_tensor.cpu().numpy())
+                else:
+                    board_np_list.append(b_tensor)
+            
+            replay_buffer.add_game(board_np_list, policy_history, result_val)
+        except Exception as e:
+            print(f"Failed to add fast MCTS game to replay buffer: {e}")
         
     return game
