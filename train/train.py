@@ -12,9 +12,10 @@ import argparse
 
 
 from models import ChessNet, create_chess_model, load_model_with_compatibility
-from data import (ChessDataset, PuzzleDataset, CurriculumPuzzleDataset, load_puzzles, 
-                 load_lichess_puzzles, filter_and_prioritize_puzzles_cached, 
+from data import (ChessDataset, PuzzleDataset, CurriculumPuzzleDataset, CachedChessDataset,
+                 load_puzzles, load_lichess_puzzles, filter_and_prioritize_puzzles_cached, 
                  load_professional_games, load_games_in_batches, expand_mate_sequences)
+
 from utils import clear_memory, test_tactical_recognition, get_optimal_batch_size, model_summary
 from self_play import generate_self_play_games, run_self_play_training, generate_self_play_games_from_endgame
 from training import train_batch, train_tactical
@@ -642,7 +643,16 @@ def main():
             print(f"Processing professional batch with {batch_size} games")
             
             # Create dataset and dataloader for this batch only
-            game_dataset = ChessDataset(pro_games, augment=True, model_type=model_type)
+            # Use CachedChessDataset for alphazero model (much faster after first run)
+            if args.model == "alphazero":
+                game_dataset = CachedChessDataset(
+                    pro_games, 
+                    model_type="alphazero",
+                    cache_name=f"pro_{batch_size}_{pro_game_count}"
+                )
+            else:
+                game_dataset = ChessDataset(pro_games, augment=True, model_type=model_type)
+
             
             if HAS_OPTIMIZATIONS:
                 game_dataloader = create_optimized_dataloader(
@@ -718,7 +728,16 @@ def main():
             print(f"Processing regular batch with {batch_size} games")
             
             # Create dataset and dataloader for this batch only
-            game_dataset = ChessDataset(regular_games, augment=True)
+            # Use CachedChessDataset for alphazero model (much faster after first run)
+            if args.model == "alphazero":
+                game_dataset = CachedChessDataset(
+                    regular_games, 
+                    model_type="alphazero",
+                    cache_name=f"regular_{batch_size}_{processed_games}"
+                )
+            else:
+                game_dataset = ChessDataset(regular_games, augment=True, model_type=model_type)
+
             
             if HAS_OPTIMIZATIONS:
                 game_dataloader = create_optimized_dataloader(

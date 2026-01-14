@@ -362,16 +362,22 @@ def create_chess_model(model_type="big", use_se=True, legacy=False):
     """Create a chess model based on the specified type.
     
     Args:
-        model_type: 'big', 'small', 'medium', or 'limited'
+        model_type: 'alphazero', 'big', 'small', 'medium', or 'limited'
         use_se: Whether to use Squeeze-and-Excitation blocks (recommended)
         legacy: If True, create legacy model for loading old checkpoints
     
     Model configurations:
+    - alphazero: 19 blocks, 256 channels, 119 inputs (AlphaZero-style with history)
     - limited: 4 blocks, 64 channels, 18 inputs (for 2GB VRAM GPUs)
     - small: 6 blocks, 256 channels, 18 inputs (fast, for testing)
     - medium: 10 blocks, 256 channels, 20 inputs (balanced)
-    - big: 15 blocks, 256 channels, 22 inputs (best quality)
+    - big: 15 blocks, 256 channels, 22 inputs (attack maps)
     """
+    # AlphaZero-style model (new architecture with position history)
+    if model_type.lower() == "alphazero":
+        from alphazero_model import AlphaZeroNet
+        return AlphaZeroNet(num_blocks=19, channels=256, use_se=use_se)
+    
     if model_type.lower() == "limited":
         # Special memory-efficient model for low VRAM GPUs
         return LimitedChessNet(num_blocks=4, channels=64, input_channels=18)
@@ -390,6 +396,7 @@ def create_chess_model(model_type="big", use_se=True, legacy=False):
         return ChessNet(num_blocks=10, channels=256, input_channels=20, use_se=use_se)
     else:  # big
         return ChessNet(num_blocks=15, channels=256, input_channels=22, use_se=use_se)
+
 
 
 def load_model_with_compatibility(model_path, device='cuda', prefer_new=True):
