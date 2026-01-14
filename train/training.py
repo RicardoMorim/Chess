@@ -492,3 +492,167 @@ def train_on_self_play(model, samples, device, optimizer=None, epochs=3,
     return total_loss / batch_count if batch_count > 0 else 0
 
 
+# ============================================================================
+# REPLAY BUFFER TRAINING (AlphaZero-style)
+# ============================================================================
+
+def train_on_replay_buffer(model, optimizer, device, batch_size=64, 
+                           num_batches=100, grad_clip=1.0, verbose=True):
+    """Train the model on samples from the self-play replay buffer.
+    
+    This function implements AlphaZero-style training where:
+    - Board positions come from self-play games
+    - Policy targets are MCTS visit count distributions (soft targets)
+    - Value targets are game outcomes
+    
+    Args:
+        model: The neural network model
+        optimizer: The optimizer
+        device: Computation device
+        batch_size: Batch size for training
+        num_batches: Number of batches to train on
+        grad_clip: Gradient clipping threshold
+        verbose: Whether to print progress
+        
+    Returns:
+        Dictionary with training statistics
+    """
+    # Import here to avoid circular dependency
+    from self_play import get_replay_buffer, REPLAY_BUFFER_CONFIG
+    
+    replay_buffer = get_replay_buffer()
+    
+    if not replay_buffer.is_ready():
+        if verbose:
+            print(f"Replay buffer not ready yet ({len(replay_buffer)} positions, "
+                  f"need {REPLAY_BUFFER_CONFIG['min_positions_for_training']})")
+        return {'loss': 0, 'policy_loss': 0, 'value_loss': 0, 'batches': 0}
+    
+    if verbose:
+        stats = replay_buffer.get_stats()
+        print(f"\n=== Training on Replay Buffer ===")
+        print(f"  Positions: {stats['positions']:,}")
+        print(f"  Games: {stats['games']:,}")
+        print(f"  Batches: {num_batches}, Batch size: {batch_size}")
+    
+    # Loss functions
+    policy_loss_fn = PolicyLoss()  # Handles soft targets via KL divergence
+    value_loss_fn = ValueLoss(use_huber=True)
+    
+    # Mixed precision if available
+    scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+    use_amp = scaler is not None
+    
+    model.train()
+    
+    total_loss = 0
+    total_policy_loss = 0
+    total_value_loss = 0
+    
+    for batch_idx in range(num_batches):
+        # Sample from replay buffer
+        boards, policies, values = replay_buffer.sample_as_tensors(batch_size, device)
+        
+        if boards is None:
+            continue
+        
+        optimizer.zero_grad()
+        
+        # Forward pass with optional mixed precision
+        if use_amp:
+            with torch.cuda.amp.autocast():
+                policy_logits, value_pred = model(boards)
+                policy_loss = policy_loss_fn(policy_logits, policies)
+                value_loss = value_loss_fn(value_pred, values)
+                loss = policy_loss + value_loss
+            
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            policy_logits, value_pred = model(boards)
+            policy_loss = policy_loss_fn(policy_logits, policies)
+            value_loss = value_loss_fn(value_pred, values)
+            loss = policy_loss + value_loss
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+        
+        total_loss += loss.item()
+        total_policy_loss += policy_loss.item()
+        total_value_loss += value_loss.item()
+        
+        # Progress update
+        if verbose and (batch_idx + 1) % 20 == 0:
+            avg_loss = total_loss / (batch_idx + 1)
+            print(f"  Batch {batch_idx + 1}/{num_batches}: Loss={avg_loss:.4f}")
+    
+    # Calculate averages
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0
+    avg_policy_loss = total_policy_loss / num_batches if num_batches > 0 else 0
+    avg_value_loss = total_value_loss / num_batches if num_batches > 0 else 0
+    
+    if verbose:
+        print(f"  Average Loss: {avg_loss:.4f} (policy: {avg_policy_loss:.4f}, value: {avg_value_loss:.4f})")
+    
+    return {
+        'loss': avg_loss,
+        'policy_loss': avg_policy_loss,
+        'value_loss': avg_value_loss,
+        'batches': num_batches
+    }
+
+
+def mixed_training_step(model, game_dataloader, puzzle_dataloader, device,
+                        optimizer, replay_ratio=0.3, verbose=True):
+    """Perform a mixed training step: supervised data + replay buffer.
+    
+    This implements the hybrid approach where we train on:
+    - Supervised data (game/puzzle batches) 
+    - Self-play data from replay buffer (MCTS policy targets)
+    
+    Args:
+        model: The neural network
+        game_dataloader: DataLoader for supervised game data
+        puzzle_dataloader: DataLoader for puzzle data
+        device: Computation device
+        optimizer: The optimizer
+        replay_ratio: Fraction of training that should use replay buffer (0-1)
+        verbose: Print progress
+        
+    Returns:
+        Dictionary with training statistics
+    """
+    from self_play import get_replay_buffer
+    
+    replay_buffer = get_replay_buffer()
+    
+    # Calculate how many replay batches to do based on game batches
+    num_game_batches = len(game_dataloader)
+    num_replay_batches = int(num_game_batches * replay_ratio)
+    
+    stats = {
+        'supervised_loss': 0,
+        'replay_loss': 0,
+        'supervised_batches': 0,
+        'replay_batches': 0
+    }
+    
+    # Train on replay buffer if ready
+    if replay_buffer.is_ready() and num_replay_batches > 0:
+        if verbose:
+            print(f"\nMixed Training: {num_game_batches} supervised + {num_replay_batches} replay batches")
+        
+        replay_stats = train_on_replay_buffer(
+            model, optimizer, device,
+            batch_size=64,
+            num_batches=num_replay_batches,
+            verbose=verbose
+        )
+        stats['replay_loss'] = replay_stats['loss']
+        stats['replay_batches'] = replay_stats['batches']
+    
+    return stats

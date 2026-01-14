@@ -20,33 +20,319 @@ from utils import get_optimal_batch_size, clear_memory
 
 
 # ============================================================================
-# SELF-PLAY CONFIGURATION
+# SELF-PLAY CONFIGURATION (AlphaZero-inspired improvements)
 # ============================================================================
 SELF_PLAY_CONFIG = {
-    # MCTS settings for self-play
-    'num_simulations': 200,       # Simulations per move (was 10, now much higher)
-    'fast_simulations': 50,       # Simulations for fast mode
+    # MCTS settings for self-play (increased for higher quality)
+    'num_simulations': 400,       # Simulations per move (AlphaZero uses 800)
+    'fast_simulations': 100,      # Simulations for fast mode
     
-    # Temperature schedule
-    'temp_initial': 1.0,          # Temperature for first N moves
+    # Temperature schedule (exploration vs exploitation)
+    'temp_initial': 1.0,          # Temperature for first N moves (explore)
     'temp_mid': 0.5,              # Temperature for mid-game
-    'temp_final': 0.1,            # Temperature for late game
+    'temp_final': 0.1,            # Temperature for late game (exploit)
     'temp_move_threshold_1': 15,  # Moves before reducing temp
     'temp_move_threshold_2': 30,  # Moves before final temp
     
-    # Exploration
-    'dirichlet_alpha': 0.3,       # Dirichlet noise alpha
+    # Exploration (Dirichlet noise at root)
+    'dirichlet_alpha': 0.3,       # Dirichlet noise alpha (0.3 for chess)
     'dirichlet_weight': 0.25,     # Weight of noise at root
     
     # Game limits
     'max_moves': 200,             # Maximum moves per game
     'min_game_length': 10,        # Minimum game length to use
+    'games_per_iteration': 100,   # Games per self-play iteration (increased)
     
     # Reward shaping
     'use_reward_shaping': True,   # Apply reward shaping
     'discount_factor': 0.99,      # Gamma for reward discounting
+    
+    # MCTS Policy Training (NEW - AlphaZero style)
+    'use_mcts_policy_targets': True,  # Train on MCTS visit distributions
+    'policy_temperature': 1.0,        # Temperature for policy targets
 }
 
+# ============================================================================
+# REPLAY BUFFER CONFIGURATION
+# ============================================================================
+REPLAY_BUFFER_CONFIG = {
+    'max_positions': 500000,      # Max positions to store
+    'max_games': 5000,            # Max games to store history
+    'sample_recent_weight': 0.7,  # Weight for sampling recent games (vs uniform)
+    'min_positions_for_training': 10000,  # Min positions before using buffer
+}
+
+
+# ============================================================================
+# SELF-PLAY REPLAY BUFFER (AlphaZero-style experience replay)
+# ============================================================================
+
+class SelfPlayReplayBuffer:
+    """Stores self-play experience for training with MCTS policy targets.
+    
+    This buffer stores positions from self-play games along with:
+    - MCTS visit count distributions (policy targets)
+    - Game outcomes (value targets)
+    
+    Key features:
+    - Memory-efficient storage with numpy arrays
+    - Prioritized sampling (recent games weighted higher)
+    - Automatic trimming when buffer is full
+    - Support for both tensor and numpy formats
+    
+    Usage:
+        buffer = SelfPlayReplayBuffer(max_positions=500000)
+        
+        # Add games as they complete
+        buffer.add_game(board_tensors, mcts_policies, game_result)
+        
+        # Sample for training
+        batch = buffer.sample(batch_size=256)
+    """
+    
+    def __init__(
+        self, 
+        max_positions: int = 500000,
+        max_games: int = 5000,
+        sample_recent_weight: float = 0.7
+    ):
+        """Initialize replay buffer.
+        
+        Args:
+            max_positions: Maximum positions to store
+            max_games: Maximum games to track (for recency weighting)
+            sample_recent_weight: Weight for recent games when sampling (0-1)
+        """
+        self.max_positions = max_positions
+        self.max_games = max_games
+        self.sample_recent_weight = sample_recent_weight
+        
+        # Storage (will grow dynamically up to max)
+        self.positions = []      # Board tensors (numpy arrays)
+        self.policies = []       # MCTS visit distributions (numpy arrays)
+        self.values = []         # Game outcomes (floats)
+        self.game_indices = []   # Which game each position belongs to
+        
+        # Game tracking
+        self.current_game_id = 0
+        self.game_count = 0
+        
+        # Statistics
+        self.total_positions_added = 0
+        self.total_games_added = 0
+    
+    def add_game(
+        self, 
+        board_tensors: list, 
+        mcts_policies: list, 
+        game_result: float,
+        from_perspective: list = None
+    ) -> None:
+        """Add a completed self-play game to the buffer.
+        
+        Args:
+            board_tensors: List of board state tensors (numpy or torch)
+            mcts_policies: List of MCTS visit distributions (4672-dim each)
+            game_result: Final result from white's perspective (+1, -1, or 0)
+            from_perspective: Optional list of booleans (True = white's turn)
+        """
+        if len(board_tensors) != len(mcts_policies):
+            raise ValueError("board_tensors and mcts_policies must have same length")
+        
+        if len(board_tensors) < SELF_PLAY_CONFIG['min_game_length']:
+            return  # Skip very short games
+        
+        # Convert values to per-position (flip for black's perspective)
+        for i in range(len(board_tensors)):
+            # Determine perspective
+            if from_perspective is not None:
+                is_white = from_perspective[i]
+            else:
+                # Infer from board tensor (channel 17 or 101 is side to move)
+                board = board_tensors[i]
+                if len(board.shape) == 3:
+                    # Check channel 17 (legacy) or 101 (alphazero)
+                    if board.shape[0] > 100:
+                        is_white = np.mean(board[101]) > 0.5
+                    else:
+                        is_white = np.mean(board[17]) > 0.5
+                else:
+                    is_white = True  # Default
+            
+            # Value from this position's perspective
+            value = game_result if is_white else -game_result
+            
+            # Convert to numpy if needed
+            if hasattr(board_tensors[i], 'numpy'):
+                board_np = board_tensors[i].numpy()
+            else:
+                board_np = np.array(board_tensors[i], dtype=np.float32)
+            
+            if hasattr(mcts_policies[i], 'numpy'):
+                policy_np = mcts_policies[i].numpy()
+            else:
+                policy_np = np.array(mcts_policies[i], dtype=np.float32)
+            
+            # Add to buffer
+            self.positions.append(board_np)
+            self.policies.append(policy_np)
+            self.values.append(float(value))
+            self.game_indices.append(self.current_game_id)
+        
+        self.current_game_id += 1
+        self.game_count += 1
+        self.total_positions_added += len(board_tensors)
+        self.total_games_added += 1
+        
+        # Trim if over capacity
+        self._trim_if_needed()
+    
+    def _trim_if_needed(self) -> None:
+        """Remove oldest positions if buffer exceeds max size."""
+        if len(self.positions) > self.max_positions:
+            # Remove oldest positions (FIFO)
+            trim_count = len(self.positions) - self.max_positions
+            self.positions = self.positions[trim_count:]
+            self.policies = self.policies[trim_count:]
+            self.values = self.values[trim_count:]
+            self.game_indices = self.game_indices[trim_count:]
+    
+    def sample(self, batch_size: int) -> tuple:
+        """Sample a batch of experiences from the buffer.
+        
+        Uses prioritized sampling: recent games are sampled more often
+        to help the model learn from its latest self-play.
+        
+        Args:
+            batch_size: Number of samples to return
+            
+        Returns:
+            Tuple of (board_tensors, policy_targets, value_targets)
+            Each as numpy arrays suitable for training
+        """
+        if len(self.positions) == 0:
+            return None, None, None
+        
+        batch_size = min(batch_size, len(self.positions))
+        
+        # Prioritized sampling based on recency
+        if self.sample_recent_weight > 0 and len(set(self.game_indices)) > 1:
+            # Calculate weights based on game recency
+            max_game_id = max(self.game_indices)
+            min_game_id = min(self.game_indices)
+            game_range = max(1, max_game_id - min_game_id)
+            
+            weights = np.array([
+                self.sample_recent_weight * (gid - min_game_id) / game_range + 
+                (1 - self.sample_recent_weight)
+                for gid in self.game_indices
+            ])
+            weights = weights / weights.sum()
+            
+            indices = np.random.choice(
+                len(self.positions), 
+                size=batch_size, 
+                replace=False,
+                p=weights
+            )
+        else:
+            # Uniform sampling
+            indices = np.random.choice(
+                len(self.positions), 
+                size=batch_size, 
+                replace=False
+            )
+        
+        # Gather batch
+        boards = np.stack([self.positions[i] for i in indices])
+        policies = np.stack([self.policies[i] for i in indices])
+        values = np.array([self.values[i] for i in indices], dtype=np.float32)
+        
+        return boards, policies, values
+    
+    def sample_as_tensors(self, batch_size: int, device: str = 'cuda') -> tuple:
+        """Sample and return as PyTorch tensors.
+        
+        Args:
+            batch_size: Number of samples
+            device: Device to place tensors on
+            
+        Returns:
+            Tuple of (board_tensors, policy_targets, value_targets) as torch Tensors
+        """
+        boards, policies, values = self.sample(batch_size)
+        
+        if boards is None:
+            return None, None, None
+        
+        import torch
+        return (
+            torch.from_numpy(boards).to(device),
+            torch.from_numpy(policies).to(device),
+            torch.from_numpy(values).to(device)
+        )
+    
+    def __len__(self) -> int:
+        """Return number of positions in buffer."""
+        return len(self.positions)
+    
+    def is_ready(self) -> bool:
+        """Check if buffer has enough data for training."""
+        return len(self.positions) >= REPLAY_BUFFER_CONFIG['min_positions_for_training']
+    
+    def get_stats(self) -> dict:
+        """Get buffer statistics."""
+        return {
+            'positions': len(self.positions),
+            'games': len(set(self.game_indices)),
+            'total_positions_added': self.total_positions_added,
+            'total_games_added': self.total_games_added,
+            'capacity_used': len(self.positions) / self.max_positions * 100,
+        }
+    
+    def save(self, filepath: str) -> None:
+        """Save buffer to disk."""
+        import pickle
+        data = {
+            'positions': self.positions,
+            'policies': self.policies,
+            'values': self.values,
+            'game_indices': self.game_indices,
+            'current_game_id': self.current_game_id,
+            'stats': self.get_stats(),
+        }
+        with open(filepath, 'wb') as f:
+            pickle.dump(data, f)
+        print(f"Saved replay buffer: {len(self.positions)} positions to {filepath}")
+    
+    def load(self, filepath: str) -> None:
+        """Load buffer from disk."""
+        import pickle
+        with open(filepath, 'rb') as f:
+            data = pickle.load(f)
+        
+        self.positions = data['positions']
+        self.policies = data['policies']
+        self.values = data['values']
+        self.game_indices = data['game_indices']
+        self.current_game_id = data.get('current_game_id', max(self.game_indices) + 1)
+        
+        print(f"Loaded replay buffer: {len(self.positions)} positions from {filepath}")
+
+
+# Global replay buffer instance (can be shared across training)
+_global_replay_buffer = None
+
+def get_replay_buffer() -> SelfPlayReplayBuffer:
+    """Get or create the global replay buffer."""
+    global _global_replay_buffer
+    if _global_replay_buffer is None:
+        _global_replay_buffer = SelfPlayReplayBuffer(
+            max_positions=REPLAY_BUFFER_CONFIG['max_positions'],
+            max_games=REPLAY_BUFFER_CONFIG['max_games'],
+            sample_recent_weight=REPLAY_BUFFER_CONFIG['sample_recent_weight']
+        )
+    return _global_replay_buffer
 
 # ============================================================================
 # ENDGAME POSITION GENERATOR
@@ -541,6 +827,20 @@ def generate_reinforcement_learning_samples(model, device, num_games=100, reward
             # Store current position for later training
             board_histories[i].append(board_to_tensor(board, move_numbers[i], input_channels))
             
+            # ==================================================================
+            # ALPHAZERO-STYLE: Store MCTS visit distribution as policy target
+            # ==================================================================
+            if SELF_PLAY_CONFIG.get('use_mcts_policy_targets', True):
+                # Create full 4672-dim policy vector from visit counts
+                mcts_policy_full = np.zeros(4672, dtype=np.float32)
+                for move_idx, m in enumerate(legal_moves):
+                    move_index = get_move_index(m)
+                    mcts_policy_full[move_index] = visit_policy[move_idx]
+                policy_histories[i].append(mcts_policy_full)
+            else:
+                # Legacy: just store the selected move index
+                policy_histories[i].append(None)
+            
             # Select move - early in training, explore more. Later, be more greedy.
             exploration_threshold = 0.8 + 0.1 * (1 - progress_factor)  # Decreases from 0.9 to 0.8 over time
             
@@ -551,7 +851,7 @@ def generate_reinforcement_learning_samples(model, device, num_games=100, reward
                 selected_idx = np.random.choice(len(legal_moves), p=visit_policy)
                 move = legal_moves[selected_idx]
             
-            # Store selected move
+            # Store selected move (for backwards compatibility)
             move_histories[i].append(get_move_index(move))
             
             # Make the move
@@ -563,8 +863,42 @@ def generate_reinforcement_learning_samples(model, device, num_games=100, reward
         if completed_games > 0 and completed_games % 10 == 0:
             print(f"Completed {completed_games}/{num_games} self-play games")
     
+    # ==================================================================
+    # Add completed games to replay buffer
+    # ==================================================================
+    if SELF_PLAY_CONFIG.get('use_mcts_policy_targets', True):
+        replay_buffer = get_replay_buffer()
+        games_added = 0
+        
+        # Process any remaining active games
+        for i in range(batch_size):
+            if board_histories[i] and policy_histories[i]:
+                # Determine game result
+                board = active_games[i]
+                if board.is_checkmate():
+                    result = 1.0 if not board.turn else -1.0
+                elif board.is_stalemate() or board.is_insufficient_material():
+                    result = 0.0
+                else:
+                    result = 0.0  # Unfinished/draw
+                
+                # Add to replay buffer
+                if policy_histories[i] and all(p is not None for p in policy_histories[i]):
+                    replay_buffer.add_game(
+                        board_histories[i],
+                        policy_histories[i],
+                        result
+                    )
+                    games_added += 1
+        
+        if games_added > 0:
+            stats = replay_buffer.get_stats()
+            print(f"  Added {games_added} games to replay buffer "
+                  f"({stats['positions']} total positions, {stats['capacity_used']:.1f}% full)")
+    
     print(f"Generated {len(samples)} training samples from {completed_games} games")
     return samples
+
 
 
 def create_training_samples_from_game(board_history, move_history, final_result, reward_shaping=True):
@@ -1244,11 +1578,55 @@ def run_self_play_training(model, device, save_path, state_file, puzzle_dataload
                 if batch_count > 0:
                     print(f"Average tactical loss: {total_loss/batch_count:.4f}")
         
+    # ==================================================================
+    # TRAIN ON REPLAY BUFFER (AlphaZero-style MCTS policy targets)
+    # ==================================================================
+    replay_buffer = get_replay_buffer()
+    
+    if replay_buffer.is_ready():
+        print(f"\n=== REPLAY BUFFER TRAINING (AlphaZero-style) ===")
+        stats = replay_buffer.get_stats()
+        print(f"Buffer contents: {stats['positions']:,} positions from {stats['games']} games")
+        
+        # Import and run replay buffer training
+        from training import train_on_replay_buffer
+        
+        # Train on replay buffer samples
+        # More batches for larger buffers
+        num_replay_batches = min(200, len(replay_buffer) // batch_size)
+        
+        if num_replay_batches > 10:
+            replay_stats = train_on_replay_buffer(
+                model, optimizer, device,
+                batch_size=batch_size,
+                num_batches=num_replay_batches,
+                verbose=True
+            )
+            
+            print(f"Replay buffer training complete:")
+            print(f"  Loss: {replay_stats['loss']:.4f}")
+            print(f"  Policy: {replay_stats['policy_loss']:.4f}")
+            print(f"  Value: {replay_stats['value_loss']:.4f}")
+        
+        # Save replay buffer periodically
+        buffer_save_path = save_path.replace('.pth', '_replay_buffer.pkl')
+        if os.path.exists(os.path.dirname(buffer_save_path) or '.'):
+            replay_buffer.save(buffer_save_path)
+    else:
+        print(f"\nReplay buffer building: {len(replay_buffer)} positions "
+              f"(need {REPLAY_BUFFER_CONFIG['min_positions_for_training']} for training)")
     
     print(f"\n=== SELF-PLAY TRAINING COMPLETED ===")
     print(f"Processed {total_positions} positions across {num_iterations} iterations")
     print(f"Best tactical accuracy: {best_accuracy:.2%}")
+    
+    # Print final replay buffer status
+    if len(replay_buffer) > 0:
+        stats = replay_buffer.get_stats()
+        print(f"Replay buffer: {stats['positions']:,} positions ({stats['capacity_used']:.1f}% full)")
+    
     return model
+
 
 
 
