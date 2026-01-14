@@ -606,11 +606,13 @@ def load_puzzles(pgn_file):
     print(f"Loaded {len(puzzles)} puzzles from PGN")
     return puzzles
 
-def load_lichess_puzzles(csv_file):
+def load_lichess_puzzles(csv_file, cache_dir="./cache"):
     """Load puzzles from Lichess CSV file with category extraction.
     
     Extracts puzzle type from the 'Themes' column.
     Lichess themes include: mateIn1, mateIn2, fork, pin, skewer, etc.
+    
+    Uses file-based caching to skip CSV parsing on subsequent runs.
     
     Returns:
         List of tuples. For mate puzzles, returns 5-tuple:
@@ -618,6 +620,25 @@ def load_lichess_puzzles(csv_file):
         For non-mate puzzles, returns 4-tuple:
         (fen, move_uci, value_target, category)
     """
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # Generate cache key based on file path and modification time
+    file_stat = os.stat(csv_file)
+    file_hash = hashlib.md5(f"{csv_file}_{file_stat.st_size}_{file_stat.st_mtime}".encode()).hexdigest()[:12]
+    cache_file = os.path.join(cache_dir, f"lichess_puzzles_{file_hash}.pkl")
+    
+    # Try loading from cache
+    if os.path.exists(cache_file):
+        try:
+            print(f"Loading Lichess puzzles from cache...")
+            with open(cache_file, 'rb') as f:
+                puzzles = pickle.load(f)
+            print(f"Loaded {len(puzzles)} Lichess puzzles from cache (instant!)")
+            return puzzles
+        except Exception as e:
+            print(f"Cache error: {e}, rebuilding...")
+    
+    print(f"Parsing Lichess CSV (first time, will cache)...")
     puzzles = []
     category_counts = {}
     
@@ -698,10 +719,18 @@ def load_lichess_puzzles(csv_file):
     for cat, count in sorted(category_counts.items(), key=lambda x: -x[1])[:10]:
         print(f"  {cat}: {count}")
     
+    # Save to cache for next time
+    try:
+        with open(cache_file, 'wb') as f:
+            pickle.dump(puzzles, f)
+        print(f"Cached Lichess puzzles to {cache_file}")
+    except Exception as e:
+        print(f"Warning: Could not cache puzzles: {e}")
+    
     return puzzles
 
 
-def expand_mate_sequences(puzzles, max_expand_depth=4):
+def expand_mate_sequences(puzzles, max_expand_depth=4, cache_dir="./cache"):
     """Expand mate-in-N puzzles to include all intermediate positions.
     
     This is crucial for teaching checkmate patterns because the model needs
@@ -716,13 +745,34 @@ def expand_mate_sequences(puzzles, max_expand_depth=4):
     - Two moves before: 0.95
     - Three moves before: 0.92
     
+    Uses caching to avoid re-expanding on every startup.
+    
     Args:
         puzzles: List of puzzle tuples (some may be 5-tuples with full move sequences)
         max_expand_depth: Maximum number of positions to expand per puzzle
+        cache_dir: Directory for cache files
         
     Returns:
         List of expanded puzzle tuples (fen, move_uci, value_target, category)
     """
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # Generate cache key based on puzzle count and content hash
+    puzzle_hash = hashlib.md5(str(len(puzzles)).encode() + str(puzzles[:10]).encode()).hexdigest()[:12]
+    cache_file = os.path.join(cache_dir, f"expanded_mates_{puzzle_hash}.pkl")
+    
+    # Try loading from cache
+    if os.path.exists(cache_file):
+        try:
+            print(f"Loading expanded mate sequences from cache...")
+            with open(cache_file, 'rb') as f:
+                expanded = pickle.load(f)
+            print(f"Loaded {len(expanded)} expanded puzzles from cache (instant!)")
+            return expanded
+        except Exception as e:
+            print(f"Cache error: {e}, rebuilding...")
+    
+    print(f"Expanding mate sequences (first time, will cache)...")
     expanded = []
     expanded_count = 0
     
@@ -812,6 +862,14 @@ def expand_mate_sequences(puzzles, max_expand_depth=4):
                 expanded.append((fen, move_uci, value_target, "other"))
     
     print(f"Mate sequence expansion: {len(puzzles)} puzzles → {len(expanded)} samples (+{expanded_count} intermediate positions)")
+    
+    # Save to cache for next time
+    try:
+        with open(cache_file, 'wb') as f:
+            pickle.dump(expanded, f)
+        print(f"Cached expanded puzzles to {cache_file}")
+    except Exception as e:
+        print(f"Warning: Could not cache expanded puzzles: {e}")
     
     return expanded
 

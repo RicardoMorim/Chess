@@ -324,11 +324,20 @@ def train_batch(model, game_dataloader, puzzle_dataloader, save_path, state_file
 # ============================================================================
 # TACTICAL TRAINING
 # ============================================================================
-def train_tactical(model, optimizer, dataloader, device, epochs=3, grad_clip=1.0):
+def train_tactical(model, optimizer, dataloader, device, epochs=3, grad_clip=1.0, ema=None):
     """Train on tactical puzzles with category-based weighting.
     
     Tactical puzzles are crucial for chess strength - they teach the model
     to recognize patterns like forks, pins, and checkmates.
+    
+    Args:
+        model: The neural network
+        optimizer: The optimizer
+        dataloader: DataLoader for tactical puzzles
+        device: Computation device
+        epochs: Number of training epochs
+        grad_clip: Gradient clipping threshold
+        ema: Optional EMA instance to update after each step
     """
     policy_loss_fn = PolicyLoss()
     value_loss_fn = ValueLoss(use_huber=True)
@@ -391,6 +400,10 @@ def train_tactical(model, optimizer, dataloader, device, epochs=3, grad_clip=1.0
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
+            
+            # Update EMA if provided
+            if ema is not None:
+                ema.update()
             
             total_loss += loss.item()
             batch_count += 1

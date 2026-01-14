@@ -343,7 +343,9 @@ Starting...
     
     # Setup paths
     checkpoint_dir = f"./checkpoints_{args.model}"
+    backup_dir = f"{checkpoint_dir}/backups"
     os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(backup_dir, exist_ok=True)
     checkpoint_path = f"{checkpoint_dir}/model_best.pt"
     state_file = f"{checkpoint_dir}/stockfish_training_state.json"
     
@@ -356,6 +358,20 @@ Starting...
     if os.path.exists(checkpoint_path):
         print(f"✓ Loading checkpoint: {checkpoint_path}")
         model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        
+        # Create backup before starting new training session
+        backup_name = f"model_backup_{time.strftime('%Y%m%d_%H%M%S')}.pt"
+        backup_path = f"{backup_dir}/{backup_name}"
+        import shutil
+        shutil.copy2(checkpoint_path, backup_path)
+        print(f"📦 Created backup: {backup_path}")
+        
+        # Cleanup old backups (keep last 5)
+        backups = sorted([f for f in os.listdir(backup_dir) if f.startswith('model_backup_')])
+        while len(backups) > 5:
+            old_backup = backups.pop(0)
+            os.remove(f"{backup_dir}/{old_backup}")
+            print(f"   Removed old backup: {old_backup}")
         
         if os.path.exists(state_file):
             with open(state_file, 'r') as f:
@@ -541,8 +557,9 @@ Starting...
 
                     if tact_acc > best_tactical_accuracy:
                         best_tactical_accuracy = tact_acc
-                        torch.save(model.state_dict(), f"{checkpoint_dir}/model_stockfish_best.pt")
-                        print(f"✓ New best: {tact_acc:.2%}")
+                        # Save best model to main checkpoint (not separate file)
+                        torch.save(model.state_dict(), checkpoint_path)
+                        print(f"⭐ New best tactical accuracy: {tact_acc:.2%} - saved to {checkpoint_path}")
 
                     all_samples = []
                     gc.collect()
@@ -676,8 +693,9 @@ Starting...
 
                     if tact_acc > best_tactical_accuracy:
                         best_tactical_accuracy = tact_acc
-                        torch.save(model.state_dict(), f"{checkpoint_dir}/model_stockfish_best.pt")
-                        print(f"✓ New best: {tact_acc:.2%}")
+                        # Save best model to main checkpoint (not separate file)
+                        torch.save(model.state_dict(), checkpoint_path)
+                        print(f"⭐ New best tactical accuracy: {tact_acc:.2%} - saved to {checkpoint_path}")
 
                     all_samples = []
                     gc.collect()

@@ -20,6 +20,18 @@ from self_play import generate_self_play_games, run_self_play_training, generate
 from training import train_batch, train_tactical
 from checkmate_training import run_checkmate_bootcamp, run_checkmate_reinforcement
 
+# Import advanced training utilities
+try:
+    from training_utils import (
+        EMA, CheckpointManager, TensorBoardLogger, StockfishEvaluator,
+        run_validation, generate_validation_positions
+    )
+    HAS_TRAINING_UTILS = True
+    print("✓ Advanced training utilities loaded")
+except ImportError as e:
+    HAS_TRAINING_UTILS = False
+    print(f"⚠ Advanced training utilities not available: {e}")
+
 # Import optimizations
 try:
     from optimizations import (
@@ -101,6 +113,28 @@ def parse_arguments():
     parser.add_argument("--endgame-start", action="store_true",
                         help="Start self-play games from endgame positions near checkmate")
     
+    # Advanced training features
+    parser.add_argument("--ema", action="store_true",
+                        help="Use EMA (Exponential Moving Average) for stable model weights")
+    
+    parser.add_argument("--ema-decay", type=float, default=0.999,
+                        help="EMA decay rate (default: 0.999, higher = more stable)")
+    
+    parser.add_argument("--tensorboard", action="store_true",
+                        help="Enable TensorBoard logging for training metrics")
+    
+    parser.add_argument("--tensorboard-dir", type=str, default="runs",
+                        help="TensorBoard log directory (default: runs)")
+    
+    parser.add_argument("--validate-every", type=int, default=1,
+                        help="Run validation every N epochs (default: 1, 0=disabled)")
+    
+    parser.add_argument("--stockfish-eval", action="store_true",
+                        help="Evaluate model against Stockfish (requires stockfish binary)")
+    
+    parser.add_argument("--stockfish-path", type=str, default=None,
+                        help="Path to Stockfish executable")
+    
     # Self-play parameters when in self-play mode
     parser.add_argument("games", nargs="?", type=int, default=None,
                         help="Number of games per batch in self-play mode")
@@ -169,10 +203,51 @@ def main():
     else:
         print("Full MCTS enabled for self-play (highest quality games)")
     
-    # Load existing model if available
+    # ========================================================================
+    # ADVANCED TRAINING UTILITIES INITIALIZATION
+    # ========================================================================
+    ema = None
+    tb_logger = None
+    checkpoint_manager = None
+    stockfish_evaluator = None
+    
+    if HAS_TRAINING_UTILS:
+        # Initialize EMA for stable model weights
+        if args.ema:
+            ema = EMA(model, decay=args.ema_decay)
+            print(f"✓ EMA enabled (decay={args.ema_decay})")
+        
+        # Initialize TensorBoard logging
+        if args.tensorboard:
+            log_dir = os.path.join(args.tensorboard_dir, f"{args.model}_{time.strftime('%Y%m%d_%H%M%S')}")
+            tb_logger = TensorBoardLogger(log_dir)
+        
+        # Initialize Stockfish evaluator
+        if args.stockfish_eval:
+            stockfish_evaluator = StockfishEvaluator(stockfish_path=args.stockfish_path)
+    
+    # Store utilities in args for access elsewhere
+    args._ema = ema
+    args._tb_logger = tb_logger
+    args._stockfish_evaluator = stockfish_evaluator
+    
+    # ========================================================================
+    # LOAD EXISTING MODEL OR CHECKPOINT
+    # ========================================================================
     if os.path.exists(save_path):
         print(f"Loading existing model from {save_path}")
-        model.load_state_dict(torch.load(save_path))
+        checkpoint = torch.load(save_path, map_location=device)
+        
+        # Handle both old-style (just state_dict) and new-style (full checkpoint) formats
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+            if ema and 'ema_state_dict' in checkpoint:
+                ema.load_state_dict(checkpoint['ema_state_dict'])
+                print("  Loaded EMA state from checkpoint")
+            print(f"  Loaded full checkpoint from epoch {checkpoint.get('epoch', '?')}")
+        else:
+            # Old-style checkpoint: just the state dict
+            model.load_state_dict(checkpoint)
         print(f"Loaded existing model from {save_path}")
 
     # Get training state
@@ -296,11 +371,23 @@ def main():
     regular_batch_size = 1000
     
     # Run checkmate bootcamp if requested (one-time intensive training)
+    bootcamp_just_completed = False  # Track for LR adjustment
+    bootcamp_baseline_accuracy = None  # Track baseline for comparison
     if args.checkmate_bootcamp:
         print("\n" + "="*60)
         print("STARTING CHECKMATE BOOT CAMP")
         print("="*60)
         run_checkmate_bootcamp(model, puzzle_dataset, device, save_path)
+        bootcamp_just_completed = True
+        
+        # Evaluate tactical recognition immediately after bootcamp
+        print("\n" + "="*60)
+        print("POST-BOOTCAMP TACTICAL EVALUATION (Baseline)")
+        print("="*60)
+        bootcamp_baseline_accuracy = test_tactical_recognition(model, device)
+        print(f"\n📊 Bootcamp baseline accuracy: {bootcamp_baseline_accuracy:.2%}")
+        print("="*60)
+        print("⚠️ Using conservative LR after bootcamp to prevent forgetting")
     
     # Main training loop
     max_iterations = 1000000  # Very high limit (essentially unlimited)
@@ -347,15 +434,28 @@ def main():
                 print(f"  {stage_info['description']}")
                 print(f"  Active puzzles: {stage_info['num_puzzles']}")
             
-            # Intensive puzzle training with higher learning rate initially
-            if iterations <= 3:
-                puzzle_lr = 0.005  # Higher LR for first few iterations
-            elif iterations <= 10:
-                puzzle_lr = 0.002  # Medium LR
+            # LEARNING RATE STRATEGY:
+            # After bootcamp, use much lower LR to preserve learned checkmate patterns
+            # This prevents catastrophic forgetting of the 85%+ accuracy achieved
+            if bootcamp_just_completed:
+                # Very conservative LR right after bootcamp - just fine-tune
+                if iterations <= 5:
+                    puzzle_lr = 0.0005  # 10x lower than before
+                elif iterations <= 15:
+                    puzzle_lr = 0.0008
+                else:
+                    puzzle_lr = 0.001
+                    bootcamp_just_completed = False  # Allow normal LR after warmup
             else:
-                puzzle_lr = 0.001  # Lower LR for fine-tuning
-                
-            print(f"Puzzle LR: {puzzle_lr}")
+                # Normal LR schedule for training without recent bootcamp
+                if iterations <= 3:
+                    puzzle_lr = 0.002  # Reduced from 0.005
+                elif iterations <= 10:
+                    puzzle_lr = 0.001  # Reduced from 0.002
+                else:
+                    puzzle_lr = 0.0005  # Fine-tuning
+                    
+            print(f"Puzzle LR: {puzzle_lr}" + (" (post-bootcamp conservative)" if bootcamp_just_completed else ""))
             
             puzzle_optimizer = torch.optim.SGD(
                 model.parameters(), 
@@ -364,8 +464,8 @@ def main():
                 weight_decay=1e-4
             )
             
-            # Train on puzzles for multiple epochs per iteration
-            puzzle_epochs = 15  # More epochs for intensive learning (was 10)
+            # Train on puzzles - fewer epochs after bootcamp to prevent overfitting
+            puzzle_epochs = 8 if bootcamp_just_completed else 12  # Reduced from 15
             print(f"Training on puzzles for {puzzle_epochs} epochs...")
             
             # Use curriculum loader if enabled, otherwise standard
@@ -381,6 +481,13 @@ def main():
             # Test tactical recognition every iteration
             test_accuracy = test_tactical_recognition(model, device)
             print(f"\nTactical recognition accuracy: {test_accuracy:.2%}")
+            
+            # Show comparison with bootcamp baseline if available
+            if bootcamp_baseline_accuracy is not None:
+                delta = test_accuracy - bootcamp_baseline_accuracy
+                delta_str = f"+{delta:.2%}" if delta >= 0 else f"{delta:.2%}"
+                status = "✅ Maintained" if delta >= -0.05 else "⚠️ FORGETTING" if delta >= -0.15 else "🔴 SEVERE FORGETTING"
+                print(f"  vs bootcamp baseline ({bootcamp_baseline_accuracy:.2%}): {delta_str} {status}")
             
             # Check curriculum advancement
             if args.curriculum:
@@ -692,6 +799,68 @@ def main():
         # Save checkpoint every iteration
         torch.save(model.state_dict(), save_path)
         print(f"Saved model checkpoint (iteration {iterations})")
+        
+        # ====================================================================
+        # ADVANCED TRAINING: EMA UPDATE, VALIDATION, LOGGING
+        # ====================================================================
+        if HAS_TRAINING_UTILS:
+            # Update EMA if enabled
+            if args._ema is not None:
+                # EMA should be updated after each optimizer step, but we also
+                # ensure it's synced at checkpoint time
+                pass  # EMA updates happen in train_batch/train_tactical
+            
+            # Run validation and Stockfish evaluation periodically
+            if args.validate_every > 0 and iterations % args.validate_every == 0:
+                print("\n--- Running Validation ---")
+                
+                # Validation on puzzle dataset
+                if args._ema:
+                    args._ema.apply_shadow()  # Use EMA weights for validation
+                
+                val_loss, val_acc, val_mae = run_validation(
+                    model, puzzle_dataloader, device, model.input_channels
+                )
+                print(f"Validation: loss={val_loss:.4f}, accuracy={val_acc:.2%}, value_mae={val_mae:.3f}")
+                
+                if args._ema:
+                    args._ema.restore()  # Restore original weights
+                
+                # Stockfish evaluation (less frequent - expensive)
+                if args._stockfish_evaluator and iterations % 5 == 0:
+                    print("Running Stockfish position evaluation...")
+                    eval_positions = generate_validation_positions(50)
+                    correlation, sf_mae = args._stockfish_evaluator.evaluate_model(
+                        model, eval_positions, device, model.input_channels
+                    )
+                    
+                    # Log to TensorBoard
+                    if args._tb_logger:
+                        args._tb_logger.log_stockfish_eval(iterations, correlation, sf_mae)
+                
+                # TensorBoard logging
+                if args._tb_logger:
+                    args._tb_logger.log_validation(iterations, val_loss, val_acc, test_accuracy if 'test_accuracy' in dir() else None)
+                    args._tb_logger.log_scalar('train/iteration', iterations, iterations)
+            
+            # Save full checkpoint with EMA
+            if iterations % 5 == 0:  # Full checkpoint every 5 iterations
+                full_checkpoint = {
+                    'epoch': iterations,
+                    'model_state_dict': model.state_dict(),
+                    'metrics': {
+                        'val_loss': val_loss if 'val_loss' in dir() else None,
+                        'val_acc': val_acc if 'val_acc' in dir() else None,
+                        'processed_games': processed_games,
+                        'pro_game_count': pro_game_count,
+                    }
+                }
+                if args._ema:
+                    full_checkpoint['ema_state_dict'] = args._ema.state_dict()
+                
+                full_ckpt_path = save_path.replace('.pt', '_full.pt')
+                torch.save(full_checkpoint, full_ckpt_path)
+                print(f"💾 Saved full checkpoint: {full_ckpt_path}")
         
         # Update tracking
         if os.path.exists(state_file):

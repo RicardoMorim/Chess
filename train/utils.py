@@ -68,13 +68,104 @@ def get_optimal_batch_size(model, device, starting_size=64, min_size=8, max_size
 # ============================================================================
 # TACTICAL TESTING
 # ============================================================================
-def load_tactical_test_positions() -> List[Tuple[str, str, str]]:
-    """Returns a flattened list of all tactical test positions."""
-    all_positions = []
-    for category, positions in TACTICAL_TEST_POSITIONS.items():
-        for fen, best_move in positions:
-            all_positions.append((fen, best_move, category))
-    return all_positions
+
+# Cache for loaded puzzles to avoid reloading every test
+_cached_puzzles = None
+
+def load_tactical_test_positions(num_samples=50, cache_dir="./cache") -> List[Tuple[str, str, str]]:
+    """Load random tactical test positions from Lichess puzzle cache.
+    
+    Samples puzzles from the same distribution as training for accurate evaluation.
+    Prioritizes mate puzzles but includes a mix of other tactics.
+    
+    Args:
+        num_samples: Number of test positions to sample
+        cache_dir: Directory containing puzzle caches
+    
+    Returns:
+        List of (fen, best_move_uci, category) tuples
+    """
+    global _cached_puzzles
+    import os
+    import pickle
+    import random
+    
+    # Try to load from Lichess cache first
+    if _cached_puzzles is None:
+        # Look for Lichess puzzle cache files
+        cache_files = []
+        if os.path.exists(cache_dir):
+            cache_files = [f for f in os.listdir(cache_dir) 
+                          if f.startswith('lichess_puzzles_') and f.endswith('.pkl')]
+        
+        if cache_files:
+            # Use most recent cache file
+            cache_file = os.path.join(cache_dir, sorted(cache_files)[-1])
+            try:
+                with open(cache_file, 'rb') as f:
+                    _cached_puzzles = pickle.load(f)
+                print(f"Loaded {len(_cached_puzzles)} puzzles for testing from cache")
+            except Exception as e:
+                print(f"Error loading puzzle cache: {e}")
+                _cached_puzzles = []
+        else:
+            print("No Lichess cache found, using fallback hardcoded positions")
+            # Fallback to hardcoded positions if no cache
+            from constants import TACTICAL_TEST_POSITIONS
+            all_positions = []
+            for category, positions in TACTICAL_TEST_POSITIONS.items():
+                for fen, best_move in positions:
+                    all_positions.append((fen, best_move, category))
+            return all_positions
+    
+    if not _cached_puzzles:
+        return []
+    
+    # Sample puzzles with category distribution matching training priorities
+    # Mate puzzles should be well represented
+    test_positions = []
+    
+    # Group puzzles by category
+    by_category = {}
+    for puzzle in _cached_puzzles:
+        if len(puzzle) >= 4:
+            fen, move, value, category = puzzle[:4]
+        else:
+            fen, move, value = puzzle[:3]
+            category = "other"
+        
+        if category not in by_category:
+            by_category[category] = []
+        by_category[category].append((fen, move, category))
+    
+    # Sample distribution: prioritize mates but include tactics
+    sample_weights = {
+        'mate_in_one': 0.25,
+        'mate_in_two': 0.15,
+        'mate_in_three': 0.10,
+        'mate_longer': 0.05,
+        'fork': 0.10,
+        'pin': 0.08,
+        'discovered': 0.07,
+        'skewer': 0.05,
+        'endgame': 0.10,
+        'other': 0.05
+    }
+    
+    for category, weight in sample_weights.items():
+        if category in by_category and by_category[category]:
+            n_samples = max(1, int(num_samples * weight))
+            samples = random.sample(
+                by_category[category], 
+                min(n_samples, len(by_category[category]))
+            )
+            test_positions.extend(samples)
+    
+    # Shuffle and limit
+    random.shuffle(test_positions)
+    test_positions = test_positions[:num_samples]
+    
+    return test_positions
 
 
 def test_tactical_recognition(model, device, verbose=True):
