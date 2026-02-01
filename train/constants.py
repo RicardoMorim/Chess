@@ -1,30 +1,45 @@
 import chess
 
 # ============================================================================
-# MODEL CONFIGURATION
+# CORE CONSTANTS (FROZEN FOR REPRODUCIBILITY)
+# ============================================================================
+ACTION_SPACE_SIZE = 4672  # Standard move encoding
+DIRICHLET_ALPHA = 10 / ACTION_SPACE_SIZE  # ~0.002
+DIRICHLET_EPSILON = 0.25
+
+# ============================================================================
+# MODEL CONFIGURATION (by variant, not size)
 # ============================================================================
 MODEL_CONFIG = {
-    # Small model (fast, for testing)
-    'small': {
-        'num_blocks': 6,
+    # Baseline: 18 input channels (standard)
+    'baseline': {
+        'num_blocks': 15,
         'channels': 256,
         'input_channels': 18,
         'use_se': True,
     },
-    # Medium model (balanced)
-    'medium': {
-        'num_blocks': 10,
-        'channels': 256,
-        'input_channels': 20,
-        'use_se': True,
-    },
-    # Big model (best quality)
-    'big': {
+    # Attack: 22 input channels (with attack maps)
+    'attack': {
         'num_blocks': 15,
         'channels': 256,
         'input_channels': 22,
         'use_se': True,
     },
+    # EST: Early Split Trunk (experimental)
+    'est': {
+        'num_blocks': 15,
+        'channels': 256,
+        'input_channels': 18,
+        'use_se': True,
+    },
+}
+
+# Legacy size aliases (backward compat)
+MODEL_SIZE_ALIASES = {
+    'small': 'baseline',
+    'medium': 'baseline', 
+    'big': 'attack',
+    'limited': 'baseline',
 }
 
 # ============================================================================
@@ -54,41 +69,68 @@ TRAINING_CONFIG = {
 # ============================================================================
 MCTS_CONFIG = {
     # Search parameters
-    'num_simulations': 400,       # Simulations per move (training)
-    'num_simulations_play': 800,  # Simulations per move (play)
+    'num_simulations': 800,       # Simulations per move (training)
+    'num_simulations_play': 1600, # Simulations per move (play)
     'c_puct': 2.5,                # Exploration constant
     
     # Parallelization
-    'parallel_workers': 4,
+    'parallel_workers': 16,
     'virtual_loss': 3.0,
     
-    # Exploration noise (Dirichlet)
-    'dirichlet_alpha': 0.3,       # Alpha for Dirichlet noise
-    'dirichlet_epsilon': 0.25,    # Weight of noise
+    # Exploration noise (use frozen DIRICHLET_ALPHA and DIRICHLET_EPSILON)
+    'dirichlet_alpha': DIRICHLET_ALPHA,
+    'dirichlet_epsilon': DIRICHLET_EPSILON,
     
     # Early stopping
     'early_stop_threshold': 0.9,
     'min_simulations': 100,
+    
+    # Endgame sim cap
+    'legal_moves_sim_cap_threshold': 12,  # if legal_moves < 12: sims //= 2
 }
 
 # ============================================================================
 # SELF-PLAY CONFIGURATION
 # ============================================================================
 SELF_PLAY_CONFIG = {
-    # Temperature schedule
-    'temp_initial': 1.0,
-    'temp_mid': 0.5,
-    'temp_final': 0.1,
-    'temp_threshold_1': 15,       # Moves before first reduction
-    'temp_threshold_2': 30,       # Moves before second reduction
+    # Temperature schedule (τ≤0.05 → greedy)
+    'temp_threshold_1': 15,        # Moves 1-15: τ=1.0
+    'temp_threshold_2': 30,        # Moves 16-30: τ=0.1
+    'temp_greedy_threshold': 0.05, # Below this → greedy (one-hot)
     
     # Game limits
     'max_moves': 200,
     'min_game_length': 10,
     
+    # Resignation (disabled first 15 moves)
+    'resignation_threshold': -0.9,
+    'resignation_consecutive': 3,
+    'resignation_min_move': 15,
+    
+    # Data quality filter
+    'min_unique_positions': 8,
+    'min_root_visits_ratio': 0.7,  # Discard if max_visits < sims * 0.7
+    
     # Reward shaping
     'use_reward_shaping': True,
     'discount_factor': 0.99,
+}
+
+# ============================================================================
+# TRAINING PHASE CONFIGURATION
+# ============================================================================
+# Replay buffer sampling ratios by phase
+SAMPLE_RATIOS = {
+    'phase1': {'puzzle': 0.8, 'selfplay': 0.2},
+    'phase2': {'puzzle': 0.4, 'selfplay': 0.6},
+    'phase3': {'puzzle': 0.1, 'selfplay': 0.9},
+}
+
+# Value loss weight by phase (early value targets are noisy)
+VALUE_WEIGHT = {
+    'phase1': 0.5,
+    'phase2': 1.0,
+    'phase3': 1.0,
 }
 
 # ============================================================================

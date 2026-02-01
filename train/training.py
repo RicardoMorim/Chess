@@ -50,12 +50,25 @@ class PolicyLoss(nn.Module):
         super().__init__()
         self.ce_loss = nn.CrossEntropyLoss()
     
-    def forward(self, logits, targets):
+    def forward(self, logits, targets, legal_mask: torch.Tensor = None):
         """
         Args:
             logits: Policy logits from network (B, num_moves)
             targets: Either class indices (B,) or soft target distributions (B, num_moves)
+            legal_mask: Optional boolean mask of legal moves (B, num_moves)
         """
+        if legal_mask is not None:
+            # CRITICAL: Empty mask guard (fail fast on corrupted positions)
+            assert legal_mask.any(dim=1).all(), \
+                "No legal moves in mask - corrupted position detected"
+            # Mask illegal moves with -inf before softmax
+            logits = logits.masked_fill(~legal_mask, float('-inf'))
+            # Assert target is legal (fail fast on data bugs)
+            if targets.dim() == 1:
+                target_legal = legal_mask.gather(1, targets.unsqueeze(1)).squeeze(1)
+                assert target_legal.all(), \
+                    "Target move is illegal - data corruption detected"
+        
         if targets.dim() == 1:
             # Hard targets (class indices) - use cross entropy
             return self.ce_loss(logits, targets)
@@ -97,14 +110,16 @@ def create_optimizer(model, config=None):
             lr=config['sgd_lr'],
             momentum=config['sgd_momentum'],
             weight_decay=config['weight_decay'],
-            nesterov=True  # Nesterov momentum often helps
+            nesterov=True,  # Nesterov momentum often helps
+            fused=True if torch.cuda.is_available() else False
         )
     else:  # adam
         optimizer = torch.optim.Adam(
             model.parameters(),
             lr=config['adam_lr'],
             weight_decay=config['weight_decay'],
-            betas=(0.9, 0.999)
+            betas=(0.9, 0.999),
+            fused=True if torch.cuda.is_available() else False
         )
     
     return optimizer
@@ -176,10 +191,11 @@ def train_batch(model, game_dataloader, puzzle_dataloader, save_path, state_file
             lr=TRAIN_CONFIG['sgd_lr'],  # Use config value
             momentum=0.9, 
             weight_decay=1e-4,
-            nesterov=True
+            nesterov=True,
+            fused=True if torch.cuda.is_available() else False
         )
     else:
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4, fused=True if torch.cuda.is_available() else False)
     
     # Use scheduler with warmup
     scheduler = create_scheduler(optimizer, epochs, TRAIN_CONFIG)

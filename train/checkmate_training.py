@@ -91,9 +91,9 @@ def run_checkmate_reinforcement(model, puzzle_dataset, device, epochs=5,
     # Create subset with only mate puzzles
     mate_subset = Subset(puzzle_dataset, mate_indices)
     
-    # Create dataloader (no workers for Windows compatibility)
+    # DataLoader workers - Windows now supported with proper __main__ guard
     import platform
-    num_workers = 0 if platform.system() == 'Windows' else 2
+    num_workers = 2  # Works on Windows with mp.freeze_support() in main
     
     mate_loader = DataLoader(
         mate_subset,
@@ -247,7 +247,7 @@ def run_checkmate_bootcamp(model, puzzle_dataset, device, save_path,
     val_subset = Subset(puzzle_dataset, val_indices)
     
     import platform
-    num_workers = 0 if platform.system() == 'Windows' else 2
+    num_workers = 2  # Works on Windows with mp.freeze_support() in main
     
     train_loader = DataLoader(
         train_subset,
@@ -493,7 +493,7 @@ def test_checkmate_accuracy(model, puzzle_dataset, device, num_samples=500):
     mate_subset = Subset(puzzle_dataset, mate_indices)
     
     import platform
-    num_workers = 0 if platform.system() == 'Windows' else 2
+    num_workers = 2  # Works on Windows with mp.freeze_support() in main
     
     loader = DataLoader(
         mate_subset,

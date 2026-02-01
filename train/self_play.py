@@ -18,8 +18,69 @@ from mcts import generate_mcts_game, select_move_with_mcts, MCTS_CONFIG
 
 from utils import get_optimal_batch_size, clear_memory
 
+from constants import SELF_PLAY_CONFIG
+
 
 # ============================================================================
+# POLICY TARGET COMPUTATION (SINGLE CANONICAL DEFINITION)
+# ============================================================================
+
+def get_temperature(move_number: int) -> float:
+    """Fixed temperature schedule per implementation plan.
+    
+    Moves 1-15:  τ=1.0 (exploration)
+    Moves 16-30: τ=0.1 (transition)
+    Moves 31+:   τ=0.01 (greedy)
+    """
+    if move_number <= SELF_PLAY_CONFIG.get('temp_threshold_1', 15):
+        return 1.0
+    elif move_number <= SELF_PLAY_CONFIG.get('temp_threshold_2', 30):
+        return 0.1
+    else:
+        return 0.01
+
+
+def compute_policy_target(
+    visit_counts: np.ndarray, 
+    temperature: float = 1.0, 
+    legal_mask: np.ndarray = None
+) -> np.ndarray:
+    """Convert MCTS visit counts to policy target distribution.
+    
+    Args:
+        visit_counts: Array of visit counts per legal move
+        temperature: Temperature for softmax (τ≤0.05 → greedy)
+        legal_mask: Optional mask for legal moves (for zero-visit fallback)
+    
+    Returns:
+        Normalized policy distribution
+    """
+    # Zero-visit edge case: uniform over legal moves
+    if visit_counts.max() == 0:
+        if legal_mask is not None:
+            target = legal_mask.astype(np.float32)
+            s = target.sum()
+            return target / s if s > 0 else target
+        else:
+            target = np.ones_like(visit_counts, dtype=np.float32)
+            return target / target.sum()
+    
+    # Greedy threshold (single rule: τ≤0.05)
+    greedy_threshold = SELF_PLAY_CONFIG.get('temp_greedy_threshold', 0.05)
+    if temperature <= greedy_threshold:
+        target = np.zeros_like(visit_counts, dtype=np.float32)
+        target[np.argmax(visit_counts)] = 1.0
+        return target
+    
+    # Temperature-scaled softmax with epsilon guard
+    scaled = np.power(visit_counts.astype(np.float32) + 1e-8, 1.0 / temperature)
+    s = scaled.sum()
+    if s <= 0:
+        target = np.zeros_like(scaled)
+        target[np.argmax(visit_counts)] = 1.0
+        return target
+    
+    return scaled / s
 # SELF-PLAY CONFIGURATION (AlphaZero-inspired improvements)
 # ============================================================================
 SELF_PLAY_CONFIG = {
@@ -148,14 +209,10 @@ class SelfPlayReplayBuffer:
             if from_perspective is not None:
                 is_white = from_perspective[i]
             else:
-                # Infer from board tensor (channel 17 or 101 is side to move)
+                # Infer from board tensor (channel 17 is side to move)
                 board = board_tensors[i]
-                if len(board.shape) == 3:
-                    # Check channel 17 (legacy) or 101 (alphazero)
-                    if board.shape[0] > 100:
-                        is_white = np.mean(board[101]) > 0.5
-                    else:
-                        is_white = np.mean(board[17]) > 0.5
+                if len(board.shape) == 3 and board.shape[0] >= 18:
+                    is_white = np.mean(board[17]) > 0.5 if board.shape[0] > 17 else True
                 else:
                     is_white = True  # Default
             
@@ -946,10 +1003,9 @@ def create_training_samples_from_game(board_history, move_history, final_result,
             shaped_value = final_result
             
         # Flip value target for black's perspective
-        # Need to handle both 22-channel (legacy) and 119-channel (AlphaZero) formats
-        if len(board_tensor.shape) == 3 and board_tensor.shape[0] > 100:
-            # AlphaZero format: channel 101 is side to move
-            is_white_to_move = np.mean(board_tensor[101]) > 0.5
+        # Using 18/20/22-channel format: channel 17 is side to move
+        if len(board_tensor.shape) == 3 and board_tensor.shape[0] > 17:
+            is_white_to_move = np.mean(board_tensor[17]) > 0.5
         elif len(board_tensor.shape) == 3:
             # Legacy format: channel 17 is side to move
             is_white_to_move = np.mean(board_tensor[17]) > 0.5
@@ -1250,8 +1306,12 @@ def run_self_play_training(model, device, save_path, state_file, puzzle_dataload
                     move_number = 1
                     
                     for move in game.mainline_moves():
-                        board_history.append(board_to_tensor(board, move_number, input_channels))
+                        # Generate tensor (only 18/20/22 channels supported)
+                        tensor = board_to_tensor(board, move_number, input_channels)
+                        
+                        board_history.append(tensor)
                         move_history.append(get_move_index(move))
+                            
                         board.push(move)
                         move_number += 1
                     
@@ -1789,12 +1849,14 @@ def generate_simple_mcts_game(model, device, temperature=1.0, num_simulations=50
     # Track history for replay buffer
     board_history = []
     policy_history = []
+    history_boards = []  # For AlphaZero history planes
+    
     
     # Apply early termination for very long games
     max_moves = 80  # Limit to reasonable game length
     
     while not board.is_game_over() and move_number <= max_moves:
-        # Keep track of board state for replay buffer
+        # Keep track of board state for replay buffer (only 18/20/22 channels)
         board_history.append(board_to_tensor(board, move_number, input_channels))
         
         # Temperature annealing - reduce temperature as game progresses  
@@ -1860,6 +1922,11 @@ def generate_simple_mcts_game(model, device, temperature=1.0, num_simulations=50
             
         if move is None:
             break
+            
+        # Update board history for AlphaZero planes
+        history_boards.insert(0, board.copy())
+        if len(history_boards) > 7:
+            history_boards.pop()
             
         # Add move to game
         board.push(move)

@@ -12,17 +12,8 @@ from data import board_to_tensor, get_move_index
 
 from utils import clear_memory
 
-# ============================================================================
-# MCTS CONFIGURATION
-# ============================================================================
-MCTS_CONFIG = {
-    'c_puct': 2.5,              # Exploration constant (AlphaZero uses ~2.5)
-    'dirichlet_alpha': 0.3,     # Dirichlet noise alpha (0.3 for chess)
-    'dirichlet_epsilon': 0.25,  # Noise weight at root
-    'virtual_loss': 3.0,        # Virtual loss for parallel search
-    'min_simulations': 100,     # Minimum simulations before early stopping
-    'early_stop_threshold': 0.9, # Stop if one move has 90% visits
-}
+# Import frozen MCTS configuration from constants
+from constants import MCTS_CONFIG
 
 
 # ============================================================================
@@ -78,8 +69,9 @@ def expand_node(node: MCTSNode, model, device, add_noise: bool = False) -> float
     Returns:
         The value estimate for this position
     """
-    input_channels = model.input_channels if hasattr(model, 'input_channels') else 20
+    input_channels = model.input_channels if hasattr(model, 'input_channels') else 22
     
+    # Generate board tensor (only 18/20/22 channels supported)
     board_tensor = torch.tensor(
         board_to_tensor(node.board, node.board.fullmove_number, input_channels), 
         dtype=torch.float32

@@ -126,19 +126,26 @@ python train.py --model small
 The AI engine features two approaches:
 
 1. **Neural Network Models**:
-   - **Big Model**: 20 input channels, 10 residual blocks with dual policy/value head
-   - **Small Model**: 18 input channels, 5 residual blocks with dual policy/value head
+   - **Alpha Zero baseline**
+   - **Alpha Zero with Attack Maps**
+   - **Custom Model**: Separate policy and value sooner, keeping the shared trunk short to reduce gradient interference and improve specialization.
+      - **Arquitecture**:
 
-2. **Monte Carlo Tree Search (MCTS)**:
-   - Policy-guided tree search with UCB formula
-   - Parallel MCTS for faster move selection
-   - Dirichlet noise at root for exploration (AlphaZero style)
-   - Tree reuse between moves
+      ```
+            Input
+            ↓
+            Shared Trunk (5 residual blocks)
+            ↓
+      ┌───────────────┐
+      │               │
+      Policy Trunk     Value Trunk
+      (5 blocks)       (5 blocks)
+      │               │
+      Policy Head      Value Head
+      ```
 
-3. **Tactical Recognition**:
-   - Specialized training on chess puzzles
-   - Category-based learning (checkmates, forks, pins)
-   - Periodic verification of tactical ability
+2. **Minimax**
+
 
 You can choose between these AI modes in the game settings or training parameters.
 

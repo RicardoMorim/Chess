@@ -9,17 +9,26 @@ import sys
 import gc
 import random
 import argparse
+import multiprocessing as mp
 
 
 from models import ChessNet, create_chess_model, load_model_with_compatibility
-from data import (ChessDataset, PuzzleDataset, CurriculumPuzzleDataset, CachedChessDataset,
+from data import (ChessDataset, PuzzleDataset, CurriculumPuzzleDataset,
                  load_puzzles, load_lichess_puzzles, filter_and_prioritize_puzzles_cached, 
-                 load_professional_games, load_games_in_batches, expand_mate_sequences)
+                 load_games_in_batches, expand_mate_sequences)
 
 from utils import clear_memory, test_tactical_recognition, get_optimal_batch_size, model_summary
 from self_play import generate_self_play_games, run_self_play_training, generate_self_play_games_from_endgame
 from training import train_batch, train_tactical
 from checkmate_training import run_checkmate_bootcamp, run_checkmate_reinforcement
+
+# Import frozen training constants
+from constants import (
+    MODEL_CONFIG, MODEL_SIZE_ALIASES,
+    MCTS_CONFIG, SELF_PLAY_CONFIG,
+    SAMPLE_RATIOS, VALUE_WEIGHT,
+    ACTION_SPACE_SIZE, DIRICHLET_ALPHA, DIRICHLET_EPSILON
+)
 
 # Import advanced training utilities
 try:
@@ -55,9 +64,16 @@ if device.type == 'cuda':
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     
-    # Enable TF32 for faster training on Ampere+ GPUs (no effect on Pascal/GTX 1050)
+    # Enable TF32 for faster training on Ampere+ GPUs (RTX 30xx/40xx/50xx)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    
+    # Set high precision for matmul (new in PyTorch 2.x)
+    try:
+        torch.set_float32_matmul_precision('high')
+        print("✓ TF32 high precision enabled")
+    except AttributeError:
+        pass
     
     # Enable cudnn benchmark for consistent input sizes
     torch.backends.cudnn.benchmark = True
@@ -77,13 +93,13 @@ def signal_handler(sig, frame, model, save_path, state_file, processed_games, cu
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Chess AI Training Script (Improved)")
     
-    # Training mode
-    parser.add_argument("mode", nargs="?", default=None, choices=["pro", "regular", "self-play", "puzzles"], 
-                        help="Training mode: professional games, regular games, self-play, or puzzles (for checkmate training)")
+    # Training mode (only puzzles and self-play per AlphaZero principles)
+    parser.add_argument("mode", nargs="?", default=None, choices=["self-play", "puzzles"], 
+                        help="Training mode: self-play or puzzles (for checkmate training)")
     
     # Model parameters
     parser.add_argument("--model", default="big", choices=["limited", "small", "medium", "big"], 
-                        help="Model size: limited (low-VRAM), small (6 blocks), medium (10 blocks), or big (15 blocks)")
+                        help="Model size: limited, small, medium, big")
     
     parser.add_argument("--model-path", default=None, 
                         help="Path to save/load the model (default: ./checkpoints_[model_size]/model_best.pt)")
@@ -172,14 +188,26 @@ def main():
         print(f"Model: Limited (low-VRAM, 4 blocks, 64 filters, 18 channels, SE={use_se})")
         model = create_chess_model("limited", use_se=use_se, legacy=args.legacy).to(device)
     elif args.model == "small":
-        print(f"Model: Small (6 blocks, 18 channels, SE={use_se})")
+        print(f"Model: Small (10 blocks, 18 channels, SE={use_se})")
         model = create_chess_model("small", use_se=use_se, legacy=args.legacy).to(device)
     elif args.model == "medium":
-        print(f"Model: Medium (10 blocks, 22 channels, SE={use_se})")
+        print(f"Model: Medium (12 blocks, 20 channels, SE={use_se})")
         model = create_chess_model("medium", use_se=use_se, legacy=args.legacy).to(device)
     else:  # "big"
         print(f"Model: Big (15 blocks, 22 channels, SE={use_se})")
         model = create_chess_model("big", use_se=use_se, legacy=args.legacy).to(device)
+    
+    # Enable PyTorch 2.0 Compilation (Huge speedup)
+    if hasattr(torch, 'compile'):
+        print("🚀 Compiling model with torch.compile (mode='max-autotune')...")
+        try:
+            # max-autotune is best for training speed on stable input sizes
+            model = torch.compile(model, mode='max-autotune')
+        except Exception as e:
+            print(f"⚠️ torch.compile failed: {e}. Continuing without compilation.")
+    
+    # Convert to channels_last for NVidia optimization
+    model = model.to(memory_format=torch.channels_last)
     
     # Print model summary
     model_summary(model)
@@ -262,22 +290,7 @@ def main():
             processed_games = state.get("processed_games", 0)
             current_epoch = state.get("last_epoch", 0)
     
-    if os.path.exists(pro_state_file):
-        with open(pro_state_file, 'r') as f:
-            pro_state = json.load(f)
-            pro_files_remaining = pro_state.get("current_pro_file_idx", 0) < len(glob.glob(os.path.join("./chess_pgns/pros", "*.pgn")))
-            pro_game_count = pro_state.get("processed_pro_games", 0)
-            
-            # If we've already processed all pro files, start with regular games
-            if not pro_files_remaining:
-                print("All professional games have been processed. Starting with regular games.")
-                current_phase = "regular"
-            else:
-                current_phase = "professional"
-    else:
-        current_phase = "professional"  # Start with professional games by default
-        pro_state = {}
-        pro_game_count = 0
+    # NOTE: Professional games mode removed - only puzzles and self-play supported
 
     # Set up signal handlers
     signal.signal(signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, model, save_path, state_file, processed_games, current_epoch))
@@ -309,7 +322,7 @@ def main():
     all_puzzles = pgn_puzzles + lichess_puzzles
     prioritized_puzzles = filter_and_prioritize_puzzles_cached(all_puzzles)
     
-    # Determine model type based on input channels (small=18, medium=20, big=22)
+    # Determine model type based on input channels (limited/small=18, medium=20, big=22)
     if model.input_channels == 18:
         model_type = "small"
     elif model.input_channels == 20:
@@ -332,7 +345,8 @@ def main():
     
     # Create puzzle dataloader once - puzzles are smaller and reused
     # With cached tensors, we can use larger batch sizes for speed
-    puzzle_batch_size = min(128, optimal_batch_size)  # Larger batch for faster training
+    # RTX 5080 can handle much larger batches
+    puzzle_batch_size = min(2048, optimal_batch_size)  # Increased limit from 128 to 2048
     
     if HAS_OPTIMIZATIONS:
         puzzle_dataloader = create_optimized_dataloader(
@@ -357,8 +371,9 @@ def main():
             persistent_workers=use_workers > 0  # Only if using workers
         )
     
-    # Determine training mode
-    current_phase = "regular"  # Default mode
+    
+    # Determine training mode (only self-play and puzzles supported)
+    current_phase = "self-play"  # Default mode
     is_mode_locked = False  # Track if mode is locked by command line
     
     # Set mode based on command line argument
@@ -366,10 +381,6 @@ def main():
         current_phase = args.mode
         is_mode_locked = True
         print(f"Command-line override: Using {current_phase} training mode (locked)")
-            
-    # Set batch sizes - smaller batch sizes for faster processing
-    pro_batch_size = 1000
-    regular_batch_size = 1000
     
     # Run checkmate bootcamp if requested (one-time intensive training)
     bootcamp_just_completed = False  # Track for LR adjustment
@@ -580,11 +591,10 @@ def main():
                         print(f"Training on {len(endgame_samples)} endgame positions")
                         endgame_dataset = SelfPlayDataset(endgame_samples, "big" if model.input_channels == 22 else "small")
                         from torch.utils.data import DataLoader
-                        import platform
-                        num_workers = 0 if platform.system() == 'Windows' else 2
+                        # Windows supported with mp.freeze_support() in main
                         endgame_loader = DataLoader(
                             endgame_dataset, batch_size=32, shuffle=True,
-                            num_workers=num_workers, pin_memory=True
+                            num_workers=2, pin_memory=True
                         )
                         
                         # Quick training on endgame positions
@@ -613,207 +623,8 @@ def main():
             if iterations % 3 == 0:
                 test_accuracy = test_tactical_recognition(model, device)
                 print(f"Tactical recognition accuracy: {test_accuracy:.2%}")
-            
-            # Continue with self-play mode if locked, otherwise potentially switch
-            if not is_mode_locked and iterations % 10 == 0:
-                # Occasionally switch to other modes for variety
-                current_phase = random.choice(["regular", "pro", "self-play"])
-                print(f"Switching to {current_phase} mode for variety")
                 
-        # Professional games mode
-        elif current_phase == "pro":
-            print("\n=== PROFESSIONAL GAMES TRAINING ===")
-            
-            # Load one batch of professional games
-            pro_games = load_professional_games(pro_state_file, batch_size=pro_batch_size)
-            
-            if not pro_games:
-                print("No more professional games to process.")
-                if is_mode_locked:
-                    print("Mode is locked to 'pro' but no more pro games available.")
-                    print("Will attempt to reload pro games in the next iteration.")
-                    time.sleep(5)  # Wait before trying again
-                    continue
-                else:
-                    print("Switching to regular games mode temporarily.")
-                    current_phase = "regular"
-                    continue
-            
-            batch_size = len(pro_games)
-            print(f"Processing professional batch with {batch_size} games")
-            
-            # Create dataset and dataloader for this batch only
-            # Use CachedChessDataset for alphazero model (much faster after first run)
-            if args.model == "alphazero":
-                game_dataset = CachedChessDataset(
-                    pro_games, 
-                    model_type="alphazero",
-                    cache_name=f"pro_{batch_size}_{pro_game_count}"
-                )
-            else:
-                game_dataset = ChessDataset(pro_games, augment=True, model_type=model_type)
-
-            
-            if HAS_OPTIMIZATIONS:
-                game_dataloader = create_optimized_dataloader(
-                    game_dataset,
-                    batch_size=optimal_batch_size,
-                    shuffle=True,
-                    for_training=True
-                )
-            else:
-                # Windows fix: use num_workers=0 to avoid pickle errors
-                import platform
-                use_workers = 0 if platform.system() == 'Windows' else min(2, os.cpu_count() or 1)
-                game_dataloader = DataLoader(
-                    game_dataset, 
-                    batch_size=optimal_batch_size,
-                    shuffle=True, 
-                    num_workers=use_workers,
-                    pin_memory=True
-                )
-            
-            # Train on this batch
-            train_batch(model, game_dataloader, puzzle_dataloader, save_path, state_file, 
-                    epochs=5, processed_games=processed_games, device=device)
-            
-            # Clean up to free memory before next phase
-            del pro_games
-            del game_dataset
-            del game_dataloader
-            gc.collect()
-            if HAS_OPTIMIZATIONS:
-                aggressive_memory_cleanup()
-            else:
-                clear_memory()
-            
-            # Tactical training after professional batch
-            print("Running enhanced tactical training phase...")
-            tactical_optimizer = torch.optim.SGD(model.parameters(), lr=0.002, momentum=0.9, weight_decay=1e-4)
-            train_tactical(model, tactical_optimizer, puzzle_dataloader, device, epochs=12)
-            
-            
-            # Test tactical recognition occasionally
-            if iterations % 3 == 0:
-                test_accuracy = test_tactical_recognition(model, device)
-                print(f"Tactical recognition accuracy: {test_accuracy:.2%}")
-            
-            # Only switch modes if not locked
-            if not is_mode_locked and iterations % 5 == 0:
-                current_phase = "regular"
-                print("Switching to regular games mode for variety")
-                
-        # Regular games mode
-        else:  # Regular games phase
-            print("\n=== REGULAR GAMES TRAINING ===")
-            if HAS_OPTIMIZATIONS:
-                print_memory_stats("before loading")
-            
-            # Load one batch of regular games
-            regular_games = load_games_in_batches(pgn_files, state_file, batch_size=regular_batch_size)
-            
-            if not regular_games:
-                print("No regular games available or error loading games.")
-                if is_mode_locked:
-                    print("Mode is locked to 'regular' but having trouble loading games.")
-                    print("Will attempt to reload games in the next iteration.")
-                    time.sleep(5)  # Wait before trying again
-                    continue
-                else:
-                    print("Switching to professional games mode temporarily.")
-                    current_phase = "pro"
-                    continue
-                
-            batch_size = len(regular_games)
-            print(f"Processing regular batch with {batch_size} games")
-            
-            # Create dataset and dataloader for this batch only
-            # Use CachedChessDataset for alphazero model (much faster after first run)
-            if args.model == "alphazero":
-                game_dataset = CachedChessDataset(
-                    regular_games, 
-                    model_type="alphazero",
-                    cache_name=f"regular_{batch_size}_{processed_games}"
-                )
-            else:
-                game_dataset = ChessDataset(regular_games, augment=True, model_type=model_type)
-
-            
-            if HAS_OPTIMIZATIONS:
-                game_dataloader = create_optimized_dataloader(
-                    game_dataset,
-                    batch_size=optimal_batch_size,
-                    shuffle=True,
-                    for_training=True
-                )
-            else:
-                # Windows fix: use num_workers=0 to avoid pickle errors
-                import platform
-                use_workers = 0 if platform.system() == 'Windows' else min(2, os.cpu_count() or 1)
-                game_dataloader = DataLoader(
-                    game_dataset, 
-                    batch_size=optimal_batch_size,
-                    shuffle=True, 
-                    num_workers=use_workers,
-                    pin_memory=True
-                )
-            
-            # Train on regular games
-            train_batch(model, game_dataloader, puzzle_dataloader, save_path, state_file, 
-                    epochs=5, processed_games=processed_games, device=device)
-            
-            # Clean up
-            del regular_games
-            del game_dataset
-            del game_dataloader
-            gc.collect()
-            if HAS_OPTIMIZATIONS:
-                aggressive_memory_cleanup()
-                print_memory_stats("after cleanup")
-            else:
-                clear_memory()
-
-            print("Running enhanced tactical training phase for regular games...")
-            tactical_optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9, weight_decay=1e-4)
-            train_tactical(model, tactical_optimizer, puzzle_dataloader, device, epochs=10)
-            
-            # Generate some self-play games after regular batch
-            self_play_count = min(5 + iterations // 2, 10)
-            print(f"Generating {self_play_count} self-play games...")
-            # Use MCTS by default now
-            self_play_games = generate_self_play_games(model, device, num_games=self_play_count, use_mcts=use_mcts)
-            
-            if self_play_games:
-                self_play_dataset = ChessDataset(self_play_games, augment=True)
-                # Windows fix: use num_workers=0 to avoid pickle errors
-                import platform
-                use_workers = 0 if platform.system() == 'Windows' else 1
-                self_play_dataloader = DataLoader(
-                    self_play_dataset,
-                    batch_size=optimal_batch_size,
-                    shuffle=True,
-                    num_workers=use_workers,
-                    pin_memory=True
-                )
-                train_batch(model, self_play_dataloader, puzzle_dataloader, save_path, state_file, 
-                        epochs=1, processed_games=processed_games, device=device)
-                
-                del self_play_games
-                del self_play_dataset
-                del self_play_dataloader
-                gc.collect()
-                clear_memory()
-
-            
-            # Run tactical test occasionally
-            if iterations % 3 == 0:
-                test_accuracy = test_tactical_recognition(model, device)
-                print(f"Tactical recognition accuracy: {test_accuracy:.2%}")
-            
-            # Only switch modes if not locked
-            if not is_mode_locked and iterations % 3 == 0 and not pro_state.get("all_pro_games_processed", False):
-                current_phase = "pro"
-                print("Switching to professional games mode for variety")
+            # Stay in self-play mode (no switching to deprecated modes)
         
         # Save checkpoint every iteration
         torch.save(model.state_dict(), save_path)
@@ -887,12 +698,8 @@ def main():
                 state = json.load(f)
                 processed_games = state.get("processed_games", 0)
         
-        if os.path.exists(pro_state_file):
-            with open(pro_state_file, 'r') as f:
-                pro_state = json.load(f)
-                pro_game_count = pro_state.get("processed_pro_games", 0)
         
-        print(f"Progress: {pro_game_count} professional games, {processed_games} regular games")
+        print(f"Progress: {processed_games} positions processed")
         
         # Give user a chance to interrupt gracefully
         print("Waiting 5 seconds before next iteration (Ctrl+C to stop)...")
@@ -906,4 +713,6 @@ def main():
 
 
 if __name__ == "__main__":
+    # Required for multiprocessing on Windows
+    mp.freeze_support()
     main()

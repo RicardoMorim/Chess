@@ -53,28 +53,30 @@ import chess
 # HARDWARE-SPECIFIC CONFIGURATION
 # ============================================================================
 HARDWARE_CONFIG = {
-    # CPU settings (i5-8th gen, 4C/8T)
-    "cpu_cores": 4,
-    "cpu_threads": 8,
+    # CPU settings (Intel Core Ultra 9 285K - 24 cores/24 threads)
+    "cpu_cores": 24,
+    "cpu_threads": 24,
     
     # DataLoader workers
-    # Rule: num_workers = min(cpu_cores, 4) for data loading
-    # Too many workers cause context switching overhead
-    "dataloader_workers": 3,        # Leave 1 core for main thread
-    "dataloader_prefetch": 2,       # Prefetch batches
+    # Ultra 9 handles context switching well. 
+    # Using 8 workers leaves plenty for system/GPU driving.
+    "dataloader_workers": 8,
+    "dataloader_prefetch": 4,       # Increase prefetch for high throughput
     
     # Self-play workers (for parallel game generation)
-    "selfplay_workers": 3,          # Parallel games
-    "mcts_batch_size": 8,           # Batch neural network calls
+    # Heavy multiprocessing to utilize the 24 cores
+    "selfplay_workers": 20,         
+    "mcts_batch_size": 256,         # Larger batch for efficient inference
     
-    # GPU settings (GTX 1050 2GB)
-    "max_batch_size": 32,           # Safe for 2GB VRAM
-    "gradient_accumulation": 2,     # Effective batch = 64
-    "enable_amp": True,             # Mixed precision training
+    # GPU settings (RTX 5080 16GB)
+    # 16GB VRAM allows ~1500-2000 batch size for "Big" model
+    "max_batch_size": 1536,         
+    "gradient_accumulation": 1,     # No need for accum with 1536 batch
+    "enable_amp": True,             # Mixed precision is critical for Tensor Cores
     
     # Memory management
-    "max_cached_positions": 100000, # Positions to keep in memory
-    "gc_frequency": 5,              # Run GC every N batches
+    "max_cached_positions": 500000, # More RAM available
+    "gc_frequency": 20,             # Less frequent GC needed
 }
 
 
@@ -174,9 +176,11 @@ def create_optimized_dataloader(dataset: Dataset, batch_size: int,
     config = HARDWARE_CONFIG
     
     # Windows has issues with multiprocessing DataLoader workers (pickle errors)
-    # Force num_workers=0 on Windows to avoid these issues
+    # ONLY if not protected by if __name__ == "__main__"
+    # We assume the user applies the fix, so we enable workers.
     if IS_WINDOWS:
-        num_workers = 0
+        # Still be conservative on Windows spawning overhead
+        num_workers = min(config["dataloader_workers"], 8)
     else:
         # Adjust workers based on dataset size
         num_workers = min(config["dataloader_workers"], len(dataset) // 100 + 1)
