@@ -1,35 +1,18 @@
-import time
-import numpy as np
-import torch
-import torch.nn.functional as F
-import chess
-import chess.pgn
-import threading
-from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Tuple, Optional, List, Any
-
-from .data import board_to_tensor, get_move_index
-from .utils import clear_memory
-from .constants import MCTS_CONFIG, ACTION_SPACE_SIZE
-
-
 # ============================================================================
 # MCTS NODE
 # ============================================================================
+import time, threading, numpy as np, torch, chess
+import torch.nn.functional as F
+from concurrent.futures import ThreadPoolExecutor
+from typing import List, Dict, Tuple, Optional
+from .data import board_to_tensor, get_move_index
+from .constants import ACTION_SPACE_SIZE, MCTS_CONFIG
+
+# ------------------------
+# Node
+# ------------------------
 class MCTSNode:
-    """Node in the Monte Carlo Tree Search.
-    
-    Each node stores:
-    - board: The chess position at this node
-    - prior: The policy network's prior probability for this move
-    - children: Dictionary of child nodes (move -> MCTSNode)
-    - visit_count: Number of times this node was visited
-    - value_sum: Sum of values backpropagated through this node
-    - virtual_loss: Penalty to discourage multiple threads selecting same path
-    """
-    __slots__ = ['board', 'prior', 'parent', 'children', 'visit_count', 
-                 'value_sum', 'virtual_loss', 'lock']
-    
+    __slots__ = ['board', 'prior', 'parent', 'children', 'visit_count', 'value_sum', 'virtual_loss', 'lock']
     def __init__(self, board: chess.Board, prior: float, parent=None):
         self.board = board.copy()
         self.prior = prior
@@ -39,16 +22,115 @@ class MCTSNode:
         self.value_sum = 0.0
         self.virtual_loss = 0
         self.lock = threading.Lock()
-
-    def value(self) -> float:
-        """Return the mean value of this node."""
-        if self.visit_count == 0:
-            return 0.0
-        return self.value_sum / self.visit_count
-    
-    def is_expanded(self) -> bool:
-        """Check if node has been expanded."""
+    def value(self):
+        return self.value_sum / self.visit_count if self.visit_count > 0 else 0.0
+    def is_expanded(self):
         return len(self.children) > 0
+
+# ------------------------
+# Batched Node Expansion
+# ------------------------
+def expand_nodes_batched(nodes: List[MCTSNode], model, device, add_noise=True):
+    if not nodes: return []
+
+    input_channels = getattr(model, "input_channels", 22)
+    boards = np.stack([board_to_tensor(n.board, n.board.fullmove_number, input_channels) for n in nodes])
+    boards_tensor = torch.tensor(boards, dtype=torch.float32).to(device)
+
+    if device.startswith("cuda"):
+        boards_tensor = boards_tensor.half()  # FP16 for throughput
+
+    with torch.no_grad():
+        policy_logits, values = model(boards_tensor)
+        policy_probs = torch.softmax(policy_logits, dim=1).cpu().numpy()
+        values = values.cpu().numpy().flatten()
+
+    for idx, node in enumerate(nodes):
+        legal_moves = list(node.board.legal_moves)
+        if not legal_moves:
+            continue
+        priors = np.array([policy_probs[idx][get_move_index(m)] for m in legal_moves], dtype=np.float32)
+        priors /= (priors.sum() + 1e-8)
+        # Dirichlet noise at root
+        if add_noise:
+            noise = np.random.dirichlet([0.3]*len(legal_moves))
+            priors = 0.75*priors + 0.25*noise
+        for move, prior in zip(legal_moves, priors):
+            child_board = node.board.copy()
+            child_board.push(move)
+            node.children[move] = MCTSNode(child_board, prior, parent=node)
+    return values
+
+# ------------------------
+# Batched Simulation
+# ------------------------
+def simulate_batched(root: MCTSNode, model, device, c_puct=2.5, virtual_loss=1.0):
+    """Run one simulation from root, batched across leaves."""
+    path = []
+    node = root
+    # Selection
+    while node.is_expanded():
+        best_score = -float("inf")
+        best_child = None
+        sqrt_parent_visits = np.sqrt(node.visit_count + 1)
+        for move, child in node.children.items():
+            with child.lock:
+                q = child.value()
+                u = c_puct * child.prior * sqrt_parent_visits / (1 + child.visit_count + child.virtual_loss)
+                score = q + u
+            if score > best_score:
+                best_score = score
+                best_child = child
+        if best_child is None: break
+        path.append(best_child)
+        with best_child.lock:
+            best_child.virtual_loss += virtual_loss
+        node = best_child
+
+    # Expansion + Evaluation
+    if not node.is_expanded() and not node.board.is_game_over():
+        value = expand_nodes_batched([node], model, device, add_noise=True)[0]
+    else:
+        value = 0.0 if node.board.is_game_over() else node.value()
+
+    # Backpropagate
+    for n in [root]+path[::-1]:
+        with n.lock:
+            n.value_sum += value
+            n.visit_count += 1
+            if n != root:
+                n.virtual_loss -= virtual_loss
+        value = -value  # alternate sides
+
+# ------------------------
+# Batched MCTS Runner
+# ------------------------
+def run_mcts_batched(root_board: chess.Board, model, device, num_simulations=800, parallel_workers=24):
+    root = MCTSNode(root_board, prior=1.0)
+    expand_nodes_batched([root], model, device, add_noise=True)
+
+    with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+        futures = [executor.submit(simulate_batched, root, model, device) for _ in range(num_simulations)]
+        for f in futures:
+            f.result()
+    
+    # Collect move counts
+    visit_counts = {m: c.visit_count for m, c in root.children.items()}
+    return visit_counts, root
+
+# ------------------------
+# Batched Move Selection
+# ------------------------
+def select_move(root_board: chess.Board, model, device, num_simulations=800, temperature=1.0, parallel_workers=24):
+    visit_counts, root = run_mcts_batched(root_board, model, device, num_simulations, parallel_workers)
+    moves = list(visit_counts.keys())
+    counts = np.array([visit_counts[m] for m in moves], dtype=np.float32)
+    if temperature == 0:
+        best_idx = np.argmax(counts)
+        return moves[best_idx], root
+    counts_temp = np.power(counts + 1e-8, 1.0/temperature)
+    probs = counts_temp / counts_temp.sum()
+    return np.random.choice(moves, p=probs), root
 
 
 # ============================================================================
