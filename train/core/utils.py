@@ -5,8 +5,8 @@ import chess
 import numpy as np
 from typing import List, Tuple
 
-from constants import TACTICAL_TEST_POSITIONS
-from data import board_to_tensor, get_move_index
+from core.constants import TACTICAL_TEST_POSITIONS
+from core.data import board_to_tensor, get_move_index
 
 
 # ============================================================================

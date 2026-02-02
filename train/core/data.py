@@ -11,7 +11,7 @@ import glob
 import time
 from torch.utils.data import Dataset
 
-from constants import promotion_moves
+from .constants import promotion_moves
 
 def get_move_index(move):
     """Get the index of a move in the policy vector"""

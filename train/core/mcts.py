@@ -8,12 +8,9 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Tuple, Optional, List, Any
 
-from data import board_to_tensor, get_move_index
-
-from utils import clear_memory
-
-# Import frozen MCTS configuration from constants
-from constants import MCTS_CONFIG
+from .data import board_to_tensor, get_move_index
+from .utils import clear_memory
+from .constants import MCTS_CONFIG, ACTION_SPACE_SIZE
 
 
 # ============================================================================
@@ -492,3 +489,72 @@ def _fallback_move_selection(board, model, device, input_channels):
         move_probs /= np.sum(move_probs)
     
     return np.random.choice(legal_moves, p=move_probs)
+
+
+# ============================================================================
+# MCTS WRAPPER CLASS (for league self-play workers)
+# ============================================================================
+class MCTS:
+    """
+    Lightweight MCTS wrapper with a simple search() API.
+    Returns a full policy vector (size ACTION_SPACE_SIZE) and selected move.
+    """
+
+    def __init__(
+        self,
+        model,
+        device,
+        num_visits: int = 800,
+        c_puct: float = 2.5,
+        temperature: float = 1.0,
+        dirichlet_alpha: float = None,
+        add_noise: bool = True,
+        parallel_workers: int = 4,
+        virtual_loss: float = 1.0,
+    ) -> None:
+        self.model = model
+        self.device = device
+        self.num_visits = num_visits
+        self.c_puct = c_puct
+        self.temperature = temperature
+        self.dirichlet_alpha = dirichlet_alpha
+        self.add_noise = add_noise
+        self.parallel_workers = parallel_workers
+        self.virtual_loss = virtual_loss
+
+    def search(self, board: chess.Board):
+        """Run MCTS and return (policy_vector, selected_move)."""
+        visit_counts, _root = run_mcts(
+            board,
+            self.model,
+            self.device,
+            num_simulations=self.num_visits,
+            c_puct=self.c_puct,
+            virtual_loss=self.virtual_loss,
+            parallel_workers=self.parallel_workers,
+            add_noise=self.add_noise,
+        )
+
+        legal_moves = list(visit_counts.keys())
+        if not legal_moves:
+            return np.zeros(ACTION_SPACE_SIZE, dtype=np.float32), None
+
+        counts = np.array([visit_counts[m] for m in legal_moves], dtype=np.float32)
+
+        # Temperature-scaled selection
+        if self.temperature == 0 or np.sum(counts) == 0:
+            probs = np.zeros_like(counts)
+            probs[np.argmax(counts)] = 1.0
+        else:
+            counts_temp = np.power(counts + 1e-8, 1.0 / self.temperature)
+            probs = counts_temp / np.sum(counts_temp)
+
+        # Build full policy vector
+        policy = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
+        for move, p in zip(legal_moves, probs):
+            idx = get_move_index(move)
+            if idx < ACTION_SPACE_SIZE:
+                policy[idx] = p
+
+        selected_move = np.random.choice(legal_moves, p=probs)
+        return policy, selected_move
