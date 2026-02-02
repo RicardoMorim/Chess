@@ -100,7 +100,11 @@ class MetricsCollector:
             variant: Optional variant name
         """
         with self.lock:
-            counter_key = f"{variant}_{name}" if variant else name
+            # Don't double-prefix if name already has variant prefix
+            if variant and not name.startswith(f"{variant}_"):
+                counter_key = f"{variant}_{name}"
+            else:
+                counter_key = name
             self.counters[counter_key] += increment
     
     def set_gauge(
@@ -118,7 +122,11 @@ class MetricsCollector:
             variant: Optional variant name
         """
         with self.lock:
-            gauge_key = f"{variant}_{name}" if variant else name
+            # Don't double-prefix if name already has variant prefix
+            if variant and not name.startswith(f"{variant}_"):
+                gauge_key = f"{variant}_{name}"
+            else:
+                gauge_key = name
             self.gauges[gauge_key] = value
     
     def record_self_play_game(

@@ -164,6 +164,11 @@ def _play_single_game(
     
     input_channels = getattr(model, "input_channels", model_config.get("input_channels", 22))
     
+    # Resignation logic: track recent values to detect mate threats
+    recent_values = []  # Last 3 values from perspective of current side
+    resignation_threshold = -0.9
+    resignation_count_needed = 3
+    
     while not board.is_game_over() and move_count < max_moves:
         # Check time limit
         if time.time() - game_start_time > max_game_time:
@@ -195,6 +200,22 @@ def _play_single_game(
                     "worker_id": worker_id,
                 })
             return None
+        
+        # Check for resignation condition
+        # Extract value estimate from policy (MCTS root value)
+        try:
+            # Try to get value from MCTS node if available
+            if hasattr(mcts, '_last_value'):
+                move_value = mcts._last_value
+                recent_values.append(move_value)
+                recent_values = recent_values[-resignation_count_needed:]  # Keep last N
+                
+                # Resign if last N values consistently bad (mate threat detected)
+                if len(recent_values) >= resignation_count_needed and all(v < resignation_threshold for v in recent_values):
+                    logger.info(f"Worker {worker_id}: Resignation at move {move_count} (value={recent_values[-1]:.3f})")
+                    break
+        except (AttributeError, TypeError):
+            pass  # MCTS doesn't expose value, continue anyway
         
         # Store position and policy
         game_data.append((position, policy, None))  # Value set later

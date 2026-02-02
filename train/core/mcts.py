@@ -535,6 +535,9 @@ class MCTS:
             add_noise=self.add_noise,
         )
 
+        # Store root value for resignation logic
+        self._last_value = _root.value() if _root else 0.0
+
         legal_moves = list(visit_counts.keys())
         if not legal_moves:
             return np.zeros(ACTION_SPACE_SIZE, dtype=np.float32), None

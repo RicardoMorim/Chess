@@ -57,16 +57,17 @@ class LeagueTrainer:
     
     # Training hyperparameters (BOOTSTRAP: minimal until flow validated)
     VARIANTS = ["baseline", "attack", "est"]
-    NUM_SELF_PLAY_WORKERS = 1  # Start minimal
-    GAMES_PER_WORKER_PER_ROUND = 1  # Validate flow first
-    BATCH_SIZE = 64  # Smaller for faster feedback
-    TRAINING_STEPS_PER_ROUND = 5  # Validate before scaling
-    CHECKPOINT_EVERY_N_ROUNDS = 1  # Frequent saves
+    # Parallelism config (SCALED UP - post-validation)
+    NUM_SELF_PLAY_WORKERS = 4  # CPU cores for parallel self-play
+    GAMES_PER_WORKER_PER_ROUND = 5  # Multiple games per worker
+    BATCH_SIZE = 128  # Larger batches for GPU efficiency
+    TRAINING_STEPS_PER_ROUND = 10  # More gradient updates per round
+    CHECKPOINT_EVERY_N_ROUNDS = 5  # Checkpoint every 5 rounds
     EVAL_EVERY_N_ROUNDS = 100  # Skip for now
     
-    # MCTS hyperparameters (DRASTICALLY REDUCED for bootstrap)
-    MCTS_VISITS_TRAINING = 16  # Minimal for validation
-    MCTS_VISITS_EVAL = 32
+    # MCTS hyperparameters (INTERMEDIATE - quality signal without full 800 visits)
+    MCTS_VISITS_TRAINING = 64  # Meaningful search depth
+    MCTS_VISITS_EVAL = 128
     C_PUCT = 4.0
     TEMPERATURE = 1.0
     DIRICHLET_ALPHA = 0.3
@@ -214,12 +215,16 @@ class LeagueTrainer:
         # Collect results
         num_games_expected = self.NUM_SELF_PLAY_WORKERS * self.GAMES_PER_WORKER_PER_ROUND
         games_collected = 0
+        errors = 0
+        
+        logger.info(f"{variant}: Waiting for {num_games_expected} games from {self.NUM_SELF_PLAY_WORKERS} workers...")
         
         for _ in range(num_games_expected):
             result = queue.get()
             
             if "error" in result:
-                logger.error(f"Worker error: {result['error']}")
+                logger.error(f"Worker {result.get('worker_id', '?')} error: {result['error']}")
+                errors += 1
                 continue
             
             game_data = result["game_data"]
@@ -232,12 +237,18 @@ class LeagueTrainer:
             game_length = len(game_data)
             outcome = "1-0"  # Would need to extract from game_data
             self.metrics.record_self_play_game(variant, game_length, outcome)
+            
+            # Progress indicator
+            if games_collected % 5 == 0 or games_collected == num_games_expected:
+                logger.info(f"{variant}: Collected {games_collected}/{num_games_expected} games...")
         
         # Wait for workers to finish
         for p in processes:
             p.join()
         
-        logger.info(f"{variant}: Collected {games_collected} games")
+        if errors > 0:
+            logger.warning(f"{variant}: {errors}/{num_games_expected} games failed")
+        logger.info(f"{variant}: ✓ Collected {games_collected} games (avg {sum([len(result['game_data']) for result in []])/max(1,games_collected):.0f} moves)" if games_collected > 0 else f"{variant}: Collected {games_collected} games")
         return games_collected
     
     def train_model(self, variant: str) -> float:
@@ -414,10 +425,29 @@ class LeagueTrainer:
             
             # Metrics summary
             round_time = time.time() - round_start
+            summary = self.metrics.get_summary()
+            
             logger.info(f"\n{'='*60}")
             logger.info(f"✓ ROUND {round_num} COMPLETE ({round_time:.1f}s)")
-            logger.info(f"Total games: {self.total_games}")
+            logger.info(f"{'='*60}")
+            logger.info(f"Total games generated: {self.total_games}")
             logger.info(f"Total training steps: {self.total_training_steps}")
+            logger.info("")
+            
+            # Per-variant stats
+            for variant in self.VARIANTS:
+                v_stats = summary.get("variants", {}).get(variant, {})
+                logger.info(f"{variant.upper()}:")
+                logger.info(f"  Games: {v_stats.get('games', 0)}")
+                logger.info(f"  Train steps: {v_stats.get('train_steps', 0)}")
+                logger.info(f"  Buffer: {v_stats.get('buffer_size', 0)}/{self.REPLAY_BUFFER_MAX_SIZE} "
+                           f"({v_stats.get('buffer_fill_ratio', 0)*100:.1f}%)")
+                if 'recent_loss' in v_stats:
+                    logger.info(f"  Recent loss: {v_stats['recent_loss']:.4f}")
+                if 'avg_game_length' in v_stats:
+                    logger.info(f"  Avg game length: {v_stats['avg_game_length']:.1f} moves")
+                logger.info("")
+            
             logger.info(f"{'='*60}\n")
             self.metrics.log_summary(f"Round {round_num} complete ({round_time:.1f}s)")
             self.metrics.save_checkpoint(f"round_{round_num}")
