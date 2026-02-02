@@ -115,7 +115,8 @@ def main():
     logger.info(f"Training steps per round: {trainer.TRAINING_STEPS_PER_ROUND}")
     logger.info(f"Checkpoint every N rounds: {trainer.CHECKPOINT_EVERY_N_ROUNDS}")
     logger.info(f"Evaluate every N rounds: {trainer.EVAL_EVERY_N_ROUNDS}")
-    logger.info(f"MCTS visits (training): {trainer.MCTS_VISITS_TRAINING}")
+    logger.info(f"MCTS visits (self-play): {trainer.MCTS_VISITS_SELFPLAY}")
+    logger.info(f"MCTS visits (evaluation): {trainer.MCTS_VISITS_EVAL}")
     logger.info(f"Temperature: {trainer.TEMPERATURE}")
     logger.info("="*60 + "\n")
     

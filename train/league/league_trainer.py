@@ -66,8 +66,10 @@ class LeagueTrainer:
     EVAL_EVERY_N_ROUNDS = 100  # Skip for now
     
     # MCTS hyperparameters (INTERMEDIATE - quality signal without full 800 visits)
-    MCTS_VISITS_TRAINING = 64  # Meaningful search depth
-    MCTS_VISITS_EVAL = 128
+    # Self-play: FAST generation of training data (CPU-bound, volume matters)
+    MCTS_VISITS_SELFPLAY = 16  # Fast, generate data efficiently (NO bottleneck)
+    # Evaluation: SLOWER, higher quality comparisons between models
+    MCTS_VISITS_EVAL = 64  # Meaningful search for model assessment
     C_PUCT = 4.0
     TEMPERATURE = 1.0
     DIRICHLET_ALPHA = 0.3
@@ -199,7 +201,7 @@ class LeagueTrainer:
                     queue,
                     self.model_configs[variant],
                     {
-                        "num_visits": self.MCTS_VISITS_TRAINING,
+                        "num_visits": self.MCTS_VISITS_SELFPLAY,  # Fast self-play
                         "temperature": self.TEMPERATURE,
                         "c_puct": self.C_PUCT,
                         "dirichlet_alpha": self.DIRICHLET_ALPHA,
