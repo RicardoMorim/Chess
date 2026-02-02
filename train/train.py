@@ -1,718 +1,562 @@
-import time
-import torch
-from torch.utils.data import DataLoader
+"""
+3-Phase Curriculum Training for Chess AI
+=========================================
+
+Phase 1: Puzzle Bootcamp (Isolated)
+    - Train exclusively on tactical puzzles
+    - Focus on checkmate patterns and tactics
+    - Target: 75% tactical accuracy
+    
+Phase 2: Transition (Brief)
+    - Generate initial self-play games
+    - Mix puzzle knowledge with self-play data
+    - Target: Smooth handoff to pure self-play
+
+Phase 3: Pure Self-Play (Convergence Loop)
+    - Generate high-quality games via MCTS
+    - Train on self-play only
+    - Optional: Periodic checkmate reinforcement
+    - Loop forever until convergence
+
+Hardware: RTX 5080 16GB + Intel Ultra 9 24-core
+"""
+
 import os
-import glob
-import json
-import signal
 import sys
-import gc
-import random
+import time
+import json
+import torch
 import argparse
 import multiprocessing as mp
+from pathlib import Path
+from torch.utils.data import DataLoader, ConcatDataset
 
-
-from models import ChessNet, create_chess_model, load_model_with_compatibility
-from data import (ChessDataset, PuzzleDataset, CurriculumPuzzleDataset,
-                 load_puzzles, load_lichess_puzzles, filter_and_prioritize_puzzles_cached, 
-                 load_games_in_batches, expand_mate_sequences)
-
-from utils import clear_memory, test_tactical_recognition, get_optimal_batch_size, model_summary
-from self_play import generate_self_play_games, run_self_play_training, generate_self_play_games_from_endgame
-from training import train_batch, train_tactical
-from checkmate_training import run_checkmate_bootcamp, run_checkmate_reinforcement
-
-# Import frozen training constants
+# Model and data
+from models import create_model, load_model_with_compatibility
+from data import PuzzleDataset, SelfPlayDataset, load_lichess_puzzles
 from constants import (
-    MODEL_CONFIG, MODEL_SIZE_ALIASES,
+    MODEL_CONFIG, VALID_VARIANTS,
+    CURRICULUM_CONFIG, TRAINING_CONFIG,
     MCTS_CONFIG, SELF_PLAY_CONFIG,
-    SAMPLE_RATIOS, VALUE_WEIGHT,
-    ACTION_SPACE_SIZE, DIRICHLET_ALPHA, DIRICHLET_EPSILON
+    HARDWARE_CONFIG
 )
 
-# Import advanced training utilities
-try:
-    from training_utils import (
-        EMA, CheckpointManager, TensorBoardLogger, StockfishEvaluator,
-        run_validation, generate_validation_positions
-    )
-    HAS_TRAINING_UTILS = True
-    print("✓ Advanced training utilities loaded")
-except ImportError as e:
-    HAS_TRAINING_UTILS = False
-    print(f"⚠ Advanced training utilities not available: {e}")
+# Training utilities
+from utils import clear_memory, test_tactical_recognition, model_summary
+from self_play import generate_self_play_games
+from training import train_on_self_play
+from checkmate_training import run_checkmate_bootcamp, run_checkmate_reinforcement
 
-# Import optimizations
+# Optional advanced features
 try:
-    from optimizations import (
-        HARDWARE_CONFIG, 
-        create_optimized_dataloader,
-        AsyncDataPrefetcher,
-        aggressive_memory_cleanup,
-        print_memory_stats
-    )
+    from training_utils import CheckpointManager, TensorBoardLogger, StockfishEvaluator
+    HAS_TRAINING_UTILS = True
+except ImportError:
+    HAS_TRAINING_UTILS = False
+    print("⚠ Advanced training utilities not available")
+
+try:
+    from optimizations import create_optimized_dataloader, aggressive_memory_cleanup
     HAS_OPTIMIZATIONS = True
-    print("✓ Training optimizations loaded")
 except ImportError:
     HAS_OPTIMIZATIONS = False
-    print("⚠ Optimizations not available, using defaults")
+    print("⚠ Optimizations not available")
 
-# Set device
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
+
 if device.type == 'cuda':
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     
-    # Enable TF32 for faster training on Ampere+ GPUs (RTX 30xx/40xx/50xx)
+    # Enable TF32 for Ampere+ GPUs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    
-    # Set high precision for matmul (new in PyTorch 2.x)
     try:
         torch.set_float32_matmul_precision('high')
-        print("✓ TF32 high precision enabled")
     except AttributeError:
         pass
-    
-    # Enable cudnn benchmark for consistent input sizes
     torch.backends.cudnn.benchmark = True
 
 
-# Signal handler 
-def signal_handler(sig, frame, model, save_path, state_file, processed_games, current_epoch):
-    print("\nTraining interrupted! Saving model and state...")
-    torch.save(model.state_dict(), save_path)
-    with open(state_file, 'w') as f:
-        state = {"processed_games": processed_games, "last_epoch": current_epoch + 1}
-        json.dump(state, f)
-    print(f"Model saved to {save_path}, state saved to {state_file}")
-    sys.exit(0)
-
-
-def parse_arguments():
-    parser = argparse.ArgumentParser(description="Chess AI Training Script (Improved)")
+def parse_args():
+    parser = argparse.ArgumentParser(description="3-Phase Curriculum Chess AI Training")
     
-    # Training mode (only puzzles and self-play per AlphaZero principles)
-    parser.add_argument("mode", nargs="?", default=None, choices=["self-play", "puzzles"], 
-                        help="Training mode: self-play or puzzles (for checkmate training)")
+    # Model selection
+    parser.add_argument("--variant", default="baseline", choices=VALID_VARIANTS,
+                        help="Model variant: baseline, attack, or est")
     
-    # Model parameters
-    parser.add_argument("--model", default="big", choices=["limited", "small", "medium", "big"], 
-                        help="Model size: limited, small, medium, big")
+    parser.add_argument("--checkpoint-dir", type=str, default=None,
+                        help="Directory for checkpoints (default: ./checkpoints_{variant})")
     
-    parser.add_argument("--model-path", default=None, 
-                        help="Path to save/load the model (default: ./checkpoints_[model_size]/model_best.pt)")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Resume from checkpoint path")
     
-    parser.add_argument("--legacy", action="store_true",
-                        help="Load legacy model architecture (for old checkpoints)")
+    # Phase control
+    parser.add_argument("--start-phase", type=int, default=1, choices=[1, 2, 3],
+                        help="Start from phase (1=Puzzle Bootcamp, 2=Transition, 3=Self-Play)")
     
-    parser.add_argument("--no-se", action="store_true",
-                        help="Disable Squeeze-and-Excitation blocks")
+    parser.add_argument("--skip-bootcamp", action="store_true",
+                        help="Skip checkmate bootcamp in Phase 1")
     
-    # MCTS parameters
-    parser.add_argument("--no-mcts", action="store_true", 
-                        help="Disable MCTS for self-play (faster but lower quality)")
-    
-    parser.add_argument("--fast-mcts", action="store_true", 
-                        help="Use fast MCTS for self-play (balanced speed/quality)")
-    
-    # Checkmate training parameters
-    parser.add_argument("--checkmate-bootcamp", action="store_true",
-                        help="Run intensive checkmate training before main training (one-time)")
-    
-    parser.add_argument("--checkmate-interval", type=int, default=3,
-                        help="Run checkmate reinforcement every N iterations (default: 3, 0=disabled)")
-    
-    parser.add_argument("--curriculum", action="store_true",
-                        help="Use curriculum learning for puzzles (progressive difficulty)")
-    
-    parser.add_argument("--endgame-start", action="store_true",
-                        help="Start self-play games from endgame positions near checkmate")
-    
-    # Advanced training features
-    parser.add_argument("--ema", action="store_true",
-                        help="Use EMA (Exponential Moving Average) for stable model weights")
-    
-    parser.add_argument("--ema-decay", type=float, default=0.999,
-                        help="EMA decay rate (default: 0.999, higher = more stable)")
-    
+    # Optional features
     parser.add_argument("--tensorboard", action="store_true",
-                        help="Enable TensorBoard logging for training metrics")
-    
-    parser.add_argument("--tensorboard-dir", type=str, default="runs",
-                        help="TensorBoard log directory (default: runs)")
-    
-    parser.add_argument("--validate-every", type=int, default=1,
-                        help="Run validation every N epochs (default: 1, 0=disabled)")
+                        help="Enable TensorBoard logging")
     
     parser.add_argument("--stockfish-eval", action="store_true",
-                        help="Evaluate model against Stockfish (requires stockfish binary)")
+                        help="Evaluate with Stockfish (optional)")
     
     parser.add_argument("--stockfish-path", type=str, default=None,
                         help="Path to Stockfish executable")
     
-    # Self-play parameters when in self-play mode
-    parser.add_argument("games", nargs="?", type=int, default=None,
-                        help="Number of games per batch in self-play mode")
-    
-    parser.add_argument("iterations", nargs="?", type=int, default=None,
-                        help="Number of iterations per cycle in self-play mode")
-    
     args = parser.parse_args()
     
-    # Set defaults based on arguments - use checkpoints_{model}/ folder
-    if args.model_path is None:
-        args.model_path = f"./checkpoints_{args.model}/model_best.pt"
-        
-    # Backward compatibility for positional arguments
-    if len(sys.argv) > 1 and sys.argv[1] in ["pro", "regular", "self-play"] and args.mode is None:
-        args.mode = sys.argv[1]
+    # Set default checkpoint directory
+    if args.checkpoint_dir is None:
+        args.checkpoint_dir = f"./checkpoints_{args.variant}"
     
     return args
 
 
-# Main execution function
+def phase1_puzzle_bootcamp(model, variant, checkpoint_dir, args):
+    """
+    Phase 1: Isolated puzzle training to bootstrap tactical knowledge
+    """
+    print("\n" + "="*80)
+    print("PHASE 1: PUZZLE BOOTCAMP (ISOLATED)")
+    print("="*80)
+    print("Goal: Bootstrap tactical priors and checkmate patterns")
+    print(f"Epochs: {CURRICULUM_CONFIG['phase1_epochs']}")
+    print(f"Batch size: {CURRICULUM_CONFIG['phase1_batch_size']}")
+    print(f"Target accuracy: {CURRICULUM_CONFIG['phase1_target_accuracy']:.1%}")
+    print("="*80 + "\n")
+    
+    # Optional: Intensive checkmate bootcamp first
+    if CURRICULUM_CONFIG['phase1_checkmate_bootcamp'] and not args.skip_bootcamp:
+        print("Running Checkmate Bootcamp (intensive)...\n")
+        run_checkmate_bootcamp(
+            model=model,
+            device=device,
+            input_channels=MODEL_CONFIG[variant]['input_channels'],
+            epochs=10,
+            batch_size=CURRICULUM_CONFIG['phase1_batch_size']
+        )
+        
+        # Save bootcamp checkpoint
+        bootcamp_path = os.path.join(checkpoint_dir, "phase1_bootcamp.pt")
+        torch.save(model.state_dict(), bootcamp_path)
+        print(f"✓ Checkmate bootcamp complete, saved to {bootcamp_path}\n")
+    
+    # Load puzzle datasets
+    print("Loading Lichess puzzle database...")
+    puzzles = load_lichess_puzzles()
+    print(f"✓ Loaded {len(puzzles)} puzzles\n")
+    
+    # Create puzzle dataset
+    puzzle_dataset = PuzzleDataset(
+        puzzles=puzzles,
+        input_channels=MODEL_CONFIG[variant]['input_channels']
+    )
+    
+    # Create dataloader
+    if HAS_OPTIMIZATIONS:
+        puzzle_loader = create_optimized_dataloader(
+            puzzle_dataset,
+            batch_size=CURRICULUM_CONFIG['phase1_batch_size'],
+            shuffle=True,
+            num_workers=HARDWARE_CONFIG['dataloader_workers'],
+            pin_memory=HARDWARE_CONFIG['pin_memory']
+        )
+    else:
+        puzzle_loader = DataLoader(
+            puzzle_dataset,
+            batch_size=CURRICULUM_CONFIG['phase1_batch_size'],
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True
+        )
+    
+    # Setup optimizer
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=TRAINING_CONFIG['sgd_lr'],
+        momentum=TRAINING_CONFIG['sgd_momentum'],
+        weight_decay=TRAINING_CONFIG['weight_decay']
+    )
+    
+    # Setup scheduler
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=CURRICULUM_CONFIG['phase1_epochs']
+    )
+    
+    # Training loop
+    best_accuracy = 0.0
+    for epoch in range(CURRICULUM_CONFIG['phase1_epochs']):
+        model.train()
+        total_loss = 0
+        correct = 0
+        total = 0
+        
+        for batch_idx, (states, policy_targets, value_targets) in enumerate(puzzle_loader):
+            states = states.to(device)
+            policy_targets = policy_targets.to(device)
+            value_targets = value_targets.to(device)
+            
+            optimizer.zero_grad()
+            
+            policy_logits, value_preds = model(states)
+            
+            # Loss calculation
+            policy_loss = torch.nn.functional.cross_entropy(policy_logits, policy_targets)
+            value_loss = torch.nn.functional.mse_loss(value_preds.squeeze(), value_targets)
+            loss = policy_loss + value_loss
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), TRAINING_CONFIG['grad_clip'])
+            optimizer.step()
+            
+            total_loss += loss.item()
+            
+            # Accuracy
+            predictions = torch.argmax(policy_logits, dim=1)
+            targets = torch.argmax(policy_targets, dim=1)
+            correct += (predictions == targets).sum().item()
+            total += states.size(0)
+        
+        scheduler.step()
+        
+        avg_loss = total_loss / len(puzzle_loader)
+        accuracy = correct / total
+        
+        print(f"Epoch {epoch+1}/{CURRICULUM_CONFIG['phase1_epochs']}: "
+              f"Loss={avg_loss:.4f}, Accuracy={accuracy:.2%}, LR={scheduler.get_last_lr()[0]:.6f}")
+        
+        # Save best model
+        if accuracy > best_accuracy:
+            best_accuracy = accuracy
+            best_path = os.path.join(checkpoint_dir, "phase1_best.pt")
+            torch.save(model.state_dict(), best_path)
+            print(f"  ✓ New best accuracy: {accuracy:.2%}, saved to {best_path}")
+        
+        # Check if target reached
+        if accuracy >= CURRICULUM_CONFIG['phase1_target_accuracy']:
+            print(f"\n✓ Target accuracy {CURRICULUM_CONFIG['phase1_target_accuracy']:.1%} reached!")
+            break
+    
+    # Final save
+    final_path = os.path.join(checkpoint_dir, "phase1_final.pt")
+    torch.save(model.state_dict(), final_path)
+    print(f"\nPhase 1 complete! Final accuracy: {best_accuracy:.2%}")
+    print(f"Model saved to {final_path}\n")
+    
+    return model
+
+
+def phase2_transition(model, variant, checkpoint_dir, args):
+    """
+    Phase 2: Brief transition to self-play with initial game generation
+    """
+    print("\n" + "="*80)
+    print("PHASE 2: TRANSITION (BRIEF HANDOFF)")
+    print("="*80)
+    print("Goal: Generate initial self-play games and blend knowledge")
+    print(f"Epochs: {CURRICULUM_CONFIG['phase2_epochs']}")
+    print(f"Games to generate: {CURRICULUM_CONFIG['phase2_games']}")
+    print(f"MCTS simulations: {CURRICULUM_CONFIG['phase2_mcts_sims']}")
+    print("="*80 + "\n")
+    
+    # Generate initial self-play games
+    print(f"Generating {CURRICULUM_CONFIG['phase2_games']} self-play games...")
+    
+    replay_dir = os.path.join(checkpoint_dir, "replay_buffer")
+    os.makedirs(replay_dir, exist_ok=True)
+    
+    games = generate_self_play_games(
+        model=model,
+        device=device,
+        input_channels=MODEL_CONFIG[variant]['input_channels'],
+        num_games=CURRICULUM_CONFIG['phase2_games'],
+        num_simulations=CURRICULUM_CONFIG['phase2_mcts_sims'],
+        num_workers=HARDWARE_CONFIG['selfplay_workers']
+    )
+    
+    print(f"✓ Generated {len(games)} games\n")
+    
+    # Save games to replay buffer
+    replay_path = os.path.join(replay_dir, "phase2_games.json")
+    with open(replay_path, 'w') as f:
+        json.dump(games, f)
+    print(f"✓ Saved games to {replay_path}\n")
+    
+    # Create self-play dataset
+    selfplay_dataset = SelfPlayDataset(
+        games=games,
+        input_channels=MODEL_CONFIG[variant]['input_channels']
+    )
+    
+    # Load puzzles for blending
+    puzzles = load_lichess_puzzles()
+    puzzle_dataset = PuzzleDataset(
+        puzzles=puzzles[:10000],  # Subset for transition
+        input_channels=MODEL_CONFIG[variant]['input_channels']
+    )
+    
+    # Mix datasets (50/50)
+    combined_dataset = ConcatDataset([selfplay_dataset, puzzle_dataset])
+    
+    # Create dataloader
+    if HAS_OPTIMIZATIONS:
+        dataloader = create_optimized_dataloader(
+            combined_dataset,
+            batch_size=CURRICULUM_CONFIG['phase1_batch_size'],
+            shuffle=True,
+            num_workers=HARDWARE_CONFIG['dataloader_workers']
+        )
+    else:
+        dataloader = DataLoader(
+            combined_dataset,
+            batch_size=CURRICULUM_CONFIG['phase1_batch_size'],
+            shuffle=True,
+            num_workers=4
+        )
+    
+    # Setup optimizer
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=TRAINING_CONFIG['sgd_lr'],
+        momentum=TRAINING_CONFIG['sgd_momentum'],
+        weight_decay=TRAINING_CONFIG['weight_decay']
+    )
+    
+    # Training loop
+    for epoch in range(CURRICULUM_CONFIG['phase2_epochs']):
+        model.train()
+        total_loss = 0
+        
+        for states, policy_targets, value_targets in dataloader:
+            states = states.to(device)
+            policy_targets = policy_targets.to(device)
+            value_targets = value_targets.to(device)
+            
+            optimizer.zero_grad()
+            
+            policy_logits, value_preds = model(states)
+            
+            policy_loss = torch.nn.functional.cross_entropy(policy_logits, policy_targets)
+            value_loss = torch.nn.functional.mse_loss(value_preds.squeeze(), value_targets)
+            loss = policy_loss + value_loss
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), TRAINING_CONFIG['grad_clip'])
+            optimizer.step()
+            
+            total_loss += loss.item()
+        
+        avg_loss = total_loss / len(dataloader)
+        print(f"Epoch {epoch+1}/{CURRICULUM_CONFIG['phase2_epochs']}: Loss={avg_loss:.4f}")
+    
+    # Save transition checkpoint
+    transition_path = os.path.join(checkpoint_dir, "phase2_final.pt")
+    torch.save(model.state_dict(), transition_path)
+    print(f"\nPhase 2 complete! Model saved to {transition_path}\n")
+    
+    return model
+
+
+def phase3_pure_selfplay(model, variant, checkpoint_dir, args):
+    """
+    Phase 3: Pure self-play convergence loop (runs forever)
+    """
+    print("\n" + "="*80)
+    print("PHASE 3: PURE SELF-PLAY (CONVERGENCE LOOP)")
+    print("="*80)
+    print("Goal: Converge to optimal play through self-improvement")
+    print(f"Games per iteration: {CURRICULUM_CONFIG['phase3_games_per_iteration']}")
+    print(f"Training epochs: {CURRICULUM_CONFIG['phase3_training_epochs']}")
+    print(f"Batch size: {CURRICULUM_CONFIG['phase3_batch_size']}")
+    print(f"MCTS simulations: {CURRICULUM_CONFIG['phase3_mcts_sims']}")
+    print("Note: This phase runs indefinitely (Ctrl+C to stop)")
+    print("="*80 + "\n")
+    
+    replay_dir = os.path.join(checkpoint_dir, "replay_buffer")
+    os.makedirs(replay_dir, exist_ok=True)
+    
+    iteration = 0
+    
+    # Setup optimizer
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=TRAINING_CONFIG['sgd_lr'],
+        momentum=TRAINING_CONFIG['sgd_momentum'],
+        weight_decay=TRAINING_CONFIG['weight_decay']
+    )
+    
+    try:
+        while True:
+            iteration += 1
+            print(f"\n{'='*80}")
+            print(f"SELF-PLAY ITERATION {iteration}")
+            print(f"{'='*80}\n")
+            
+            # Generate self-play games
+            print(f"Generating {CURRICULUM_CONFIG['phase3_games_per_iteration']} games...")
+            start_time = time.time()
+            
+            games = generate_self_play_games(
+                model=model,
+                device=device,
+                input_channels=MODEL_CONFIG[variant]['input_channels'],
+                num_games=CURRICULUM_CONFIG['phase3_games_per_iteration'],
+                num_simulations=CURRICULUM_CONFIG['phase3_mcts_sims'],
+                num_workers=HARDWARE_CONFIG['selfplay_workers']
+            )
+            
+            gen_time = time.time() - start_time
+            print(f"✓ Generated {len(games)} games in {gen_time:.1f}s\n")
+            
+            # Save games
+            replay_path = os.path.join(replay_dir, f"iteration_{iteration:04d}.json")
+            with open(replay_path, 'w') as f:
+                json.dump(games, f)
+            
+            # Create dataset
+            selfplay_dataset = SelfPlayDataset(
+                games=games,
+                input_channels=MODEL_CONFIG[variant]['input_channels']
+            )
+            
+            # Create dataloader
+            if HAS_OPTIMIZATIONS:
+                dataloader = create_optimized_dataloader(
+                    selfplay_dataset,
+                    batch_size=CURRICULUM_CONFIG['phase3_batch_size'],
+                    shuffle=True,
+                    num_workers=HARDWARE_CONFIG['dataloader_workers']
+                )
+            else:
+                dataloader = DataLoader(
+                    selfplay_dataset,
+                    batch_size=CURRICULUM_CONFIG['phase3_batch_size'],
+                    shuffle=True,
+                    num_workers=4
+                )
+            
+            # Train on self-play data
+            print(f"Training for {CURRICULUM_CONFIG['phase3_training_epochs']} epochs...")
+            for epoch in range(CURRICULUM_CONFIG['phase3_training_epochs']):
+                model.train()
+                total_loss = 0
+                
+                for states, policy_targets, value_targets in dataloader:
+                    states = states.to(device)
+                    policy_targets = policy_targets.to(device)
+                    value_targets = value_targets.to(device)
+                    
+                    optimizer.zero_grad()
+                    
+                    policy_logits, value_preds = model(states)
+                    
+                    policy_loss = torch.nn.functional.cross_entropy(policy_logits, policy_targets)
+                    value_loss = torch.nn.functional.mse_loss(value_preds.squeeze(), value_targets)
+                    loss = policy_loss + value_loss
+                    
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), TRAINING_CONFIG['grad_clip'])
+                    optimizer.step()
+                    
+                    total_loss += loss.item()
+                
+                avg_loss = total_loss / len(dataloader)
+                print(f"  Epoch {epoch+1}: Loss={avg_loss:.4f}")
+            
+            # Save iteration checkpoint
+            iter_path = os.path.join(checkpoint_dir, f"phase3_iter_{iteration:04d}.pt")
+            torch.save(model.state_dict(), iter_path)
+            print(f"\n✓ Iteration {iteration} complete, saved to {iter_path}")
+            
+            # Periodic checkmate reinforcement
+            if (CURRICULUM_CONFIG['phase3_checkmate_interval'] > 0 and 
+                iteration % CURRICULUM_CONFIG['phase3_checkmate_interval'] == 0):
+                print("\nRunning checkmate reinforcement...")
+                run_checkmate_reinforcement(
+                    model=model,
+                    device=device,
+                    input_channels=MODEL_CONFIG[variant]['input_channels'],
+                    epochs=5,
+                    batch_size=CURRICULUM_CONFIG['phase3_batch_size']
+                )
+            
+            # Optional: Evaluation
+            if (CURRICULUM_CONFIG['phase3_evaluation_interval'] > 0 and
+                iteration % CURRICULUM_CONFIG['phase3_evaluation_interval'] == 0):
+                print("\nRunning tactical evaluation...")
+                test_tactical_recognition(
+                    model=model,
+                    device=device,
+                    input_channels=MODEL_CONFIG[variant]['input_channels']
+                )
+            
+            # Memory cleanup
+            if HAS_OPTIMIZATIONS:
+                aggressive_memory_cleanup()
+            
+    except KeyboardInterrupt:
+        print("\n\nTraining interrupted by user!")
+        final_path = os.path.join(checkpoint_dir, "phase3_interrupted.pt")
+        torch.save(model.state_dict(), final_path)
+        print(f"Model saved to {final_path}")
+
+
 def main():
-    # Parse command line arguments
-    args = parse_arguments()
+    args = parse_args()
     
-    print(f"\n{'='*60}")
-    print("CHESS AI TRAINING")
-    print(f"{'='*60}")
+    print("\n" + "="*80)
+    print("3-PHASE CURRICULUM CHESS AI TRAINING")
+    print("="*80)
+    print(f"Variant: {args.variant}")
+    print(f"Checkpoint directory: {args.checkpoint_dir}")
+    print(f"Starting phase: {args.start_phase}")
+    print("="*80 + "\n")
     
-    # Initialize model based on size
-    use_se = not args.no_se
+    # Create checkpoint directory
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
     
-    if args.model == "limited":
-        print(f"Model: Limited (low-VRAM, 4 blocks, 64 filters, 18 channels, SE={use_se})")
-        model = create_chess_model("limited", use_se=use_se, legacy=args.legacy).to(device)
-    elif args.model == "small":
-        print(f"Model: Small (10 blocks, 18 channels, SE={use_se})")
-        model = create_chess_model("small", use_se=use_se, legacy=args.legacy).to(device)
-    elif args.model == "medium":
-        print(f"Model: Medium (12 blocks, 20 channels, SE={use_se})")
-        model = create_chess_model("medium", use_se=use_se, legacy=args.legacy).to(device)
-    else:  # "big"
-        print(f"Model: Big (15 blocks, 22 channels, SE={use_se})")
-        model = create_chess_model("big", use_se=use_se, legacy=args.legacy).to(device)
-    
-    # Enable PyTorch 2.0 Compilation (Huge speedup)
-    if hasattr(torch, 'compile'):
-        print("🚀 Compiling model with torch.compile (mode='max-autotune')...")
-        try:
-            # max-autotune is best for training speed on stable input sizes
-            model = torch.compile(model, mode='max-autotune')
-        except Exception as e:
-            print(f"⚠️ torch.compile failed: {e}. Continuing without compilation.")
-    
-    # Convert to channels_last for NVidia optimization
-    model = model.to(memory_format=torch.channels_last)
+    # Create model
+    print(f"Creating {args.variant} model...")
+    model = create_model(variant=args.variant).to(device)
     
     # Print model summary
     model_summary(model)
-        
-    # Setup paths
-    save_path = args.model_path
-    model_dir = os.path.dirname(save_path)
-    state_file = os.path.join(model_dir, "training_state.json")
-    pro_state_file = os.path.join(model_dir, "pro_training_state.json")
     
-    # Create directory if it doesn't exist
-    os.makedirs(model_dir, exist_ok=True)
-    
-    # Determine MCTS settings
-    use_mcts = not args.no_mcts
-    fast_mcts = args.fast_mcts
-    
-    if not use_mcts:
-        print("MCTS disabled for self-play (faster but lower quality)")
-    elif fast_mcts:
-        print("Using fast MCTS for self-play (balanced speed/quality)")
-    else:
-        print("Full MCTS enabled for self-play (highest quality games)")
-    
-    # ========================================================================
-    # ADVANCED TRAINING UTILITIES INITIALIZATION
-    # ========================================================================
-    ema = None
-    tb_logger = None
-    checkpoint_manager = None
-    stockfish_evaluator = None
-    
-    if HAS_TRAINING_UTILS:
-        # Initialize EMA for stable model weights
-        if args.ema:
-            ema = EMA(model, decay=args.ema_decay)
-            print(f"✓ EMA enabled (decay={args.ema_decay})")
-        
-        # Initialize TensorBoard logging
-        if args.tensorboard:
-            log_dir = os.path.join(args.tensorboard_dir, f"{args.model}_{time.strftime('%Y%m%d_%H%M%S')}")
-            tb_logger = TensorBoardLogger(log_dir)
-        
-        # Initialize Stockfish evaluator
-        if args.stockfish_eval:
-            stockfish_evaluator = StockfishEvaluator(stockfish_path=args.stockfish_path)
-    
-    # Store utilities in args for access elsewhere
-    args._ema = ema
-    args._tb_logger = tb_logger
-    args._stockfish_evaluator = stockfish_evaluator
-    
-    # ========================================================================
-    # LOAD EXISTING MODEL OR CHECKPOINT
-    # ========================================================================
-    if os.path.exists(save_path):
-        print(f"Loading existing model from {save_path}")
-        checkpoint = torch.load(save_path, map_location=device)
-        
-        # Handle both old-style (just state_dict) and new-style (full checkpoint) formats
-        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
-            if ema and 'ema_state_dict' in checkpoint:
-                ema.load_state_dict(checkpoint['ema_state_dict'])
-                print("  Loaded EMA state from checkpoint")
-            print(f"  Loaded full checkpoint from epoch {checkpoint.get('epoch', '?')}")
-        else:
-            # Old-style checkpoint: just the state dict
-            model.load_state_dict(checkpoint)
-        print(f"Loaded existing model from {save_path}")
-
-    # Get training state
-    current_epoch = 0
-    processed_games = 0
-    pro_game_count = 0
-    
-    if os.path.exists(state_file):
-        with open(state_file, 'r') as f:
-            state = json.load(f)
-            processed_games = state.get("processed_games", 0)
-            current_epoch = state.get("last_epoch", 0)
-    
-    # NOTE: Professional games mode removed - only puzzles and self-play supported
-
-    # Set up signal handlers
-    signal.signal(signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, model, save_path, state_file, processed_games, current_epoch))
-    signal.signal(signal.SIGTERM, lambda sig, frame: signal_handler(sig, frame, model, save_path, state_file, processed_games, current_epoch))
-
-    # Get file paths
-    pgn_directory = "./chess_pgns"
-    pgn_files = glob.glob(os.path.join(pgn_directory, "*.pgn"))
-
-    # Load puzzles once - they're small enough
-    puzzle_pgn = "./chess_pgns/puzzles/puzzles.pgn"
-    lichess_csv = "./chess_pgns/puzzles/lichess_db_puzzle.csv"
-    
-    # Only try to load if files exist
-    pgn_puzzles = []
-    if os.path.exists(puzzle_pgn):
-        pgn_puzzles = load_puzzles(puzzle_pgn)
-        print(f"Loaded {len(pgn_puzzles)} PGN puzzles")
-    
-    lichess_puzzles = []  
-    if os.path.exists(lichess_csv):
-        lichess_puzzles = load_lichess_puzzles(lichess_csv)
-        print(f"Loaded {len(lichess_puzzles)} Lichess puzzles")
-        
-        # Expand mate sequences to include intermediate positions
-        # This teaches the model the SETUP moves, not just the final checkmate
-        lichess_puzzles = expand_mate_sequences(lichess_puzzles)
-
-    all_puzzles = pgn_puzzles + lichess_puzzles
-    prioritized_puzzles = filter_and_prioritize_puzzles_cached(all_puzzles)
-    
-    # Determine model type based on input channels (limited/small=18, medium=20, big=22)
-    if model.input_channels == 18:
-        model_type = "small"
-    elif model.input_channels == 20:
-        model_type = "medium"
-    else:  # 22 channels
-        model_type = "big"
-    
-    # Pass model_type to puzzle_dataset to ensure matching channels
-    puzzle_dataset = PuzzleDataset(prioritized_puzzles, model_type=model_type)
-    print(f"Total puzzles after prioritization: {len(prioritized_puzzles)}")
-    print(f"Using {model_type} model architecture with {model.input_channels} input channels")
-
-    # Find optimal batch size
-    print("Determining optimal batch size...")
-    model.eval()
-    optimal_batch_size = get_optimal_batch_size(model, device, starting_size=64)
-    model.train()
-    print(f"Using optimal batch size: {optimal_batch_size}")
-    
-    
-    # Create puzzle dataloader once - puzzles are smaller and reused
-    # With cached tensors, we can use larger batch sizes for speed
-    # RTX 5080 can handle much larger batches
-    puzzle_batch_size = min(2048, optimal_batch_size)  # Increased limit from 128 to 2048
-    
-    if HAS_OPTIMIZATIONS:
-        puzzle_dataloader = create_optimized_dataloader(
-            puzzle_dataset,
-            batch_size=puzzle_batch_size,
-            shuffle=True,
-            for_training=True
-        )
-        print(f"Using optimized DataLoader (workers={HARDWARE_CONFIG['dataloader_workers']}, batch={puzzle_batch_size})")
-    else:
-        # Windows has issues with multiprocessing DataLoader (uses spawn instead of fork)
-        # Use num_workers=0 on Windows to avoid pickle errors
-        import platform
-        use_workers = 0 if platform.system() == 'Windows' else 4
-        
-        puzzle_dataloader = DataLoader(
-            puzzle_dataset, 
-            batch_size=puzzle_batch_size,
-            shuffle=True,
-            num_workers=use_workers,
-            pin_memory=True,
-            persistent_workers=use_workers > 0  # Only if using workers
-        )
-    
-    
-    # Determine training mode (only self-play and puzzles supported)
-    current_phase = "self-play"  # Default mode
-    is_mode_locked = False  # Track if mode is locked by command line
-    
-    # Set mode based on command line argument
-    if args.mode:
-        current_phase = args.mode
-        is_mode_locked = True
-        print(f"Command-line override: Using {current_phase} training mode (locked)")
-    
-    # Run checkmate bootcamp if requested (one-time intensive training)
-    bootcamp_just_completed = False  # Track for LR adjustment
-    bootcamp_baseline_accuracy = None  # Track baseline for comparison
-    if args.checkmate_bootcamp:
-        print("\n" + "="*60)
-        print("STARTING CHECKMATE BOOT CAMP")
-        print("="*60)
-        run_checkmate_bootcamp(model, puzzle_dataset, device, save_path)
-        bootcamp_just_completed = True
-        
-        # Evaluate tactical recognition immediately after bootcamp
-        print("\n" + "="*60)
-        print("POST-BOOTCAMP TACTICAL EVALUATION (Baseline)")
-        print("="*60)
-        bootcamp_baseline_accuracy = test_tactical_recognition(model, device)
-        print(f"\n📊 Bootcamp baseline accuracy: {bootcamp_baseline_accuracy:.2%}")
-        print("="*60)
-        print("⚠️ Using conservative LR after bootcamp to prevent forgetting")
-    
-    # Main training loop
-    max_iterations = 1000000  # Very high limit (essentially unlimited)
-    iterations = 0
-    checkmate_interval = args.checkmate_interval
-    
-    while iterations < max_iterations:
-        iterations += 1
-        print(f"\n--- Training Iteration {iterations} ---")
-        
-        # Periodic checkmate reinforcement (every N iterations)
-        if checkmate_interval > 0 and iterations % checkmate_interval == 0:
-            run_checkmate_reinforcement(model, puzzle_dataset, device, epochs=5)
-        
-        # Puzzle-only mode (intensive checkmate/tactical training)
-        if current_phase == "puzzles":
-            print("\n=== PUZZLE TRAINING MODE (Checkmate Focus) ===")
-            
-            # Use curriculum learning if enabled
-            if args.curriculum:
-                # Create curriculum dataset on first iteration
-                if not hasattr(args, '_curriculum_dataset'):
-                    print("Initializing curriculum learning...")
-                    args._curriculum_dataset = CurriculumPuzzleDataset(
-                        prioritized_puzzles, model_type=model_type
-                    )
-                    # Create dataloader for curriculum
-                    import platform
-                    from torch.utils.data import DataLoader as TorchDataLoader
-                    use_workers = 0 if platform.system() == 'Windows' else 2
-                    args._curriculum_loader = TorchDataLoader(
-                        args._curriculum_dataset,
-                        batch_size=optimal_batch_size,
-                        shuffle=True,
-                        num_workers=use_workers,
-                        pin_memory=True
-                    )
-                
-                curriculum_dataset = args._curriculum_dataset
-                curriculum_loader = args._curriculum_loader
-                
-                stage_info = curriculum_dataset.get_stage_info()
-                print(f"Curriculum stage {stage_info['index']}: {stage_info['name']}")
-                print(f"  {stage_info['description']}")
-                print(f"  Active puzzles: {stage_info['num_puzzles']}")
-            
-            # LEARNING RATE STRATEGY:
-            # After bootcamp, use much lower LR to preserve learned checkmate patterns
-            # This prevents catastrophic forgetting of the 85%+ accuracy achieved
-            if bootcamp_just_completed:
-                # Very conservative LR right after bootcamp - just fine-tune
-                if iterations <= 5:
-                    puzzle_lr = 0.0005  # 10x lower than before
-                elif iterations <= 15:
-                    puzzle_lr = 0.0008
-                else:
-                    puzzle_lr = 0.001
-                    bootcamp_just_completed = False  # Allow normal LR after warmup
-            else:
-                # Normal LR schedule for training without recent bootcamp
-                if iterations <= 3:
-                    puzzle_lr = 0.002  # Reduced from 0.005
-                elif iterations <= 10:
-                    puzzle_lr = 0.001  # Reduced from 0.002
-                else:
-                    puzzle_lr = 0.0005  # Fine-tuning
-                    
-            print(f"Puzzle LR: {puzzle_lr}" + (" (post-bootcamp conservative)" if bootcamp_just_completed else ""))
-            
-            puzzle_optimizer = torch.optim.SGD(
-                model.parameters(), 
-                lr=puzzle_lr, 
-                momentum=0.9, 
-                weight_decay=1e-4
-            )
-            
-            # Train on puzzles - fewer epochs after bootcamp to prevent overfitting
-            puzzle_epochs = 8 if bootcamp_just_completed else 12  # Reduced from 15
-            print(f"Training on puzzles for {puzzle_epochs} epochs...")
-            
-            # Use curriculum loader if enabled, otherwise standard
-            if args.curriculum:
-                train_tactical(model, puzzle_optimizer, curriculum_loader, device, epochs=puzzle_epochs)
-            else:
-                train_tactical(model, puzzle_optimizer, puzzle_dataloader, device, epochs=puzzle_epochs)
-            
-            # Save checkpoint
-            torch.save(model.state_dict(), save_path)
-            print(f"Saved checkpoint to {save_path}")
-            
-            # Test tactical recognition every iteration
-            test_accuracy = test_tactical_recognition(model, device)
-            print(f"\nTactical recognition accuracy: {test_accuracy:.2%}")
-            
-            # Show comparison with bootcamp baseline if available
-            if bootcamp_baseline_accuracy is not None:
-                delta = test_accuracy - bootcamp_baseline_accuracy
-                delta_str = f"+{delta:.2%}" if delta >= 0 else f"{delta:.2%}"
-                status = "✅ Maintained" if delta >= -0.05 else "⚠️ FORGETTING" if delta >= -0.15 else "🔴 SEVERE FORGETTING"
-                print(f"  vs bootcamp baseline ({bootcamp_baseline_accuracy:.2%}): {delta_str} {status}")
-            
-            # Check curriculum advancement
-            if args.curriculum:
-                if curriculum_dataset.check_and_advance(test_accuracy):
-                    # Recreate dataloader with new active indices
-                    import platform
-                    from torch.utils.data import DataLoader as TorchDataLoader
-                    use_workers = 0 if platform.system() == 'Windows' else 2
-                    args._curriculum_loader = TorchDataLoader(
-                        curriculum_dataset,
-                        batch_size=optimal_batch_size,
-                        shuffle=True,
-                        num_workers=use_workers,
-                        pin_memory=True
-                    )
-            
-            # Save state
-            with open(state_file, 'w') as f:
-                state = {
-                    "puzzle_iterations": iterations,
-                    "tactical_accuracy": test_accuracy,
-                    "mode": "puzzles"
-                }
-                if args.curriculum:
-                    state["curriculum_stage"] = curriculum_dataset.current_stage
-                json.dump(state, f)
-            
-            # Memory cleanup
-            clear_memory()
-            
-            continue  # Continue puzzle training
-        
-        # Self-play mode
-        if current_phase == "self-play":
-            print("\n=== SELF-PLAY REINFORCEMENT LEARNING MODE ===")
-            
-            # Default number of self-play games and iterations for continuous mode
-            games_per_batch = 30  # Lower default for continuous mode
-            iterations_per_cycle = 2  # Fewer iterations per cycle for faster feedback
-            
-            # Use command line arguments if provided
-            if args.games is not None:
-                games_per_batch = args.games
-                
-            if args.iterations is not None:
-                iterations_per_cycle = args.iterations
-                
-            print(f"Running {iterations_per_cycle} iterations with {games_per_batch} games per iteration")
-            
-            # If endgame-start is enabled, alternate between regular and endgame games
-            if hasattr(args, 'endgame_start') and args.endgame_start:
-                print("Using endgame starting positions for checkmate training")
-                
-                # Generate endgame games
-                endgame_games = generate_self_play_games_from_endgame(
-                    model, device, 
-                    num_games=games_per_batch // 2,  # Half endgame games
-                    use_mcts=use_mcts
-                )
-                
-                if endgame_games:
-                    # Convert endgame games to training samples
-                    from data import board_to_tensor, get_move_index, SelfPlayDataset
-                    from self_play import create_training_samples_from_game
-                    
-                    input_channels = model.input_channels if hasattr(model, 'input_channels') else 22
-                    endgame_samples = []
-                    
-                    for game in endgame_games:
-                        board = chess.Board(game.headers.get("FEN", chess.STARTING_FEN))
-                        result_str = game.headers.get("Result", "*")
-                        result_value = 1.0 if result_str == "1-0" else (-1.0 if result_str == "0-1" else 0.0)
-                        
-                        move_history = []
-                        board_history = []
-                        
-                        for move in game.mainline_moves():
-                            board_history.append(board_to_tensor(board, 1, input_channels))
-                            move_history.append(get_move_index(move))
-                            board.push(move)
-                        
-                        samples = create_training_samples_from_game(
-                            board_history, move_history, result_value, True
-                        )
-                        endgame_samples.extend(samples)
-                    
-                    if endgame_samples:
-                        # Train on endgame samples
-                        print(f"Training on {len(endgame_samples)} endgame positions")
-                        endgame_dataset = SelfPlayDataset(endgame_samples, "big" if model.input_channels == 22 else "small")
-                        from torch.utils.data import DataLoader
-                        # Windows supported with mp.freeze_support() in main
-                        endgame_loader = DataLoader(
-                            endgame_dataset, batch_size=32, shuffle=True,
-                            num_workers=2, pin_memory=True
-                        )
-                        
-                        # Quick training on endgame positions
-                        optimizer = torch.optim.SGD(model.parameters(), lr=0.002, momentum=0.9)
-                        train_tactical(model, optimizer, endgame_loader, device, epochs=3)
-            
-            # Run regular self-play training for this batch
-            model = run_self_play_training(
-                model, 
-                device,
-                save_path, 
-                state_file, 
-                num_games=games_per_batch,
-                num_iterations=iterations_per_cycle,
-                use_mcts=use_mcts,
-                fast_mcts=fast_mcts
-            )
-            
-            # Run tactical training after self-play to maintain tactical awareness
-            print("Running tactical training phase...")
-            tactical_optimizer = torch.optim.SGD(model.parameters(), lr=0.0005, momentum=0.9, weight_decay=1e-4)
-            tactical_epochs = min(6 + iterations // 5, 20)  # Start with 6, gradually increase
-            train_tactical(model, tactical_optimizer, puzzle_dataloader, device, epochs=tactical_epochs)
-            
-            # Test tactical recognition occasionally
-            if iterations % 3 == 0:
-                test_accuracy = test_tactical_recognition(model, device)
-                print(f"Tactical recognition accuracy: {test_accuracy:.2%}")
-                
-            # Stay in self-play mode (no switching to deprecated modes)
-        
-        # Save checkpoint every iteration
-        torch.save(model.state_dict(), save_path)
-        print(f"Saved model checkpoint (iteration {iterations})")
-        
-        # ====================================================================
-        # ADVANCED TRAINING: EMA UPDATE, VALIDATION, LOGGING
-        # ====================================================================
-        if HAS_TRAINING_UTILS:
-            # Update EMA if enabled
-            if args._ema is not None:
-                # EMA should be updated after each optimizer step, but we also
-                # ensure it's synced at checkpoint time
-                pass  # EMA updates happen in train_batch/train_tactical
-            
-            # Run validation and Stockfish evaluation periodically
-            if args.validate_every > 0 and iterations % args.validate_every == 0:
-                print("\n--- Running Validation ---")
-                
-                # Validation on puzzle dataset
-                if args._ema:
-                    args._ema.apply_shadow()  # Use EMA weights for validation
-                
-                val_loss, val_acc, val_mae = run_validation(
-                    model, puzzle_dataloader, device, model.input_channels
-                )
-                print(f"Validation: loss={val_loss:.4f}, accuracy={val_acc:.2%}, value_mae={val_mae:.3f}")
-                
-                if args._ema:
-                    args._ema.restore()  # Restore original weights
-                
-                # Stockfish evaluation (less frequent - expensive)
-                if args._stockfish_evaluator and iterations % 5 == 0:
-                    print("Running Stockfish position evaluation...")
-                    eval_positions = generate_validation_positions(50)
-                    correlation, sf_mae = args._stockfish_evaluator.evaluate_model(
-                        model, eval_positions, device, model.input_channels
-                    )
-                    
-                    # Log to TensorBoard
-                    if args._tb_logger:
-                        args._tb_logger.log_stockfish_eval(iterations, correlation, sf_mae)
-                
-                # TensorBoard logging
-                if args._tb_logger:
-                    args._tb_logger.log_validation(iterations, val_loss, val_acc, test_accuracy if 'test_accuracy' in dir() else None)
-                    args._tb_logger.log_scalar('train/iteration', iterations, iterations)
-            
-            # Save full checkpoint with EMA
-            if iterations % 5 == 0:  # Full checkpoint every 5 iterations
-                full_checkpoint = {
-                    'epoch': iterations,
-                    'model_state_dict': model.state_dict(),
-                    'metrics': {
-                        'val_loss': val_loss if 'val_loss' in dir() else None,
-                        'val_acc': val_acc if 'val_acc' in dir() else None,
-                        'processed_games': processed_games,
-                        'pro_game_count': pro_game_count,
-                    }
-                }
-                if args._ema:
-                    full_checkpoint['ema_state_dict'] = args._ema.state_dict()
-                
-                full_ckpt_path = save_path.replace('.pt', '_full.pt')
-                torch.save(full_checkpoint, full_ckpt_path)
-                print(f"💾 Saved full checkpoint: {full_ckpt_path}")
-        
-        # Update tracking
-        if os.path.exists(state_file):
-            with open(state_file, 'r') as f:
-                state = json.load(f)
-                processed_games = state.get("processed_games", 0)
-        
-        
-        print(f"Progress: {processed_games} positions processed")
-        
-        # Give user a chance to interrupt gracefully
-        print("Waiting 5 seconds before next iteration (Ctrl+C to stop)...")
+    # Optional: Compile model for 2x speedup (PyTorch 2.0+)
+    if HARDWARE_CONFIG['compile_model']:
         try:
-            time.sleep(5)
-        except KeyboardInterrupt:
-            signal_handler(signal.SIGINT, None, model, save_path, state_file, processed_games, current_epoch)
-            break
+            model = torch.compile(model)
+            print("✓ Model compiled with torch.compile\n")
+        except Exception as e:
+            print(f"⚠ Could not compile model: {e}\n")
     
-    print(f"\nTraining completed with {processed_games} regular games and {pro_game_count} professional games!")
+    # Resume from checkpoint if specified
+    if args.resume:
+        print(f"Loading checkpoint from {args.resume}...")
+        model = load_model_with_compatibility(model, args.resume, device)
+        print("✓ Checkpoint loaded\n")
+    
+    # Run phases
+    if args.start_phase <= 1:
+        model = phase1_puzzle_bootcamp(model, args.variant, args.checkpoint_dir, args)
+    
+    if args.start_phase <= 2:
+        model = phase2_transition(model, args.variant, args.checkpoint_dir, args)
+    
+    if args.start_phase <= 3:
+        model = phase3_pure_selfplay(model, args.variant, args.checkpoint_dir, args)
+    
+    print("\n✓ All phases complete!")
 
 
 if __name__ == "__main__":
-    # Required for multiprocessing on Windows
     mp.freeze_support()
     main()

@@ -81,37 +81,6 @@ def compute_policy_target(
         return target
     
     return scaled / s
-# SELF-PLAY CONFIGURATION (AlphaZero-inspired improvements)
-# ============================================================================
-SELF_PLAY_CONFIG = {
-    # MCTS settings for self-play (increased for higher quality)
-    'num_simulations': 400,       # Simulations per move (AlphaZero uses 800)
-    'fast_simulations': 100,      # Simulations for fast mode
-    
-    # Temperature schedule (exploration vs exploitation)
-    'temp_initial': 1.0,          # Temperature for first N moves (explore)
-    'temp_mid': 0.5,              # Temperature for mid-game
-    'temp_final': 0.1,            # Temperature for late game (exploit)
-    'temp_move_threshold_1': 15,  # Moves before reducing temp
-    'temp_move_threshold_2': 30,  # Moves before final temp
-    
-    # Exploration (Dirichlet noise at root)
-    'dirichlet_alpha': 0.3,       # Dirichlet noise alpha (0.3 for chess)
-    'dirichlet_weight': 0.25,     # Weight of noise at root
-    
-    # Game limits
-    'max_moves': 200,             # Maximum moves per game
-    'min_game_length': 10,        # Minimum game length to use
-    'games_per_iteration': 100,   # Games per self-play iteration (increased)
-    
-    # Reward shaping
-    'use_reward_shaping': True,   # Apply reward shaping
-    'discount_factor': 0.99,      # Gamma for reward discounting
-    
-    # MCTS Policy Training (NEW - AlphaZero style)
-    'use_mcts_policy_targets': True,  # Train on MCTS visit distributions
-    'policy_temperature': 1.0,        # Temperature for policy targets
-}
 
 # ============================================================================
 # REPLAY BUFFER CONFIGURATION

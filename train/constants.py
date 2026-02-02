@@ -34,13 +34,8 @@ MODEL_CONFIG = {
     },
 }
 
-# Legacy size aliases (backward compat)
-MODEL_SIZE_ALIASES = {
-    'small': 'baseline',
-    'medium': 'baseline', 
-    'big': 'attack',
-    'limited': 'baseline',
-}
+# Valid model variants (no legacy aliases)
+VALID_VARIANTS = ['baseline', 'attack', 'est']
 
 # ============================================================================
 # TRAINING CONFIGURATION
@@ -62,6 +57,30 @@ TRAINING_CONFIG = {
     # Batch training
     'epochs_per_batch': 5,
     'puzzle_batches_per_game_batch': 5,
+}
+
+# ============================================================================
+# 3-PHASE CURRICULUM CONFIGURATION
+# ============================================================================
+CURRICULUM_CONFIG = {
+    # Phase 1: Puzzle Bootcamp (isolated)
+    'phase1_epochs': 50,
+    'phase1_batch_size': 256,
+    'phase1_checkmate_bootcamp': True,  # Run intensive checkmate training
+    'phase1_target_accuracy': 0.75,     # Target tactical accuracy before Phase 2
+    
+    # Phase 2: Transition (brief handoff)
+    'phase2_epochs': 10,
+    'phase2_games': 500,                # Generate initial self-play games
+    'phase2_mcts_sims': 400,            # MCTS simulations for transition games
+    
+    # Phase 3: Pure Self-Play (repeat forever)
+    'phase3_games_per_iteration': 200,  # Games per self-play iteration
+    'phase3_training_epochs': 5,        # Epochs per iteration
+    'phase3_batch_size': 512,           # Large batch for RTX 5080
+    'phase3_mcts_sims': 800,            # Full MCTS for quality games
+    'phase3_checkmate_interval': 5,     # Checkmate reinforcement every N iterations (0=disabled)
+    'phase3_evaluation_interval': 10,   # Evaluate model every N iterations
 }
 
 # ============================================================================
@@ -117,20 +136,22 @@ SELF_PLAY_CONFIG = {
 }
 
 # ============================================================================
-# TRAINING PHASE CONFIGURATION
+# HARDWARE CONFIGURATION (RTX 5080 16GB + Ultra 9 24-core)
 # ============================================================================
-# Replay buffer sampling ratios by phase
-SAMPLE_RATIOS = {
-    'phase1': {'puzzle': 0.8, 'selfplay': 0.2},
-    'phase2': {'puzzle': 0.4, 'selfplay': 0.6},
-    'phase3': {'puzzle': 0.1, 'selfplay': 0.9},
-}
-
-# Value loss weight by phase (early value targets are noisy)
-VALUE_WEIGHT = {
-    'phase1': 0.5,
-    'phase2': 1.0,
-    'phase3': 1.0,
+HARDWARE_CONFIG = {
+    # GPU settings
+    'max_batch_size': 512,           # RTX 5080 can handle large batches
+    'enable_amp': True,              # Mixed precision for Tensor Cores
+    'compile_model': True,           # torch.compile for 2x speedup
+    
+    # CPU settings
+    'dataloader_workers': 8,         # Ultra 9 has 24 cores, use 8 for loading
+    'selfplay_workers': 20,          # 20 parallel workers for self-play
+    'mcts_parallel_workers': 16,     # Parallel MCTS simulations
+    
+    # Memory
+    'pin_memory': True,
+    'prefetch_factor': 4,
 }
 
 # ============================================================================

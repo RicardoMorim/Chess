@@ -1,5 +1,5 @@
 chess
-pygame
+Pillow
 numpy
 torch
 psutil

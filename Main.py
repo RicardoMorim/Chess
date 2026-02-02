@@ -3,21 +3,9 @@ import random
 import sys
 import os
 from time import sleep
-
-# Save the original stdout and stderr
-orig_stdout = sys.stdout
-orig_stderr = sys.stderr
-
-# Redirect stdout and stderr to os.devnull
-sys.stdout = open(os.devnull, "w")
-sys.stderr = open(os.devnull, "w")
-
-# Import pygame
-import pygame
-
-# Restore stdout and stderr
-sys.stdout = orig_stdout
-sys.stderr = orig_stderr
+import tkinter as tk
+from tkinter import messagebox
+from PIL import Image, ImageTk
 import chess
 from Minimax_improved import MinimaxAI  
 
@@ -41,9 +29,18 @@ class Main:
         stockfish_path="./stockfish/stockfish-windows-x86-64-avx2.exe",
     ):
         self.board = board if board else chess.Board()
-        self.width, self.height = 500, 500
+        self.width, self.height = 512, 512
         self.square_size = self.width // 8
-        self.screen = pygame.display.set_mode((self.width, self.height))
+        
+        # Create Tkinter window
+        self.root = tk.Tk()
+        self.root.title("Chess Game")
+        self.root.resizable(False, False)
+        
+        # Create canvas for drawing
+        self.canvas = tk.Canvas(self.root, width=self.width, height=self.height)
+        self.canvas.pack()
+        
         if Main.piece_images is None:
             Main.piece_images = self.load_piece_images()
         self.selected_piece = None
@@ -53,7 +50,6 @@ class Main:
         self.color = "w"
         self.AI_type = "minimax"  # Default AI type
         self.neural_model_type = "limited"  # Default neural model
-        pygame.display.set_caption("Chess Game")
         
         # Fix typo: oppenings -> openings
         self.openings_folder = "./openings"
@@ -67,6 +63,7 @@ class Main:
         self._neural_engine = None
         self._minimax_engine = None
 
+        self.running = True
         # New flags for human input
         self.human_moved = False
         self.start_click_square = None
@@ -79,6 +76,8 @@ class Main:
         # Parallel search settings
         self.use_parallel_minimax = True  # Enable Lazy SMP by default
         self.minimax_depth = 6
+        self.white_minimax_depth = 6
+        self.black_minimax_depth = 6
         
         # AI vs AI mode settings (initialized before selection screen)
         self.ai_vs_ai_mode = False
@@ -90,6 +89,11 @@ class Main:
         self._black_neural_engine = None
         self._white_minimax_engine = None
         self._black_minimax_engine = None
+        
+        # Bind mouse events
+        self.canvas.bind("<Button-1>", self.handle_mouse_click)
+        self.canvas.bind("<B1-Motion>", self.handle_mouse_motion)
+        self.canvas.bind("<ButtonRelease-1>", self.handle_mouse_release)
         
         # Show selection screen (this will set ai_vs_ai_mode if selected)
         self.select_side_screen()
@@ -118,16 +122,18 @@ class Main:
             )
         return self._minimax_engine
     
-    def get_ai_engine(self, ai_type, model_type, color):
+    def get_ai_engine(self, ai_type, model_type, color, depth=None):
         """Get or create an AI engine for the specified type and color."""
         if ai_type == "minimax":
             # Create minimax engine for specified color
             cache_key = f"_minimax_{color}"
             if not hasattr(self, cache_key) or getattr(self, cache_key) is None:
+                # Use provided depth or fetch from color-specific depth
+                use_depth = depth if depth is not None else self.minimax_depth
                 engine = MinimaxAI(
                     self.openings, 
                     color, 
-                    depth=self.minimax_depth,
+                    depth=use_depth,
                     use_parallel=self.use_parallel_minimax
                 )
                 setattr(self, cache_key, engine)
@@ -136,14 +142,13 @@ class Main:
             # Neural engine (same model can be used for both colors)
             cache_key = f"_neural_{model_type}"
             if not hasattr(self, cache_key) or getattr(self, cache_key) is None:
-                print(f"Loading {model_type} neural network...")
+                print(f"Loading {model_type} neural network (variant: {model_type})...")
                 if NEW_MODEL_LOADER:
                     engine = load_chess_model(model_type)
                 else:
                     engine = PytorchModel()
                 setattr(self, cache_key, engine)
             return getattr(self, cache_key)
-
 
     @classmethod
     def load_piece_images(cls):
@@ -154,9 +159,9 @@ class Main:
         for piece in pieces:
             for color in colors:
                 image_path = os.path.join("img", f"{piece}-{color}.png")
-                piece_images[piece + ("b" if color == "black" else "w")] = (
-                    pygame.image.load(image_path)
-                )
+                img = Image.open(image_path)
+                img = img.resize((64, 64), Image.Resampling.LANCZOS)
+                piece_images[piece + ("b" if color == "black" else "w")] = ImageTk.PhotoImage(img)
 
         return piece_images
 
@@ -177,20 +182,15 @@ class Main:
         self.openings = {name: self.openings[name] for name in opening_names}
 
     def draw_board(self):
-        colors = [(255, 255, 255), (0, 0, 0)]
+        colors = ["#F0D9B5", "#B58863"]  # Light and dark squares
         for row in range(8):
             for col in range(8):
                 color = colors[(row + col) % 2]
-                pygame.draw.rect(
-                    self.screen,
-                    color,
-                    (
-                        col * self.square_size,
-                        row * self.square_size,
-                        self.square_size,
-                        self.square_size,
-                    ),
-                )
+                x1 = col * self.square_size
+                y1 = row * self.square_size
+                x2 = x1 + self.square_size
+                y2 = y1 + self.square_size
+                self.canvas.create_rectangle(x1, y1, x2, y2, fill=color, outline="")
 
     def draw_pieces(self):
         for row in range(8):
@@ -205,12 +205,13 @@ class Main:
                     piece_color = "b" if piece.color == chess.BLACK else "w"
                     piece_key = piece_name + piece_color
                     piece_image = self.piece_images[piece_key]
-                    self.screen.blit(
-                        piece_image, (col * self.square_size, row * self.square_size)
-                    )
+                    x = col * self.square_size
+                    y = row * self.square_size
+                    self.canvas.create_image(x + self.square_size // 2, y + self.square_size // 2, 
+                                            image=piece_image)
 
     def handle_mouse_click(self, event):
-        x, y = event.pos
+        x, y = event.x, event.y
         col, row = x // self.square_size, y // self.square_size
 
         if not (0 <= col < 8 and 0 <= row < 8):
@@ -224,7 +225,6 @@ class Main:
             square = chess.square(7 - col, row)  
         else:
             square = chess.square(col, 7 - row)
-
 
         # If no piece is selected yet, try to select an allied piece.
         if not self.selected_piece:
@@ -257,12 +257,12 @@ class Main:
                 if piece and piece.color == self.board.turn:
                     print(f"Switching selection to {chess.square_name(square)}")
                     self.selected_piece = (piece, square)
-        pygame.display.flip()
+        self.redraw()
 
     def handle_mouse_motion(self, event):
         if self.selected_piece and self.start_click_pos:
-            dx = event.pos[0] - self.start_click_pos[0]
-            dy = event.pos[1] - self.start_click_pos[1]
+            dx = event.x - self.start_click_pos[0]
+            dy = event.y - self.start_click_pos[1]
             dist = (dx**2 + dy**2)**0.5
             # If motion is significant, consider it a drag.
             if dist > 5:
@@ -270,7 +270,6 @@ class Main:
                 self.dragging = True
                 # Cancel two-click mode if dragging
                 self.waiting_for_second_click = False
-            # (You might add visual feedback for dragging here.)
     
     def handle_mouse_release(self, event):
         if self.ignore_release:
@@ -280,7 +279,7 @@ class Main:
         if not self.selected_piece:
             return
 
-        x, y = event.pos
+        x, y = event.x, event.y
         col, row = x // self.square_size, y // self.square_size
         if not (0 <= col < 8 and 0 <= row < 8):
             self.selected_piece = None
@@ -289,10 +288,9 @@ class Main:
             return
 
         if self.color == "b":
-            release_square = chess.square(7 - col, row)  # Only mirror the column for black
+            release_square = chess.square(7 - col, row)
         else:
             release_square = chess.square(col, 7 - row)
-
 
         # If a drag was detected, use the release square as the destination.
         # Otherwise, in two-click mode, only act if the release square
@@ -324,7 +322,7 @@ class Main:
         self.dragging = False
         self.start_click_square = None
         self.drag_started = False
-        pygame.display.flip()
+        self.redraw()
 
     def get_square_at_position(self, position):
         x, y = position
@@ -361,8 +359,6 @@ class Main:
         print(f"Legal moves: {[m.uci() for m in self.board.legal_moves]}")
         
         return move
-
-
 
     def push_move(self, best_move):
         if best_move in self.board.legal_moves:
@@ -422,17 +418,19 @@ class Main:
         if self.board.turn == chess.WHITE:
             ai_type = self.white_ai_type
             model_type = self.white_model_type
+            depth = self.white_minimax_depth
             color = "w"
             label = "WHITE"
         else:
             ai_type = self.black_ai_type
             model_type = self.black_model_type
+            depth = self.black_minimax_depth
             color = "b"
             label = "BLACK"
         
         print(f"{label} ({ai_type}) thinking...")
         
-        engine = self.get_ai_engine(ai_type, model_type, color)
+        engine = self.get_ai_engine(ai_type, model_type, color, depth=depth)
         
         if ai_type == "minimax":
             best_move = engine.get_best_move(self.board)
@@ -460,41 +458,23 @@ class Main:
         
         print(f"{label} plays: {best_move}")
         self.push_move(best_move)
-
-    def start_game(self):
-        logging.basicConfig(level=logging.DEBUG)
-
-        ai_color = "w" if self.color == "b" else "b"
-
-        # self.AI_turn = False  
-        max_depth = 6  # Set the initial max depth for the engine
-
-        clock = pygame.time.Clock()
-
-        while not self.board.is_game_over():
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    pygame.quit()
-                    sys.exit()
-
-                # Process mouse events only if it is human's turn.
-                if not self.AI_turn:
-                    if event.type == pygame.MOUSEBUTTONDOWN:
-                        self.handle_mouse_click(event)
-                    elif event.type == pygame.MOUSEMOTION:
-                        self.handle_mouse_motion(event)
-                    elif event.type == pygame.MOUSEBUTTONUP:
-                        self.handle_mouse_release(event)
-
-            self.draw_board()
-            self.draw_pieces()
-            pygame.display.flip()
-
+    
+    def redraw(self):
+        """Redraw the entire board and pieces."""
+        self.canvas.delete("all")
+        self.draw_board()
+        self.draw_pieces()
+    
+    def game_loop(self):
+        """Main game loop using Tkinter's after method."""
+        if not self.board.is_game_over() and self.running:
+            self.redraw()
+            
             ## AI VS AI MODE ##
             if self.ai_vs_ai_mode:
-                sleep(0.5)  # Small delay so you can see the moves
                 self.play_ai_vs_ai_move()
-
+                self.root.after(500, self.game_loop)  # Delay to see moves
+            
             ## AI VS HUMAN MODE ##
             else:
                 # If it's human turn and a move has been made, then switch to AI turn.
@@ -505,318 +485,271 @@ class Main:
                 # If it's AI's turn, execute the engine move and then switch turn.
                 if self.AI_turn:
                     print("The engine is thinking...")
-                    sleep(1)
-                    self.play_engine_move(max_depth, ai_color)
-                    self.AI_turn = False
-
-            clock.tick(60)  # Limit frames per second
-
-        # Game over, show end game screen
+                    self.root.after(100, self._ai_move_async)
+                else:
+                    self.root.after(100, self.game_loop)
+        elif self.board.is_game_over():
+            self.game_over()
+    
+    def _ai_move_async(self):
+        """Execute AI move asynchronously."""
+        ai_color = "w" if self.color == "b" else "b"
+        max_depth = 6
+        self.play_engine_move(max_depth, ai_color)
+        self.AI_turn = False
+        self.root.after(100, self.game_loop)
+    
+    def game_over(self):
+        """Handle game over."""
         print(self.board.outcome)
         winner = "White" if self.board.turn == chess.BLACK else "Black"
-        print("Looser: " + self.AI_type)
-        print("Winner: " + ("monte_carlo" if self.AI_type == "minimax" else "minimax"))
         print(str(chess.pgn.Game.from_board(self.board)))
-        if self.end_game_screen(winner):
-            return True  # Start a new game
-        else:
-            pygame.quit()
-            return False
+        self.end_game_screen(winner)
 
     def end_game_screen(self, winner):
-        font = pygame.font.Font(None, 36)
-        text = font.render(f"Winner: {winner}", True, (255, 255, 255))
-        text_rect = text.get_rect(center=(self.width // 2, self.height // 2 - 50))
+        result = messagebox.askyesno("Game Over", f"Winner: {winner}\n\nPlay again?")
+        if result:
+            self.root.destroy()
+            # Restart will be handled by main
+        else:
+            self.root.destroy()
+            sys.exit()
 
-        restart_button = pygame.Rect(self.width // 2 - 75, self.height // 2, 150, 50)
-
-        pygame.draw.rect(self.screen, (255, 255, 255), restart_button)
-
-        restart_text = font.render("Restart", True, (0, 0, 0))
-        restart_text_rect = restart_text.get_rect(center=restart_button.center)
-
-        while True:
-            self.screen.fill((0, 0, 0))
-            self.screen.blit(text, text_rect)
-            pygame.draw.rect(self.screen, (255, 255, 255), restart_button)
-            self.screen.blit(restart_text, restart_text_rect)
-            pygame.display.flip()
-
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    pygame.quit()
-                    sys.exit()
-
-                if event.type == pygame.MOUSEBUTTONDOWN:
-                    if restart_button.collidepoint(event.pos):
-                        return True  # Restart the game
-            pygame.time.Clock().tick(60)
+    def start_game(self):
+        logging.basicConfig(level=logging.DEBUG)
+        self.running = True
+        self.game_loop()
+        self.root.mainloop()
+        return False  # No restart for now
 
     def select_side_screen(self):
         """Selection screen for side, AI type, and model."""
-        font = pygame.font.Font(None, 32)
-        small_font = pygame.font.Font(None, 24)
-        tiny_font = pygame.font.Font(None, 20)
+        # Create a new toplevel window for selection
+        selection_window = tk.Toplevel(self.root)
+        selection_window.title("Chess AI Setup")
+        selection_window.geometry("600x700")
+        selection_window.resizable(False, False)
+        selection_window.grab_set()  # Make it modal
         
-        # Available AI types
-        ai_types = ["minimax", "neural_mcts", "neural_direct"]
-        ai_labels = ["Minimax", "Neural MCTS", "Neural Direct"]
+        # Set color scheme
+        BG_COLOR = "#1e1e2e"
+        FG_COLOR = "#ffffff"
+        ACCENT_COLOR = "#4CAF50"
+        SECONDARY_COLOR = "#FF9800"
+        LABEL_COLOR = "#b0b0b0"
         
-        # Available neural model types
-        model_types = ["limited", "small", "medium", "big"]
-        model_labels = ["Limited", "Small", "Medium", "Big"]
+        selection_window.configure(bg=BG_COLOR)
         
-        # Selection state
-        game_mode = "vs_human"  # "vs_human" or "ai_vs_ai"
-        selected_ai_idx = 0  # For vs_human mode
-        selected_model_idx = 0
+        # State variables
+        game_mode = tk.StringVar(value="vs_human")
+        selected_ai = tk.StringVar(value="minimax")
+        selected_model = tk.StringVar(value="baseline")
+        selected_depth = tk.IntVar(value=6)
+        white_ai = tk.StringVar(value="neural_mcts")
+        white_model = tk.StringVar(value="baseline")
+        white_depth = tk.IntVar(value=6)
+        black_ai = tk.StringVar(value="minimax")
+        black_model = tk.StringVar(value="baseline")
+        black_depth = tk.IntVar(value=6)
         
-        # AI vs AI selections
-        white_ai_idx = 1  # Default to Neural MCTS
-        white_model_idx = 0  # Limited
-        black_ai_idx = 0  # Default to Minimax
-        black_model_idx = 0
+        def update_human_ui(*args):
+            """Update UI visibility based on selected AI type."""
+            for widget in model_frame.winfo_children():
+                widget.destroy()
+            for widget in depth_frame.winfo_children():
+                widget.destroy()
+            
+            if selected_ai.get() == "minimax":
+                tk.Label(depth_frame, text="Depth:", bg=BG_COLOR, fg=FG_COLOR, font=("Arial", 10)).pack(side="left", padx=5)
+                tk.Scale(depth_frame, from_=1, to=8, orient="horizontal", variable=selected_depth,
+                        bg=SECONDARY_COLOR, fg=FG_COLOR, length=200).pack(side="left", padx=5)
+            else:
+                tk.Label(model_frame, text="Model Variant:", bg=BG_COLOR, fg=FG_COLOR, font=("Arial", 10)).pack(anchor="w", padx=5)
+                for variant in ["baseline", "attack", "est"]:
+                    tk.Radiobutton(model_frame, text=variant.capitalize(), variable=selected_model, value=variant,
+                                 bg=BG_COLOR, fg=FG_COLOR, selectcolor=ACCENT_COLOR, 
+                                 activebackground=BG_COLOR, activeforeground=ACCENT_COLOR,
+                                 font=("Arial", 9)).pack(anchor="w", padx=20, pady=2)
         
-        while True:
-            self.screen.fill((30, 30, 40))
+        def update_white_ui(*args):
+            """Update White AI UI."""
+            for widget in white_model_frame.winfo_children():
+                widget.destroy()
+            for widget in white_depth_frame.winfo_children():
+                widget.destroy()
             
-            # Title
-            title = font.render("Chess AI Setup", True, (255, 255, 255))
-            self.screen.blit(title, (self.width // 2 - title.get_width() // 2, 10))
+            if white_ai.get() == "minimax":
+                tk.Label(white_depth_frame, text="Depth:", bg=BG_COLOR, fg=FG_COLOR, font=("Arial", 9)).pack(side="left", padx=5)
+                tk.Scale(white_depth_frame, from_=1, to=8, orient="horizontal", variable=white_depth,
+                        bg=SECONDARY_COLOR, fg=FG_COLOR, length=150).pack(side="left", padx=5)
+            else:
+                tk.Label(white_model_frame, text="Variant:", bg=BG_COLOR, fg=FG_COLOR, font=("Arial", 9)).pack(anchor="w", padx=5)
+                for variant in ["baseline", "attack", "est"]:
+                    tk.Radiobutton(white_model_frame, text=variant.capitalize(), variable=white_model, value=variant,
+                                 bg=BG_COLOR, fg=FG_COLOR, selectcolor=ACCENT_COLOR,
+                                 activebackground=BG_COLOR, activeforeground=ACCENT_COLOR,
+                                 font=("Arial", 8)).pack(anchor="w", padx=15, pady=1)
+        
+        def update_black_ui(*args):
+            """Update Black AI UI."""
+            for widget in black_model_frame.winfo_children():
+                widget.destroy()
+            for widget in black_depth_frame.winfo_children():
+                widget.destroy()
             
-            # Section 1: Game Mode
-            mode_text = small_font.render("Game Mode:", True, (200, 200, 200))
-            self.screen.blit(mode_text, (20, 45))
-            
-            human_btn = pygame.Rect(20, 70, 120, 35)
-            ai_ai_btn = pygame.Rect(150, 70, 120, 35)
-            
-            human_color = (100, 200, 100) if game_mode == "vs_human" else (60, 60, 70)
-            ai_ai_color = (100, 200, 100) if game_mode == "ai_vs_ai" else (60, 60, 70)
-            
-            pygame.draw.rect(self.screen, human_color, human_btn, border_radius=5)
-            pygame.draw.rect(self.screen, ai_ai_color, ai_ai_btn, border_radius=5)
-            pygame.draw.rect(self.screen, (150, 150, 150), human_btn, 1, border_radius=5)
-            pygame.draw.rect(self.screen, (150, 150, 150), ai_ai_btn, 1, border_radius=5)
-            
-            human_txt = small_font.render("vs Human", True, (0,0,0) if game_mode == "vs_human" else (180,180,180))
-            ai_ai_txt = small_font.render("AI vs AI", True, (0,0,0) if game_mode == "ai_vs_ai" else (180,180,180))
-            self.screen.blit(human_txt, (human_btn.centerx - human_txt.get_width()//2, human_btn.centery - 8))
-            self.screen.blit(ai_ai_txt, (ai_ai_btn.centerx - ai_ai_txt.get_width()//2, ai_ai_btn.centery - 8))
-            
-            # Different UI based on game mode
-            if game_mode == "vs_human":
-                # Section 2: Side selection
-                side_text = small_font.render("Your Side:", True, (200, 200, 200))
-                self.screen.blit(side_text, (20, 115))
-                
-                white_button = pygame.Rect(20, 140, 100, 35)
-                black_button = pygame.Rect(130, 140, 100, 35)
-                
-                white_color = (100, 200, 100) if self.color == "w" else (80, 80, 80)
-                black_color = (100, 200, 100) if self.color == "b" else (40, 40, 40)
-                
-                pygame.draw.rect(self.screen, white_color, white_button, border_radius=5)
-                pygame.draw.rect(self.screen, black_color, black_button, border_radius=5)
-                pygame.draw.rect(self.screen, (255, 255, 255), white_button, 2, border_radius=5)
-                pygame.draw.rect(self.screen, (255, 255, 255), black_button, 2, border_radius=5)
-                
-                white_txt = small_font.render("White", True, (0, 0, 0) if self.color == "w" else (200, 200, 200))
-                black_txt = small_font.render("Black", True, (255, 255, 255))
-                self.screen.blit(white_txt, (white_button.centerx - white_txt.get_width()//2, white_button.centery - 8))
-                self.screen.blit(black_txt, (black_button.centerx - black_txt.get_width()//2, black_button.centery - 8))
-                
-                # Section 3: AI Type selection
-                ai_text = small_font.render("Opponent AI:", True, (200, 200, 200))
-                self.screen.blit(ai_text, (20, 190))
-                
-                ai_buttons = []
-                for i, label in enumerate(ai_labels):
-                    btn = pygame.Rect(20 + i * 155, 215, 145, 35)
-                    ai_buttons.append(btn)
-                    
-                    color = (100, 200, 100) if i == selected_ai_idx else (60, 60, 70)
-                    pygame.draw.rect(self.screen, color, btn, border_radius=5)
-                    pygame.draw.rect(self.screen, (150, 150, 150), btn, 1, border_radius=5)
-                    
-                    txt = small_font.render(label, True, (0, 0, 0) if i == selected_ai_idx else (200, 200, 200))
-                    self.screen.blit(txt, (btn.centerx - txt.get_width()//2, btn.centery - 8))
-                
-                # Section 4: Neural Model selection
-                model_buttons = []
-                if selected_ai_idx > 0:
-                    model_text = small_font.render("Neural Model:", True, (200, 200, 200))
-                    self.screen.blit(model_text, (20, 265))
-                    
-                    for i, label in enumerate(model_labels):
-                        btn = pygame.Rect(20 + i * 118, 290, 110, 30)
-                        model_buttons.append(btn)
-                        
-                        color = (100, 150, 200) if i == selected_model_idx else (60, 60, 70)
-                        pygame.draw.rect(self.screen, color, btn, border_radius=5)
-                        pygame.draw.rect(self.screen, (150, 150, 150), btn, 1, border_radius=5)
-                        
-                        txt = tiny_font.render(label, True, (0, 0, 0) if i == selected_model_idx else (180, 180, 180))
-                        self.screen.blit(txt, (btn.centerx - txt.get_width()//2, btn.centery - 6))
-                
-                # Store buttons for event handling
-                white_ai_buttons = []
-                white_model_buttons = []
-                black_ai_buttons = []
-                black_model_buttons = []
-                
-            else:  # AI vs AI mode
-                # White AI selection
-                white_text = small_font.render("WHITE AI:", True, (220, 220, 220))
-                self.screen.blit(white_text, (20, 115))
-                
-                white_ai_buttons = []
-                for i, label in enumerate(ai_labels):
-                    btn = pygame.Rect(20 + i * 155, 140, 145, 30)
-                    white_ai_buttons.append(btn)
-                    
-                    color = (100, 200, 100) if i == white_ai_idx else (60, 60, 70)
-                    pygame.draw.rect(self.screen, color, btn, border_radius=5)
-                    pygame.draw.rect(self.screen, (150, 150, 150), btn, 1, border_radius=5)
-                    
-                    txt = tiny_font.render(label, True, (0, 0, 0) if i == white_ai_idx else (180, 180, 180))
-                    self.screen.blit(txt, (btn.centerx - txt.get_width()//2, btn.centery - 6))
-                
-                # White model (if neural)
-                white_model_buttons = []
-                if white_ai_idx > 0:
-                    for i, label in enumerate(model_labels):
-                        btn = pygame.Rect(20 + i * 118, 175, 110, 25)
-                        white_model_buttons.append(btn)
-                        
-                        color = (100, 150, 200) if i == white_model_idx else (50, 50, 60)
-                        pygame.draw.rect(self.screen, color, btn, border_radius=4)
-                        
-                        txt = tiny_font.render(label, True, (0, 0, 0) if i == white_model_idx else (150, 150, 150))
-                        self.screen.blit(txt, (btn.centerx - txt.get_width()//2, btn.centery - 5))
-                
-                # Black AI selection
-                black_y = 215
-                black_text = small_font.render("BLACK AI:", True, (180, 180, 180))
-                self.screen.blit(black_text, (20, black_y))
-                
-                black_ai_buttons = []
-                for i, label in enumerate(ai_labels):
-                    btn = pygame.Rect(20 + i * 155, black_y + 25, 145, 30)
-                    black_ai_buttons.append(btn)
-                    
-                    color = (100, 200, 100) if i == black_ai_idx else (60, 60, 70)
-                    pygame.draw.rect(self.screen, color, btn, border_radius=5)
-                    pygame.draw.rect(self.screen, (150, 150, 150), btn, 1, border_radius=5)
-                    
-                    txt = tiny_font.render(label, True, (0, 0, 0) if i == black_ai_idx else (180, 180, 180))
-                    self.screen.blit(txt, (btn.centerx - txt.get_width()//2, btn.centery - 6))
-                
-                # Black model (if neural)
-                black_model_buttons = []
-                if black_ai_idx > 0:
-                    for i, label in enumerate(model_labels):
-                        btn = pygame.Rect(20 + i * 118, black_y + 60, 110, 25)
-                        black_model_buttons.append(btn)
-                        
-                        color = (100, 150, 200) if i == black_model_idx else (50, 50, 60)
-                        pygame.draw.rect(self.screen, color, btn, border_radius=4)
-                        
-                        txt = tiny_font.render(label, True, (0, 0, 0) if i == black_model_idx else (150, 150, 150))
-                        self.screen.blit(txt, (btn.centerx - txt.get_width()//2, btn.centery - 5))
-                
-                # Match info
-                match_y = 320
-                vs_text = small_font.render(f"Match: {ai_labels[white_ai_idx]} vs {ai_labels[black_ai_idx]}", True, (255, 200, 100))
-                self.screen.blit(vs_text, (self.width//2 - vs_text.get_width()//2, match_y))
-                
-                # Clear unused buttons
-                ai_buttons = []
-                model_buttons = []
-                white_button = None
-                black_button = None
-            
-            # Start button
-            start_button = pygame.Rect(self.width // 2 - 75, self.height - 70, 150, 50)
-            pygame.draw.rect(self.screen, (50, 150, 50), start_button, border_radius=8)
-            pygame.draw.rect(self.screen, (100, 255, 100), start_button, 2, border_radius=8)
-            
-            start_txt = font.render("START", True, (255, 255, 255))
-            self.screen.blit(start_txt, (start_button.centerx - start_txt.get_width()//2, start_button.centery - 10))
-            
-            pygame.display.flip()
-            
-            # Event handling
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    pygame.quit()
-                    sys.exit()
-                
-                if event.type == pygame.MOUSEBUTTONDOWN:
-                    pos = event.pos
-                    
-                    # Game mode buttons
-                    if human_btn.collidepoint(pos):
-                        game_mode = "vs_human"
-                    elif ai_ai_btn.collidepoint(pos):
-                        game_mode = "ai_vs_ai"
-                    
-                    if game_mode == "vs_human":
-                        # Side buttons
-                        if white_button and white_button.collidepoint(pos):
-                            self.color = "w"
-                            self.AI_turn = False
-                        elif black_button and black_button.collidepoint(pos):
-                            self.color = "b"
-                            self.AI_turn = True
-                        
-                        # AI type buttons
-                        for i, btn in enumerate(ai_buttons):
-                            if btn.collidepoint(pos):
-                                selected_ai_idx = i
-                        
-                        # Model buttons
-                        for i, btn in enumerate(model_buttons):
-                            if btn.collidepoint(pos):
-                                selected_model_idx = i
-                    else:
-                        # White AI buttons
-                        for i, btn in enumerate(white_ai_buttons):
-                            if btn.collidepoint(pos):
-                                white_ai_idx = i
-                        
-                        # White model buttons
-                        for i, btn in enumerate(white_model_buttons):
-                            if btn.collidepoint(pos):
-                                white_model_idx = i
-                        
-                        # Black AI buttons
-                        for i, btn in enumerate(black_ai_buttons):
-                            if btn.collidepoint(pos):
-                                black_ai_idx = i
-                        
-                        # Black model buttons
-                        for i, btn in enumerate(black_model_buttons):
-                            if btn.collidepoint(pos):
-                                black_model_idx = i
-                    
-                    # Start button
-                    if start_button.collidepoint(pos):
-                        if game_mode == "vs_human":
-                            self.ai_vs_ai_mode = False
-                            self.AI_type = ai_types[selected_ai_idx]
-                            self.neural_model_type = model_types[selected_model_idx]
-                            print(f"Human vs AI: Side={self.color}, AI={self.AI_type}, Model={self.neural_model_type}")
-                        else:
-                            self.ai_vs_ai_mode = True
-                            self.white_ai_type = ai_types[white_ai_idx]
-                            self.white_model_type = model_types[white_model_idx]
-                            self.black_ai_type = ai_types[black_ai_idx]
-                            self.black_model_type = model_types[black_model_idx]
-                            print(f"AI vs AI: White={self.white_ai_type}({self.white_model_type}), Black={self.black_ai_type}({self.black_model_type})")
-                        return
-            
-            pygame.time.Clock().tick(60)
+            if black_ai.get() == "minimax":
+                tk.Label(black_depth_frame, text="Depth:", bg=BG_COLOR, fg=FG_COLOR, font=("Arial", 9)).pack(side="left", padx=5)
+                tk.Scale(black_depth_frame, from_=1, to=8, orient="horizontal", variable=black_depth,
+                        bg=SECONDARY_COLOR, fg=FG_COLOR, length=150).pack(side="left", padx=5)
+            else:
+                tk.Label(black_model_frame, text="Variant:", bg=BG_COLOR, fg=FG_COLOR, font=("Arial", 9)).pack(anchor="w", padx=5)
+                for variant in ["baseline", "attack", "est"]:
+                    tk.Radiobutton(black_model_frame, text=variant.capitalize(), variable=black_model, value=variant,
+                                 bg=BG_COLOR, fg=FG_COLOR, selectcolor=ACCENT_COLOR,
+                                 activebackground=BG_COLOR, activeforeground=ACCENT_COLOR,
+                                 font=("Arial", 8)).pack(anchor="w", padx=15, pady=1)
+        
+        def on_start():
+            if game_mode.get() == "vs_human":
+                self.ai_vs_ai_mode = False
+                self.AI_type = selected_ai.get()
+                self.neural_model_type = selected_model.get()
+                self.minimax_depth = selected_depth.get()
+                print(f"Human vs AI: Side={self.color}, AI={self.AI_type}, Model/Depth={self.neural_model_type}/{self.minimax_depth}")
+            else:
+                self.ai_vs_ai_mode = True
+                self.white_ai_type = white_ai.get()
+                self.white_model_type = white_model.get()
+                self.white_minimax_depth = white_depth.get()
+                self.black_ai_type = black_ai.get()
+                self.black_model_type = black_model.get()
+                self.black_minimax_depth = black_depth.get()
+                print(f"AI vs AI: White={self.white_ai_type}({self.white_model_type}/{self.white_minimax_depth}), Black={self.black_ai_type}({self.black_model_type}/{self.black_minimax_depth})")
+            selection_window.destroy()
+        
+        # ===== TITLE =====
+        title_frame = tk.Frame(selection_window, bg=ACCENT_COLOR, height=50)
+        title_frame.pack(fill="x", pady=0)
+        tk.Label(title_frame, text="⚔ Chess AI Setup ⚔", font=("Arial", 18, "bold"), 
+                bg=ACCENT_COLOR, fg="#000000").pack(pady=10)
+        
+        # ===== MAIN CONTENT =====
+        content_frame = tk.Frame(selection_window, bg=BG_COLOR)
+        content_frame.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        # ===== GAME MODE SECTION =====
+        mode_label = tk.Label(content_frame, text="Game Mode", font=("Arial", 12, "bold"), 
+                            bg=BG_COLOR, fg=ACCENT_COLOR)
+        mode_label.pack(anchor="w", pady=(0, 10))
+        
+        mode_buttons_frame = tk.Frame(content_frame, bg=BG_COLOR)
+        mode_buttons_frame.pack(fill="x", pady=(0, 20))
+        
+        for text, value in [("🎮 vs Human", "vs_human"), ("🤖 AI vs AI", "ai_vs_ai")]:
+            tk.Radiobutton(mode_buttons_frame, text=text, variable=game_mode, value=value,
+                         bg=BG_COLOR, fg=FG_COLOR, selectcolor=ACCENT_COLOR,
+                         activebackground=BG_COLOR, activeforeground=ACCENT_COLOR,
+                         font=("Arial", 10)).pack(anchor="w", pady=5)
+        
+        # ===== DYNAMIC CONTENT BASED ON MODE =====
+        
+        # Frame that will hold either "Human vs AI" or "AI vs AI" content
+        mode_content = tk.Frame(content_frame, bg=BG_COLOR)
+        mode_content.pack(fill="both", expand=True)
+        
+        # Human vs AI Section
+        human_section = tk.Frame(mode_content, bg=BG_COLOR)
+        
+        tk.Label(human_section, text="Your Side", font=("Arial", 11, "bold"), 
+                bg=BG_COLOR, fg=SECONDARY_COLOR).pack(anchor="w", pady=(10, 5))
+        side_frame = tk.Frame(human_section, bg=BG_COLOR)
+        side_frame.pack(fill="x", pady=(0, 15))
+        for text, value in [("⚪ White", "w"), ("⚫ Black", "b")]:
+            tk.Radiobutton(side_frame, text=text, variable=tk.StringVar(), value=value,
+                         bg=BG_COLOR, fg=FG_COLOR, selectcolor=ACCENT_COLOR,
+                         activebackground=BG_COLOR, activeforeground=ACCENT_COLOR,
+                         command=lambda v=value: setattr(self, 'color', v),
+                         font=("Arial", 10)).pack(side="left", padx=10)
+        
+        tk.Label(human_section, text="Opponent AI Type", font=("Arial", 11, "bold"), 
+                bg=BG_COLOR, fg=SECONDARY_COLOR).pack(anchor="w", pady=(10, 5))
+        ai_type_frame = tk.Frame(human_section, bg=BG_COLOR)
+        ai_type_frame.pack(fill="x", pady=(0, 15))
+        for ai_type in ["minimax", "neural_mcts", "neural_direct"]:
+            tk.Radiobutton(ai_type_frame, text=ai_type.replace("_", " ").title(), variable=selected_ai, 
+                         value=ai_type, bg=BG_COLOR, fg=FG_COLOR, selectcolor=ACCENT_COLOR,
+                         activebackground=BG_COLOR, activeforeground=ACCENT_COLOR,
+                         command=update_human_ui, font=("Arial", 10)).pack(anchor="w", pady=3)
+        
+        depth_frame = tk.Frame(human_section, bg=BG_COLOR)
+        depth_frame.pack(fill="x", pady=(5, 10))
+        
+        model_frame = tk.Frame(human_section, bg=BG_COLOR)
+        model_frame.pack(fill="x", pady=(5, 15))
+        
+        # AI vs AI Section
+        ai_vs_ai_section = tk.Frame(mode_content, bg=BG_COLOR)
+        
+        # White AI
+        tk.Label(ai_vs_ai_section, text="White AI", font=("Arial", 11, "bold"), 
+                bg=BG_COLOR, fg=SECONDARY_COLOR).pack(anchor="w", pady=(10, 5))
+        white_ai_frame = tk.Frame(ai_vs_ai_section, bg=BG_COLOR)
+        white_ai_frame.pack(fill="x", pady=(0, 8))
+        for ai_type in ["minimax", "neural_mcts", "neural_direct"]:
+            tk.Radiobutton(white_ai_frame, text=ai_type.replace("_", " ").title(), variable=white_ai,
+                         value=ai_type, bg=BG_COLOR, fg=FG_COLOR, selectcolor=ACCENT_COLOR,
+                         activebackground=BG_COLOR, activeforeground=ACCENT_COLOR,
+                         command=update_white_ui, font=("Arial", 9)).pack(anchor="w", pady=2)
+        
+        white_depth_frame = tk.Frame(ai_vs_ai_section, bg=BG_COLOR)
+        white_depth_frame.pack(fill="x", pady=(3, 10))
+        
+        white_model_frame = tk.Frame(ai_vs_ai_section, bg=BG_COLOR)
+        white_model_frame.pack(fill="x", pady=(3, 15))
+        
+        # Black AI
+        tk.Label(ai_vs_ai_section, text="Black AI", font=("Arial", 11, "bold"), 
+                bg=BG_COLOR, fg=SECONDARY_COLOR).pack(anchor="w", pady=(10, 5))
+        black_ai_frame = tk.Frame(ai_vs_ai_section, bg=BG_COLOR)
+        black_ai_frame.pack(fill="x", pady=(0, 8))
+        for ai_type in ["minimax", "neural_mcts", "neural_direct"]:
+            tk.Radiobutton(black_ai_frame, text=ai_type.replace("_", " ").title(), variable=black_ai,
+                         value=ai_type, bg=BG_COLOR, fg=FG_COLOR, selectcolor=ACCENT_COLOR,
+                         activebackground=BG_COLOR, activeforeground=ACCENT_COLOR,
+                         command=update_black_ui, font=("Arial", 9)).pack(anchor="w", pady=2)
+        
+        black_depth_frame = tk.Frame(ai_vs_ai_section, bg=BG_COLOR)
+        black_depth_frame.pack(fill="x", pady=(3, 10))
+        
+        black_model_frame = tk.Frame(ai_vs_ai_section, bg=BG_COLOR)
+        black_model_frame.pack(fill="x", pady=(3, 15))
+        
+        def switch_mode(*args):
+            human_section.pack_forget()
+            ai_vs_ai_section.pack_forget()
+            if game_mode.get() == "vs_human":
+                human_section.pack(fill="both", expand=True)
+                update_human_ui()
+            else:
+                ai_vs_ai_section.pack(fill="both", expand=True)
+                update_white_ui()
+                update_black_ui()
+        
+        game_mode.trace("w", switch_mode)
+        
+        # Initialize UI
+        switch_mode()
+        
+        # ===== START BUTTON =====
+        button_frame = tk.Frame(selection_window, bg=BG_COLOR)
+        button_frame.pack(fill="x", padx=20, pady=20)
+        
+        start_btn = tk.Button(button_frame, text="▶ START GAME", command=on_start,
+                            font=("Arial", 12, "bold"), bg=ACCENT_COLOR, fg="#000000",
+                            padx=50, pady=12, relief="raised", bd=2, cursor="hand2")
+        start_btn.pack(fill="x")
+        
+        selection_window.wait_window()
 
 
 # Create an instance and start a game
@@ -825,8 +758,5 @@ if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
     
-    pygame.init()
-    start_game = True
-    while start_game:
-        game = Main()
-        start_game = game.start_game()
+    game = Main()
+    game.start_game()

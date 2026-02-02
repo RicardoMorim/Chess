@@ -503,11 +503,11 @@ class ChessModelWrapper:
 # ============================================================================
 # MODEL LOADING FUNCTIONS
 # ============================================================================
-def load_chess_model(model_type="limited", checkpoint_path=None, device_override=None):
-    """Load a chess model by type or from checkpoint.
+def load_chess_model(model_type="baseline", checkpoint_path=None, device_override=None):
+    """Load a chess model by variant or from checkpoint.
     
     Args:
-        model_type: "limited", "small", "medium", or "big"
+        model_type: "baseline", "attack", or "est" (legacy: "limited", "small", "medium", "big")
         checkpoint_path: Optional path to specific checkpoint
         device_override: Optional device override
     
@@ -520,23 +520,33 @@ def load_chess_model(model_type="limited", checkpoint_path=None, device_override
     
     # Try to import from train folder
     try:
-        from models import create_chess_model, LimitedChessNet, ChessNet
+        from models import create_model, ChessNet
     except ImportError:
         # Fallback: define models inline
         print("Warning: Could not import from train/models.py, using inline definitions")
         return _load_legacy_model(checkpoint_path)
     
-    # Determine input channels based on model type
-    channel_map = {
-        "limited": 18,
-        "small": 18,
-        "medium": 22,
-        "big": 22,
+    # Map legacy names to new variants
+    legacy_map = {
+        "limited": "baseline",
+        "small": "baseline",
+        "medium": "baseline",
+        "big": "attack",
     }
-    input_channels = channel_map.get(model_type.lower(), 18)
+    
+    # Convert legacy names
+    variant = legacy_map.get(model_type.lower(), model_type.lower())
+    
+    # Determine input channels based on variant
+    channel_map = {
+        "baseline": 18,
+        "attack": 22,
+        "est": 18,
+    }
+    input_channels = channel_map.get(variant, 18)
     
     # Create model
-    model = create_chess_model(model_type)
+    model = create_model(variant)
     model = model.to(device)
     
     # Load checkpoint if provided
@@ -550,14 +560,15 @@ def load_chess_model(model_type="limited", checkpoint_path=None, device_override
         else:
             model.load_state_dict(checkpoint)
     else:
-        # Try to find default checkpoint - prioritize checkpoints_{model_type}/ folder
+        # Try to find default checkpoint - prioritize checkpoints_{variant}/ folder
         default_paths = [
-            f"train/checkpoints_{model_type}/model_best.pt",
-            f"train/checkpoints_{model_type}/model_epoch_0100.pt",
+            f"train/checkpoints_{variant}/phase3_best.pt",
+            f"train/checkpoints_{variant}/phase2_final.pt",
+            f"train/checkpoints_{variant}/phase1_final.pt",
+            f"train/checkpoints_{variant}/model_best.pt",
+            f"train/checkpoints_{model_type}/model_best.pt",  # Legacy path
             f"train/chess_model/{model_type}_model.pth",  
             f"chess_model/{model_type}_model.pth",
-            f"train/chess_model/chess_model_{model_type}.pth",
-            "chess_model/chess_model.pth",
         ]
         
         for path in default_paths:
@@ -571,10 +582,10 @@ def load_chess_model(model_type="limited", checkpoint_path=None, device_override
                     model.load_state_dict(checkpoint)
                 break
         else:
-            print(f"Warning: No checkpoint found for {model_type} model. Using random weights.")
+            print(f"Warning: No checkpoint found for {variant} model. Using random weights.")
     
     model.eval()
-    return ChessModelWrapper(model, input_channels, model_type)
+    return ChessModelWrapper(model, input_channels, variant)
 
 
 def _load_legacy_model(checkpoint_path):

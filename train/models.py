@@ -8,7 +8,6 @@ Contains:
 
 Factory functions:
 - create_model(variant): New unified factory 
-- create_chess_model(model_type): Legacy backward-compatible factory
 """
 import torch
 import torch.nn as nn
@@ -224,30 +223,6 @@ def create_model(variant: str, **kwargs) -> nn.Module:
     
     return factories[variant]()
 
-
-def create_chess_model(model_type: str, use_se=True, legacy=False) -> nn.Module:
-    """
-    Legacy factory function for backward compatibility with train.py.
-    
-    Args:
-        model_type: One of "limited", "small", "medium", "big"
-        use_se: Ignored (SE always enabled)
-        legacy: Ignored (for backward compatibility)
-    
-    Returns:
-        Configured ChessNet model
-    """
-    configs = {
-        "limited": {"input_channels": 18, "num_blocks": 4, "channels": 64},
-        "small": {"input_channels": 18, "num_blocks": 10, "channels": 128},
-        "medium": {"input_channels": 20, "num_blocks": 12, "channels": 192},
-        "big": {"input_channels": 22, "num_blocks": 15, "channels": 256},
-    }
-    
-    if model_type not in configs:
-        raise ValueError(f"Unknown model_type '{model_type}'. Choose from: {list(configs.keys())}")
-    
-    return ChessNet(**configs[model_type])
 
 
 def load_model_with_compatibility(model: nn.Module, checkpoint_path: str, device='cpu') -> nn.Module:
