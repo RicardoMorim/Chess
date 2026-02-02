@@ -14,6 +14,7 @@ import os
 import sys
 import argparse
 import multiprocessing as mp
+from pathlib import Path
 
 import torch
 
@@ -117,6 +118,25 @@ Examples:
 def main():
     """Main entry point."""
     args = parse_args()
+
+    # Guard against overwriting league checkpoints
+    project_root = Path(__file__).parent.parent
+    league_checkpoint_dir = (project_root / "checkpoints").resolve()
+    checkpoint_dir = Path(args.checkpoint_dir).resolve()
+
+    if checkpoint_dir == league_checkpoint_dir or league_checkpoint_dir in checkpoint_dir.parents:
+        raise SystemExit(
+            f"Refusing to use league checkpoint directory for individual training: {checkpoint_dir}\n"
+            f"Choose a different --checkpoint-dir (e.g., ./checkpoints_{args.variant})."
+        )
+
+    if args.resume:
+        resume_path = Path(args.resume).resolve()
+        if resume_path == league_checkpoint_dir or league_checkpoint_dir in resume_path.parents:
+            raise SystemExit(
+                f"Refusing to resume from league checkpoints: {resume_path}\n"
+                "Copy the checkpoint to an individual directory before resuming."
+            )
     
     print("\n" + "="*80)
     print("3-PHASE CURRICULUM CHESS AI TRAINING")

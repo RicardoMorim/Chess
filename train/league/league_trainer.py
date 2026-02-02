@@ -67,8 +67,8 @@ class LeagueTrainer:
     EVAL_EVERY_N_ROUNDS = 100  # Skip for now
     
     # MCTS hyperparameters (INTERMEDIATE - correct dual-budget approach)
-    # Self-play: FAST generation of training data (CPU-bound, volume matters)
-    MCTS_VISITS_SELFPLAY = 16  # Fast, generate data efficiently (no timeouts)
+    # Self-play: BALANCED generation of training data (GPU utilized 100%, VRAM 80%)
+    MCTS_VISITS_SELFPLAY = 16  # Throughput-optimal; 32 doubled round time
     # Evaluation: SLOWER, higher quality comparisons between models
     MCTS_VISITS_EVAL = 64  # Meaningful search for model assessment
     C_PUCT = 4.0

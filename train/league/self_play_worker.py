@@ -70,13 +70,13 @@ def play_game_batch_mcts(mcts, device, model_config, worker_id):
     CRITICAL: Must use mcts.search() to get MCTS-guided moves, NOT just policy sampling.
     """
     import chess
-    max_moves = 150
+    max_moves = 120
     game_data = []
     board = chess.Board()
     move_count = 0
     recent_values = []
-    resignation_threshold = -0.9
-    resignation_count_needed = 3
+    resignation_threshold = -0.8
+    resignation_count_needed = 2
 
     input_channels = getattr(mcts.model, "input_channels", model_config.get("input_channels", 22))
 
