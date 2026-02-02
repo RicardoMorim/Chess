@@ -405,16 +405,23 @@ class LeagueTrainer:
             logger.info(f"ROUND {round_num}")
             logger.info(f"{'='*60}")
             
-            # Self-play phase (CPU parallel)
-            logger.info("Phase 1: Self-play generation...")
+            # Self-play phase (fully parallel across all variants)
+            logger.info("Phase 1: Self-play generation (parallel across variants)...")
             sp_start = time.time()
-            for variant in self.VARIANTS:
-                try:
-                    self.generate_self_play(variant)
-                    logger.info(f"✓ {variant}: self-play complete")
-                except Exception as e:
-                    logger.error(f"✗ {variant}: self-play failed: {e}", exc_info=True)
-                    return
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                # Submit all variants simultaneously
+                futures = {}
+                for variant in self.VARIANTS:
+                    futures[variant] = executor.submit(self.generate_self_play, variant)
+                
+                # Collect results
+                for variant in self.VARIANTS:
+                    try:
+                        games_collected = futures[variant].result()
+                        logger.info(f"✓ {variant}: self-play complete ({games_collected} games)")
+                    except Exception as e:
+                        logger.error(f"✗ {variant}: self-play failed: {e}", exc_info=True)
+                        raise
             logger.info(f"Phase 1 complete ({time.time()-sp_start:.1f}s)\n")
             
             # Training phase (GPU parallel with ThreadPoolExecutor)
