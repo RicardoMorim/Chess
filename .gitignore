@@ -9,3 +9,5 @@ cache*
 /stockfish/*
 
 .claude/*
+.mcp.json
+.vscode/mcp.json

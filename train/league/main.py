@@ -38,7 +38,7 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("train/logs/league_training.log"),
+        logging.FileHandler("logs/league_training.log"),
     ]
 )
 
@@ -63,8 +63,8 @@ def main():
     # Initialize trainer
     logger.info("Initializing trainer...")
     trainer = LeagueTrainer(
-        checkpoint_dir="train/checkpoints_league",
-        log_dir="train/logs",
+        checkpoint_dir="/checkpoints_league",
+        log_dir="/logs",
         device=device,
     )
     
