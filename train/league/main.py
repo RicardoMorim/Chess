@@ -16,7 +16,7 @@ Run:
     python league/main.py
 
 Monitor:
-    tail -f logs/metrics.log
+    tail -f train/logs/metrics.log
 
 The Rule: Only MCTS self-play improves models. Everything else measures or protects.
 """
@@ -30,6 +30,12 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
+# Repo-relative output directories (avoid absolute paths like C:\checkpoints_league)
+log_dir = project_root / "logs"
+checkpoint_dir = project_root / "checkpoints_league"
+log_dir.mkdir(parents=True, exist_ok=True)
+checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
 from league.league_trainer import LeagueTrainer
 
 # Configure logging
@@ -38,7 +44,7 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("logs/league_training.log"),
+        logging.FileHandler(log_dir / "league_training.log"),
     ]
 )
 
@@ -63,8 +69,8 @@ def main():
     # Initialize trainer
     logger.info("Initializing trainer...")
     trainer = LeagueTrainer(
-        checkpoint_dir="/checkpoints_league",
-        log_dir="/logs",
+        checkpoint_dir=str(checkpoint_dir),
+        log_dir=str(log_dir),
         device=device,
     )
     
@@ -100,6 +106,14 @@ def main():
             }
         )
         logger.info("Models initialized successfully")
+
+        # Auto-resume from latest checkpoints if present
+        try:
+            resumed_step = trainer.load_latest_checkpoints()
+            if resumed_step > 1:
+                logger.info(f"Auto-resume enabled: starting from step {resumed_step}")
+        except Exception as e:
+            logger.warning(f"Auto-resume skipped (could not load checkpoints): {e}")
     except Exception as e:
         logger.error(f"Failed to initialize models: {e}", exc_info=True)
         return 1

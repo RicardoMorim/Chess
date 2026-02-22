@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Tuple, Optional
 from .data import board_to_tensor, get_move_index
 from .constants import ACTION_SPACE_SIZE, MCTS_CONFIG
+from .utils import clear_memory
 
 # ------------------------
 # Node

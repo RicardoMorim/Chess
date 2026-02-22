@@ -49,6 +49,9 @@ class MetricsCollector:
         
         # Per-variant tracking
         self.variant_metrics = defaultdict(lambda: defaultdict(list))
+
+        # Prevent unbounded memory growth for long-running sessions
+        self.max_points_per_series = 50_000
         
         # Buffer for high-frequency events
         self.event_buffer = defaultdict(list)
@@ -80,10 +83,16 @@ class MetricsCollector:
         """
         with self.lock:
             timestamp = time.time()
-            self.metrics[name].append((timestamp, value))
+            series = self.metrics[name]
+            series.append((timestamp, value))
+            if len(series) > self.max_points_per_series:
+                del series[:-self.max_points_per_series]
             
             if variant:
-                self.variant_metrics[variant][name].append((timestamp, value))
+                v_series = self.variant_metrics[variant][name]
+                v_series.append((timestamp, value))
+                if len(v_series) > self.max_points_per_series:
+                    del v_series[:-self.max_points_per_series]
     
     def record_counter(
         self,

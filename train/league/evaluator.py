@@ -56,7 +56,7 @@ class Evaluator:
         self,
         variant: str,
         step: int,
-        model_state: Dict[str, torch.Tensor],
+        checkpoint_path: Optional[str] = None,
     ) -> None:
         """
         Register a checkpoint for future evaluation.
@@ -64,13 +64,13 @@ class Evaluator:
         Args:
             variant: Model variant name
             step: Training step at which checkpoint was taken
-            model_state: Model state dict
+            checkpoint_path: Path to checkpoint on disk
         """
         key = f"{variant}_step_{step}"
         self.checkpoints[key] = {
             "variant": variant,
             "step": step,
-            "state": model_state.copy() if isinstance(model_state, dict) else model_state,
+            "path": checkpoint_path,
         }
         logger.info(f"Registered checkpoint: {key}")
     

@@ -10,13 +10,16 @@ Phase 3: Pure Self-Play - Convergence loop (runs indefinitely)
 import os
 import time
 import json
+import chess.pgn
 
 import torch
 from torch.utils.data import DataLoader, ConcatDataset
+from torch.cuda.amp import autocast, GradScaler
+from concurrent.futures import ThreadPoolExecutor
 
 # Import from core
 from core.models import create_model
-from core.data import PuzzleDataset, SelfPlayDataset, load_lichess_puzzles
+from core.data import PuzzleDataset, ChessDataset, load_lichess_puzzles
 from core.constants import (
     MODEL_CONFIG, CURRICULUM_CONFIG, TRAINING_CONFIG, HARDWARE_CONFIG
 )
@@ -31,16 +34,47 @@ def _get_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def _create_dataloader(dataset, batch_size, shuffle=True, num_workers=4):
+def _variant_model_type(variant: str) -> str:
+    input_channels = MODEL_CONFIG[variant]["input_channels"]
+    if input_channels >= 22:
+        return "big"
+    if input_channels >= 20:
+        return "medium"
+    return "small"
+
+
+def _create_dataloader(dataset, batch_size, shuffle=True, num_workers=None):
     """Create a DataLoader with sensible defaults."""
     device = _get_device()
+    if num_workers is None:
+        num_workers = int(HARDWARE_CONFIG.get('dataloader_workers', 4))
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=device.type == 'cuda'
+        pin_memory=device.type == 'cuda',
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=int(HARDWARE_CONFIG.get('prefetch_factor', 2)) if num_workers > 0 else None,
+        drop_last=shuffle,
     )
+
+
+def _amp_enabled(device: torch.device) -> bool:
+    return bool(device.type == 'cuda' and HARDWARE_CONFIG.get('enable_amp', False))
+
+
+def _save_games_pgn(games, path: str) -> None:
+    """Save a list of chess.pgn.Game objects to a PGN file."""
+    exporter = chess.pgn.StringExporter(headers=True, variations=False, comments=False)
+    with open(path, "w", encoding="utf-8") as f:
+        for game in games:
+            try:
+                f.write(game.accept(exporter))
+                f.write("\n\n")
+            except Exception:
+                # Skip any malformed game object
+                continue
 
 
 # ============================================================================
@@ -79,7 +113,8 @@ def phase1_puzzle_bootcamp(model, variant, checkpoint_dir, skip_bootcamp=False):
     
     puzzle_dataset = PuzzleDataset(
         puzzles=puzzles,
-        input_channels=MODEL_CONFIG[variant]['input_channels']
+        model_type=_variant_model_type(variant),
+        cache_dir=os.path.join(checkpoint_dir, "cache"),
     )
     
     # Optional checkmate bootcamp
@@ -115,6 +150,9 @@ def phase1_puzzle_bootcamp(model, variant, checkpoint_dir, skip_bootcamp=False):
         optimizer,
         T_max=CURRICULUM_CONFIG['phase1_epochs']
     )
+
+    use_amp = _amp_enabled(device)
+    scaler = GradScaler(enabled=use_amp)
     
     best_accuracy = 0.0
     
@@ -126,21 +164,28 @@ def phase1_puzzle_bootcamp(model, variant, checkpoint_dir, skip_bootcamp=False):
         
         for batch_idx, batch in enumerate(puzzle_loader):
             states, policy_targets, value_targets = batch[:3]
-            states = states.to(device)
-            policy_targets = policy_targets.to(device)
-            value_targets = value_targets.to(device)
+            states = states.to(device, non_blocking=True)
+            policy_targets = policy_targets.to(device, non_blocking=True)
+            value_targets = value_targets.to(device, non_blocking=True)
             
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             
-            policy_logits, value_preds = model(states)
-            
-            policy_loss = torch.nn.functional.cross_entropy(policy_logits, policy_targets)
-            value_loss = torch.nn.functional.mse_loss(value_preds.squeeze(), value_targets)
-            loss = policy_loss + value_loss
-            
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), TRAINING_CONFIG['grad_clip'])
-            optimizer.step()
+            with autocast(enabled=use_amp):
+                policy_logits, value_preds = model(states)
+                policy_loss = torch.nn.functional.cross_entropy(policy_logits, policy_targets)
+                value_loss = torch.nn.functional.mse_loss(value_preds.squeeze(), value_targets)
+                loss = policy_loss + value_loss
+
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), TRAINING_CONFIG['grad_clip'])
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), TRAINING_CONFIG['grad_clip'])
+                optimizer.step()
             
             total_loss += loss.item()
             
@@ -219,25 +264,26 @@ def phase2_transition(model, variant, checkpoint_dir, generate_games_fn=None):
         print("⚠ No game generation function provided, using empty game list")
         games = []
     
-    # Save games
-    replay_path = os.path.join(replay_dir, "phase2_games.json")
-    with open(replay_path, 'w') as f:
-        json.dump(games, f)
+    # Save games (PGN)
+    replay_path = os.path.join(replay_dir, "phase2_games.pgn")
+    _save_games_pgn(games, replay_path)
     
     if not games:
         print("Skipping training (no games generated)")
         return model
     
     # Create datasets
-    selfplay_dataset = SelfPlayDataset(
+    selfplay_dataset = ChessDataset(
         games=games,
-        input_channels=MODEL_CONFIG[variant]['input_channels']
+        augment=True,
+        model_type=_variant_model_type(variant),
     )
     
     puzzles = load_lichess_puzzles()
     puzzle_dataset = PuzzleDataset(
         puzzles=puzzles[:10000],
-        input_channels=MODEL_CONFIG[variant]['input_channels']
+        model_type=_variant_model_type(variant),
+        cache_dir=os.path.join(checkpoint_dir, "cache"),
     )
     
     combined_dataset = ConcatDataset([selfplay_dataset, puzzle_dataset])
@@ -255,31 +301,44 @@ def phase2_transition(model, variant, checkpoint_dir, generate_games_fn=None):
         weight_decay=TRAINING_CONFIG['weight_decay']
     )
     
+    use_amp = _amp_enabled(device)
+    scaler = GradScaler(enabled=use_amp)
+
     for epoch in range(CURRICULUM_CONFIG['phase2_epochs']):
         model.train()
         total_loss = 0
         
         for states, policy_targets, value_targets in dataloader:
-            states = states.to(device)
-            policy_targets = policy_targets.to(device)
-            value_targets = value_targets.to(device)
+            states = states.to(device, non_blocking=True)
+            policy_targets = policy_targets.to(device, non_blocking=True)
+            value_targets = value_targets.to(device, non_blocking=True)
             
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             
-            policy_logits, value_preds = model(states)
-            
-            policy_loss = torch.nn.functional.cross_entropy(policy_logits, policy_targets)
-            value_loss = torch.nn.functional.mse_loss(value_preds.squeeze(), value_targets)
-            loss = policy_loss + value_loss
-            
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), TRAINING_CONFIG['grad_clip'])
-            optimizer.step()
+            with autocast(enabled=use_amp):
+                policy_logits, value_preds = model(states)
+                policy_loss = torch.nn.functional.cross_entropy(policy_logits, policy_targets)
+                value_loss = torch.nn.functional.mse_loss(value_preds.squeeze(), value_targets)
+                loss = policy_loss + value_loss
+
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), TRAINING_CONFIG['grad_clip'])
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), TRAINING_CONFIG['grad_clip'])
+                optimizer.step()
             
             total_loss += loss.item()
         
-        avg_loss = total_loss / len(dataloader)
-        print(f"Epoch {epoch+1}/{CURRICULUM_CONFIG['phase2_epochs']}: Loss={avg_loss:.4f}")
+        if len(dataloader) == 0:
+            print(f"Epoch {epoch+1}/{CURRICULUM_CONFIG['phase2_epochs']}: no samples (skipping)")
+        else:
+            avg_loss = total_loss / len(dataloader)
+            print(f"Epoch {epoch+1}/{CURRICULUM_CONFIG['phase2_epochs']}: Loss={avg_loss:.4f}")
     
     transition_path = os.path.join(checkpoint_dir, "phase2_final.pt")
     torch.save(model.state_dict(), transition_path)
@@ -292,7 +351,10 @@ def phase2_transition(model, variant, checkpoint_dir, generate_games_fn=None):
 # PHASE 3: PURE SELF-PLAY
 # ============================================================================
 def phase3_pure_selfplay(model, variant, checkpoint_dir, 
-                         generate_games_fn=None, puzzle_dataset=None):
+                         generate_games_fn=None, puzzle_dataset=None,
+                         max_iterations=None, save_every: int = 1,
+                         keep_last: int = 3, keep_every: int = 15,
+                         resume_path: str | None = None):
     """
     Phase 3: Pure self-play convergence loop (runs indefinitely).
     
@@ -322,7 +384,23 @@ def phase3_pure_selfplay(model, variant, checkpoint_dir,
     replay_dir = os.path.join(checkpoint_dir, "replay_buffer")
     os.makedirs(replay_dir, exist_ok=True)
     
+    # Continue iteration numbering from existing checkpoints.
     iteration = 0
+    try:
+        existing = []
+        for f in os.listdir(checkpoint_dir):
+            i = None
+            if f.startswith("phase3_iter_") and f.endswith(".pt"):
+                try:
+                    i = int(f[len("phase3_iter_"):-len(".pt")])
+                except ValueError:
+                    i = None
+            if i is not None:
+                existing.append(i)
+        if existing:
+            iteration = max(existing)
+    except Exception:
+        pass
     
     optimizer = torch.optim.SGD(
         model.parameters(),
@@ -330,41 +408,133 @@ def phase3_pure_selfplay(model, variant, checkpoint_dir,
         momentum=TRAINING_CONFIG['sgd_momentum'],
         weight_decay=TRAINING_CONFIG['weight_decay']
     )
+
+    use_amp = _amp_enabled(device)
+    scaler = GradScaler(enabled=use_amp)
+
+    # Optional: resume optimizer/scaler from a rich checkpoint.
+    if resume_path:
+        try:
+            ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+            if isinstance(ckpt, dict):
+                # Model weights might already be loaded by main; safe to apply again.
+                state_dict = ckpt.get("model_state_dict") or ckpt.get("state_dict")
+                if state_dict is not None:
+                    model.load_state_dict(state_dict, strict=False)
+                opt_state = ckpt.get("optimizer_state_dict")
+                if opt_state is not None:
+                    try:
+                        optimizer.load_state_dict(opt_state)
+                    except Exception:
+                        pass
+                sc_state = ckpt.get("scaler_state_dict")
+                if use_amp and sc_state is not None:
+                    try:
+                        scaler.load_state_dict(sc_state)
+                    except Exception:
+                        pass
+                ckpt_iter = ckpt.get("iteration")
+                if isinstance(ckpt_iter, int) and ckpt_iter > iteration:
+                    iteration = ckpt_iter
+        except Exception:
+            pass
+
+    def _parse_iter_checkpoint(name: str) -> int | None:
+        prefix = "phase3_iter_"
+        suffix = ".pt"
+        if not (name.startswith(prefix) and name.endswith(suffix)):
+            return None
+        num = name[len(prefix):-len(suffix)]
+        try:
+            return int(num)
+        except ValueError:
+            return None
+
+    def _prune_phase3_checkpoints() -> None:
+        try:
+            files = [f for f in os.listdir(checkpoint_dir) if f.startswith("phase3_iter_") and f.endswith(".pt")]
+            iters = []
+            for f in files:
+                i = _parse_iter_checkpoint(f)
+                if i is not None:
+                    iters.append((i, f))
+            if not iters:
+                return
+            iters.sort(key=lambda x: x[0])
+            all_i = [i for i, _ in iters]
+            keep = set()
+            if all_i:
+                keep.add(all_i[0])  # keep the first iteration checkpoint
+            if keep_every and keep_every > 0:
+                keep |= {i for i in all_i if i % keep_every == 0}
+            if keep_last and keep_last > 0:
+                keep |= set(all_i[-keep_last:])
+            for i, f in iters:
+                if i in keep:
+                    continue
+                try:
+                    os.remove(os.path.join(checkpoint_dir, f))
+                except OSError:
+                    pass
+        except Exception:
+            pass
     
+    def _snapshot_state_dict_cpu():
+        # Snapshot the *current* model weights for background self-play.
+        # Must be CPU tensors so worker processes don't create CUDA contexts.
+        with torch.no_grad():
+            return {k: v.detach().cpu() for k, v in model.state_dict().items()}
+
     try:
+        executor = ThreadPoolExecutor(max_workers=1) if generate_games_fn is not None else None
+        next_games_future = None
+
+        # Warmup: generate an initial batch so we have something to train on.
+        if generate_games_fn is None:
+            print("⚠ No game generation function, skipping Phase 3.")
+            return model
+
+        print(f"Generating {CURRICULUM_CONFIG['phase3_games_per_iteration']} games (warmup)...")
+        start_time = time.time()
+        games = generate_games_fn(
+            model=model,
+            device=device,
+            num_games=CURRICULUM_CONFIG['phase3_games_per_iteration'],
+            num_simulations=CURRICULUM_CONFIG['phase3_mcts_sims']
+        )
+        gen_time = time.time() - start_time
+        print(f"✓ Generated {len(games)} games in {gen_time:.1f}s\n")
+
         while True:
             iteration += 1
+            if max_iterations is not None and iteration > int(max_iterations):
+                print("\nReached --max-iterations, stopping Phase 3.")
+                break
             print(f"\n{'='*80}")
             print(f"SELF-PLAY ITERATION {iteration}")
             print(f"{'='*80}\n")
-            
-            # Generate games
-            if generate_games_fn is not None:
-                print(f"Generating {CURRICULUM_CONFIG['phase3_games_per_iteration']} games...")
-                start_time = time.time()
-                
-                games = generate_games_fn(
-                    model=model,
+
+            # Start generating the NEXT batch in the background while we train on the CURRENT batch.
+            if executor is not None and next_games_future is None:
+                print("Launching background self-play for next iteration...")
+                snapshot = _snapshot_state_dict_cpu()
+                next_games_future = executor.submit(
+                    generate_games_fn,
+                    model_state_dict=snapshot,
                     device=device,
                     num_games=CURRICULUM_CONFIG['phase3_games_per_iteration'],
-                    num_simulations=CURRICULUM_CONFIG['phase3_mcts_sims']
+                    num_simulations=CURRICULUM_CONFIG['phase3_mcts_sims'],
                 )
-                
-                gen_time = time.time() - start_time
-                print(f"✓ Generated {len(games)} games in {gen_time:.1f}s\n")
-            else:
-                print("⚠ No game generation function, skipping")
-                continue
             
             # Save games
-            replay_path = os.path.join(replay_dir, f"iteration_{iteration:04d}.json")
-            with open(replay_path, 'w') as f:
-                json.dump(games, f)
+            replay_path = os.path.join(replay_dir, f"iteration_{iteration:04d}.pgn")
+            _save_games_pgn(games, replay_path)
             
             # Train
-            selfplay_dataset = SelfPlayDataset(
+            selfplay_dataset = ChessDataset(
                 games=games,
-                input_channels=MODEL_CONFIG[variant]['input_channels']
+                augment=True,
+                model_type=_variant_model_type(variant),
             )
             
             dataloader = _create_dataloader(
@@ -372,6 +542,11 @@ def phase3_pure_selfplay(model, variant, checkpoint_dir,
                 batch_size=CURRICULUM_CONFIG['phase3_batch_size'],
                 shuffle=True
             )
+
+            if len(dataloader) == 0:
+                print("⚠ No training samples from generated games (skipping training for this iteration)")
+                # Let the loop continue; the next self-play batch may contain finished games.
+                continue
             
             print(f"Training for {CURRICULUM_CONFIG['phase3_training_epochs']} epochs...")
             for epoch in range(CURRICULUM_CONFIG['phase3_training_epochs']):
@@ -379,31 +554,54 @@ def phase3_pure_selfplay(model, variant, checkpoint_dir,
                 total_loss = 0
                 
                 for states, policy_targets, value_targets in dataloader:
-                    states = states.to(device)
-                    policy_targets = policy_targets.to(device)
-                    value_targets = value_targets.to(device)
+                    states = states.to(device, non_blocking=True)
+                    policy_targets = policy_targets.to(device, non_blocking=True)
+                    value_targets = value_targets.to(device, non_blocking=True)
                     
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
                     
-                    policy_logits, value_preds = model(states)
-                    
-                    policy_loss = torch.nn.functional.cross_entropy(policy_logits, policy_targets)
-                    value_loss = torch.nn.functional.mse_loss(value_preds.squeeze(), value_targets)
-                    loss = policy_loss + value_loss
-                    
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), TRAINING_CONFIG['grad_clip'])
-                    optimizer.step()
+                    with autocast(enabled=use_amp):
+                        policy_logits, value_preds = model(states)
+                        policy_loss = torch.nn.functional.cross_entropy(policy_logits, policy_targets)
+                        value_loss = torch.nn.functional.mse_loss(value_preds.squeeze(), value_targets)
+                        loss = policy_loss + value_loss
+
+                    if use_amp:
+                        scaler.scale(loss).backward()
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), TRAINING_CONFIG['grad_clip'])
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), TRAINING_CONFIG['grad_clip'])
+                        optimizer.step()
                     
                     total_loss += loss.item()
                 
-                avg_loss = total_loss / len(dataloader)
-                print(f"  Epoch {epoch+1}: Loss={avg_loss:.4f}")
+                if len(dataloader) == 0:
+                    print(f"  Epoch {epoch+1}: no samples")
+                else:
+                    avg_loss = total_loss / len(dataloader)
+                    print(f"  Epoch {epoch+1}: Loss={avg_loss:.4f}")
             
             # Save checkpoint
-            iter_path = os.path.join(checkpoint_dir, f"phase3_iter_{iteration:04d}.pt")
-            torch.save(model.state_dict(), iter_path)
-            print(f"\n✓ Iteration {iteration} complete, saved to {iter_path}")
+            if save_every > 0 and (iteration % save_every == 0):
+                iter_path = os.path.join(checkpoint_dir, f"phase3_iter_{iteration:04d}.pt")
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scaler_state_dict": scaler.state_dict() if use_amp else None,
+                        "iteration": iteration,
+                        "variant": variant,
+                    },
+                    iter_path,
+                )
+                _prune_phase3_checkpoints()
+                print(f"\n✓ Iteration {iteration} complete, saved to {iter_path}")
+            else:
+                print(f"\n✓ Iteration {iteration} complete")
             
             # Periodic checkmate reinforcement
             checkmate_interval = CURRICULUM_CONFIG.get('phase3_checkmate_interval', 5)
@@ -425,6 +623,16 @@ def phase3_pure_selfplay(model, variant, checkpoint_dir,
             
             # Memory cleanup
             clear_memory()
+
+            # Collect the next batch (wait only if generation is slower than training + extras)
+            if next_games_future is not None:
+                print("Waiting for next self-play batch...")
+                games = next_games_future.result()
+                next_games_future = None
+                print(f"✓ Next batch ready: {len(games)} games")
+
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
             
     except KeyboardInterrupt:
         print("\n\nTraining interrupted by user!")

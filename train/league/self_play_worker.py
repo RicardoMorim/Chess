@@ -28,7 +28,8 @@ def self_play_worker(
 
     # Default configs
     model_config = model_config or {"input_channels": 22, "num_blocks": 15, "channels": 256}
-    mcts_config = mcts_config or {"num_visits": 800, "temperature": 1.0, "c_puct": 4.0, "dirichlet_alpha": 0.3, "add_noise": True, "parallel_workers": 8}
+    # NOTE: Self-play runs in multiple processes; keep MCTS inner threading low to avoid oversubscription.
+    mcts_config = mcts_config or {"num_visits": 800, "temperature": 1.0, "c_puct": 4.0, "dirichlet_alpha": 0.3, "add_noise": True, "parallel_workers": 1}
 
     try:
         # Load model on GPU (or CPU)
@@ -47,7 +48,7 @@ def self_play_worker(
             temperature=mcts_config["temperature"],
             dirichlet_alpha=mcts_config["dirichlet_alpha"],
             add_noise=mcts_config["add_noise"],
-            parallel_workers=mcts_config.get("parallel_workers", 8),
+            parallel_workers=mcts_config.get("parallel_workers", 1),
         )
 
         logger.info(f"Worker {worker_id}: Model loaded on {device}")
