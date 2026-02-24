@@ -11,3 +11,6 @@ cache*
 .claude/*
 .mcp.json
 .vscode/mcp.json
+
+/train/checkpoints*
+/train/checkpoints_league/*
