@@ -72,6 +72,7 @@ def main():
         checkpoint_dir=str(checkpoint_dir),
         log_dir=str(log_dir),
         device=device,
+        use_gpu_batching=True
     )
     
     # Import model constructor

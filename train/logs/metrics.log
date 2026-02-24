@@ -1,0 +1,185 @@
+2026-02-24 01:04:09 [INFO] Round 0 complete (266.3s) Metrics Summary (elapsed: 268.4s)
+
+est:
+  games: 30
+  train_steps: 10
+  buffer_size: 2700
+  buffer_fill_ratio: 0.0900
+  recent_loss: 8.2342
+  avg_game_length: 90.0000
+
+attack:
+  games: 30
+  train_steps: 10
+  buffer_size: 2700
+  buffer_fill_ratio: 0.0900
+  recent_loss: 8.2400
+  avg_game_length: 90.0000
+
+baseline:
+  games: 30
+  train_steps: 10
+  buffer_size: 2700
+  buffer_fill_ratio: 0.0900
+  recent_loss: 8.2868
+  avg_game_length: 90.0000
+
+2026-02-24 01:08:39 [INFO] Round 1 complete (270.5s) Metrics Summary (elapsed: 538.9s)
+
+est:
+  games: 60
+  train_steps: 20
+  buffer_size: 5400
+  buffer_fill_ratio: 0.1800
+  recent_loss: 7.5771
+  avg_game_length: 90.0000
+
+attack:
+  games: 60
+  train_steps: 20
+  buffer_size: 5400
+  buffer_fill_ratio: 0.1800
+  recent_loss: 7.5777
+  avg_game_length: 90.0000
+
+baseline:
+  games: 60
+  train_steps: 20
+  buffer_size: 5400
+  buffer_fill_ratio: 0.1800
+  recent_loss: 7.8574
+  avg_game_length: 90.0000
+
+2026-02-24 01:13:14 [INFO] Round 2 complete (274.3s) Metrics Summary (elapsed: 813.2s)
+
+est:
+  games: 90
+  train_steps: 30
+  buffer_size: 8100
+  buffer_fill_ratio: 0.2700
+  recent_loss: 7.2822
+  avg_game_length: 90.0000
+
+attack:
+  games: 90
+  train_steps: 30
+  buffer_size: 8100
+  buffer_fill_ratio: 0.2700
+  recent_loss: 7.1277
+  avg_game_length: 90.0000
+
+baseline:
+  games: 90
+  train_steps: 30
+  buffer_size: 8100
+  buffer_fill_ratio: 0.2700
+  recent_loss: 7.3860
+  avg_game_length: 90.0000
+
+2026-02-24 01:17:49 [INFO] Round 3 complete (275.2s) Metrics Summary (elapsed: 1088.4s)
+
+est:
+  games: 120
+  train_steps: 40
+  buffer_size: 10800
+  buffer_fill_ratio: 0.3600
+  recent_loss: 7.0484
+  avg_game_length: 90.0000
+
+attack:
+  games: 120
+  train_steps: 40
+  buffer_size: 10800
+  buffer_fill_ratio: 0.3600
+  recent_loss: 6.7862
+  avg_game_length: 90.0000
+
+baseline:
+  games: 120
+  train_steps: 40
+  buffer_size: 10800
+  buffer_fill_ratio: 0.3600
+  recent_loss: 7.1426
+  avg_game_length: 90.0000
+
+2026-02-24 01:22:14 [INFO] Round 4 complete (265.1s) Metrics Summary (elapsed: 1353.5s)
+
+est:
+  games: 150
+  train_steps: 50
+  buffer_size: 13500
+  buffer_fill_ratio: 0.4500
+  recent_loss: 6.7314
+  avg_game_length: 90.0000
+
+attack:
+  games: 150
+  train_steps: 50
+  buffer_size: 13500
+  buffer_fill_ratio: 0.4500
+  recent_loss: 6.6476
+  avg_game_length: 90.0000
+
+baseline:
+  games: 150
+  train_steps: 50
+  buffer_size: 13500
+  buffer_fill_ratio: 0.4500
+  recent_loss: 6.7082
+  avg_game_length: 90.0000
+
+2026-02-24 01:22:14 [INFO] Saved metrics checkpoint: C:\Users\Ricar\Desktop\projects\Chess\train\logs\metrics_round_4_20260224_012214.json
+2026-02-24 01:26:00 [INFO] Round 5 complete (225.7s) Metrics Summary (elapsed: 1579.2s)
+
+est:
+  games: 180
+  train_steps: 60
+  buffer_size: 16200
+  buffer_fill_ratio: 0.5400
+  recent_loss: 6.3974
+  avg_game_length: 90.0000
+
+attack:
+  games: 180
+  train_steps: 60
+  buffer_size: 16200
+  buffer_fill_ratio: 0.5400
+  recent_loss: 6.3270
+  avg_game_length: 90.0000
+
+baseline:
+  games: 180
+  train_steps: 60
+  buffer_size: 16200
+  buffer_fill_ratio: 0.5400
+  recent_loss: 6.6234
+  avg_game_length: 90.0000
+
+2026-02-24 01:26:39 [INFO] Saved metrics checkpoint: C:\Users\Ricar\Desktop\projects\Chess\train\logs\metrics_interrupted_20260224_012639.json
+2026-02-24 01:39:46 [INFO] Round 5 complete (250.6s) Metrics Summary (elapsed: 252.6s)
+
+est:
+  games: 30
+  train_steps: 10
+  buffer_size: 16189
+  buffer_fill_ratio: 0.5396
+  recent_loss: 6.3879
+  avg_game_length: 89.6333
+
+attack:
+  games: 30
+  train_steps: 10
+  buffer_size: 16199
+  buffer_fill_ratio: 0.5400
+  recent_loss: 6.5191
+  avg_game_length: 89.9667
+
+baseline:
+  games: 30
+  train_steps: 10
+  buffer_size: 16200
+  buffer_fill_ratio: 0.5400
+  recent_loss: 6.6327
+  avg_game_length: 90.0000
+
+2026-02-24 01:39:50 [INFO] Saved metrics checkpoint: C:\Users\Ricar\Desktop\projects\Chess\traIN\logs\metrics_interrupted_20260224_013950.json

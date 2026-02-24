@@ -144,7 +144,13 @@ class GPUInferenceServer:
             ]).to(self.device)
         except Exception as e:
             logger.error(f"Feature extraction failed: {e}. Returning defaults.")
-            return [(torch.zeros(legal_count), 0.0) for legal_count in [len(b.legal_moves) for b in boards]]
+            legal_counts: List[int] = []
+            for b in boards:
+                try:
+                    legal_counts.append(b.legal_moves.count())
+                except Exception:
+                    legal_counts.append(len(list(b.legal_moves)))
+            return [(torch.zeros(max(1, n), dtype=torch.float32), 0.0) for n in legal_counts]
         
         # Forward pass
         with torch.no_grad():
@@ -283,22 +289,35 @@ class GPUInferenceServer:
         """
         Convert chess board to feature tensor.
         
-        Placeholder: implement based on your model's feature format.
-        For now: return zero vector with correct shape (4672 = typical move space).
+        Uses board_to_tensor from train.core.data to create 22-channel board representation.
+        Supports input_channels detection from model if available.
         """
-        # TODO: Implement board → feature conversion matching your model
-        # For now, return dummy features
-        return torch.zeros(4672, dtype=torch.float32)
+        from train.core.data import board_to_tensor
+        
+        # Determine input channels (22 for big/attack models, 18 for others)
+        input_channels = 22
+        if hasattr(self.model, 'input_channels'):
+            input_channels = self.model.input_channels
+        
+        # Convert board to feature array
+        feat_array = board_to_tensor(
+            board,
+            move_number=board.fullmove_number,
+            input_channels=input_channels
+        )
+        
+        # Convert to tensor and return
+        return torch.tensor(feat_array, dtype=torch.float32, device=self.device)
     
     def _move_to_index(self, move: chess.Move) -> int:
         """
         Convert chess move to policy vector index.
         
-        Placeholder: implement based on your move encoding.
+        Uses get_move_index from train.core.data to encode moves consistently.
+        Supports standard moves and promotions via lookup table.
         """
-        # TODO: Implement move → policy index conversion
-        # For now: simple hash modulo 4672
-        return hash((move.from_square, move.to_square)) % 4672
+        from train.core.data import get_move_index
+        return get_move_index(move)
 
 
 def create_inference_server(
