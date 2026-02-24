@@ -4,7 +4,7 @@
 import time, threading, numpy as np, torch, chess
 import torch.nn.functional as F
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Dict, Tuple, Optional
+from typing import Callable, List, Dict, Tuple, Optional
 from .data import board_to_tensor, get_move_index
 from .constants import ACTION_SPACE_SIZE, MCTS_CONFIG
 from .utils import clear_memory
@@ -137,7 +137,13 @@ def select_move(root_board: chess.Board, model, device, num_simulations=800, tem
 # ============================================================================
 # NODE EXPANSION
 # ============================================================================
-def expand_node(node: MCTSNode, model, device, add_noise: bool = False) -> float:
+def expand_node(
+    node: MCTSNode,
+    model,
+    device,
+    add_noise: bool = False,
+    evaluate_fn: Optional[Callable[[chess.Board], Tuple[Optional[List[float]], float]]] = None,
+) -> float:
     """Expand a leaf node using the neural network.
     
     Args:
@@ -149,23 +155,57 @@ def expand_node(node: MCTSNode, model, device, add_noise: bool = False) -> float
     Returns:
         The value estimate for this position
     """
+    legal_moves = list(node.board.legal_moves)
+
+    # External evaluation path (GPU-batched server)
+    if evaluate_fn is not None:
+        try:
+            legal_logits, value_pred = evaluate_fn(node.board)
+        except Exception:
+            legal_logits, value_pred = None, 0.0
+
+        if not legal_moves:
+            return float(value_pred)
+
+        if not legal_logits or len(legal_logits) != len(legal_moves):
+            move_priors = np.ones(len(legal_moves), dtype=np.float32) / max(1, len(legal_moves))
+        else:
+            logits = np.asarray(legal_logits, dtype=np.float32)
+            logits = logits - np.max(logits)  # stabilize
+            exp = np.exp(logits)
+            move_priors = exp / (np.sum(exp) + 1e-8)
+
+        # Add Dirichlet noise at root for exploration
+        if add_noise and len(legal_moves) > 0:
+            noise = np.random.dirichlet([MCTS_CONFIG['dirichlet_alpha']] * len(legal_moves))
+            epsilon = MCTS_CONFIG['dirichlet_epsilon']
+            move_priors = (1 - epsilon) * move_priors + epsilon * noise
+
+        # Create child nodes
+        for move, prior in zip(legal_moves, move_priors):
+            next_board = node.board.copy()
+            next_board.push(move)
+            node.children[move] = MCTSNode(next_board, prior=prior, parent=node)
+
+        return float(value_pred)
+
+    # Local model evaluation path (default)
     input_channels = model.input_channels if hasattr(model, 'input_channels') else 22
-    
+
     # Generate board tensor (only 18/20/22 channels supported)
     board_tensor = torch.tensor(
-        board_to_tensor(node.board, node.board.fullmove_number, input_channels), 
-        dtype=torch.float32
+        board_to_tensor(node.board, node.board.fullmove_number, input_channels),
+        dtype=torch.float32,
     ).unsqueeze(0).to(device)
-    
+
     with torch.no_grad():
         policy_logits, value_pred = model(board_tensor)
-    
+
     policy = F.softmax(policy_logits, dim=1).cpu().numpy().flatten()
-    
-    legal_moves = list(node.board.legal_moves)
+
     if not legal_moves:
         return float(value_pred.item())
-    
+
     # Extract priors for legal moves only
     move_priors = []
     for move in legal_moves:
@@ -174,7 +214,7 @@ def expand_node(node: MCTSNode, model, device, add_noise: bool = False) -> float
             move_priors.append(policy[move_index])
         else:
             move_priors.append(1e-6)  # Small prior for unmapped moves
-    
+
     move_priors = np.array(move_priors, dtype=np.float32)
     
     # Normalize priors
@@ -247,7 +287,14 @@ def select_child(node: MCTSNode, c_puct: float) -> Tuple[chess.Move, 'MCTSNode']
 # ============================================================================
 # MCTS SIMULATION
 # ============================================================================
-def simulate(node: MCTSNode, model, device, c_puct: float, virtual_loss: float = 1.0) -> float:
+def simulate(
+    node: MCTSNode,
+    model,
+    device,
+    c_puct: float,
+    virtual_loss: float = 1.0,
+    evaluate_fn: Optional[Callable[[chess.Board], Tuple[Optional[List[float]], float]]] = None,
+) -> float:
     """Run one simulation from the given node.
     
     1. Selection: Select child nodes until reaching a leaf
@@ -269,7 +316,7 @@ def simulate(node: MCTSNode, model, device, c_puct: float, virtual_loss: float =
     # Expand if leaf node
     with node.lock:
         if not node.is_expanded():
-            value = expand_node(node, model, device, add_noise=False)
+            value = expand_node(node, model, device, add_noise=False, evaluate_fn=evaluate_fn)
             node.visit_count += 1
             node.value_sum += value
             return value
@@ -285,7 +332,7 @@ def simulate(node: MCTSNode, model, device, c_puct: float, virtual_loss: float =
         child.virtual_loss += virtual_loss
 
     # Recursive simulation (negate value for opponent)
-    value = -simulate(child, model, device, c_puct, virtual_loss)
+    value = -simulate(child, model, device, c_puct, virtual_loss, evaluate_fn=evaluate_fn)
 
     # Backpropagate and remove virtual loss
     with node.lock:
@@ -300,9 +347,18 @@ def simulate(node: MCTSNode, model, device, c_puct: float, virtual_loss: float =
 # ============================================================================
 # RUN MCTS
 # ============================================================================
-def run_mcts(root_board: chess.Board, model, device, num_simulations: int = 800, 
-             time_limit: float = None, c_puct: float = None, virtual_loss: float = None, 
-             parallel_workers: int = 4, add_noise: bool = True) -> Tuple[Dict, MCTSNode]:
+def run_mcts(
+    root_board: chess.Board,
+    model,
+    device,
+    num_simulations: int = 800,
+    time_limit: float = None,
+    c_puct: float = None,
+    virtual_loss: float = None,
+    parallel_workers: int = 4,
+    add_noise: bool = True,
+    evaluate_fn: Optional[Callable[[chess.Board], Tuple[Optional[List[float]], float]]] = None,
+) -> Tuple[Dict, MCTSNode]:
     """Run Monte Carlo Tree Search from a root position.
     
     Args:
@@ -327,7 +383,7 @@ def run_mcts(root_board: chess.Board, model, device, num_simulations: int = 800,
     
     # Create and expand root
     root = MCTSNode(root_board, prior=1.0)
-    expand_node(root, model, device, add_noise=add_noise)
+    expand_node(root, model, device, add_noise=add_noise, evaluate_fn=evaluate_fn)
     
     if not root.children:
         return {}, root
@@ -341,7 +397,7 @@ def run_mcts(root_board: chess.Board, model, device, num_simulations: int = 800,
     
     def run_one_simulation():
         nonlocal simulations_done
-        simulate(root, model, device, c_puct, virtual_loss)
+        simulate(root, model, device, c_puct, virtual_loss, evaluate_fn=evaluate_fn)
         simulations_done += 1
 
     # Determine budget
@@ -594,6 +650,7 @@ class MCTS:
         add_noise: bool = True,
         parallel_workers: int = 4,
         virtual_loss: float = 1.0,
+        evaluate_fn: Optional[Callable[[chess.Board], Tuple[Optional[List[float]], float]]] = None,
     ) -> None:
         self.model = model
         self.device = device
@@ -604,6 +661,7 @@ class MCTS:
         self.add_noise = add_noise
         self.parallel_workers = parallel_workers
         self.virtual_loss = virtual_loss
+        self.evaluate_fn = evaluate_fn
 
     def search(self, board: chess.Board):
         """Run MCTS and return (policy_vector, selected_move)."""
@@ -616,6 +674,7 @@ class MCTS:
             virtual_loss=self.virtual_loss,
             parallel_workers=self.parallel_workers,
             add_noise=self.add_noise,
+            evaluate_fn=self.evaluate_fn,
         )
 
         # Store root value for resignation logic

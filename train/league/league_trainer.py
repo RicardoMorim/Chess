@@ -36,6 +36,7 @@ from league.replay_buffer import ReplayBuffer
 from league.self_play_worker import self_play_worker
 from league.monitoring import MetricsCollector
 from league.evaluator import Evaluator
+from league.gpu_inference_process import gpu_inference_server_main
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -161,6 +162,8 @@ class LeagueTrainer:
         
         if self.use_gpu_batching:
             logger.info("GPU-batched inference enabled (EXPERIMENTAL)")
+            # Single GPU: avoid running multiple self-play variants concurrently.
+            self._variant_parallelism = 1
         else:
             logger.info("Using CPU-only MCTS for self-play (GPU-batched disabled)")
         
@@ -369,17 +372,59 @@ class LeagueTrainer:
         ctx = mp.get_context("spawn")
         queue = ctx.Queue()
         processes = []
+
+        # If GPU batching is enabled, start one GPU inference process for this variant.
+        use_gpu_eval = bool(self.use_gpu_batching and self.device.type == "cuda" and torch.cuda.is_available())
+        gpu_server_proc = None
+        gpu_request_queue = None
+        gpu_response_queues = None
+
+        # Self-play feature channels must match the model variant.
+        # baseline/est => 18, attack => 22
+        input_channels = 22 if variant == "attack" else 18
         
         model = self.models[variant]
-        # Send CPU weights to workers to avoid CUDA tensor pickling and extra GPU memory pressure.
+        # Always snapshot weights on CPU for multiprocessing.
         model_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+
+        if use_gpu_eval:
+            gpu_request_queue = ctx.Queue(maxsize=5000)
+            gpu_response_queues = [ctx.Queue(maxsize=5000) for _ in range(self._num_self_play_workers)]
+
+            gpu_server_proc = ctx.Process(
+                target=gpu_inference_server_main,
+                args=(
+                    model_state,
+                    self._model_constructor,
+                    self.model_configs[variant],
+                    str(self.device),
+                    gpu_request_queue,
+                    gpu_response_queues,
+                    32,
+                    10,
+                ),
+                name=f"{variant}_gpu_inference",
+            )
+            gpu_server_proc.start()
+            logger.info(f"{variant}: GPU inference process started (device={self.device})")
+        elif self.use_gpu_batching and self.device.type != "cuda":
+            logger.warning(f"{variant}: GPU batching requested but trainer device={self.device}; falling back to CPU-only self-play")
         
         # Launch workers
         for worker_id in range(self._num_self_play_workers):
+            gpu_eval_payload = None
+            if use_gpu_eval:
+                gpu_eval_payload = {
+                    "request_queue": gpu_request_queue,
+                    "response_queue": gpu_response_queues[worker_id],
+                    "timeout_sec": 15.0,
+                    "input_channels": input_channels,
+                }
+
             p = ctx.Process(
                 target=self_play_worker,
                 args=(
-                    model_state,
+                    ({} if use_gpu_eval else model_state),
                     self._model_constructor,
                     self.GAMES_PER_WORKER_PER_ROUND,
                     self.SELF_PLAY_DEVICE,
@@ -394,6 +439,7 @@ class LeagueTrainer:
                         "parallel_workers": 2,
                     },
                     worker_id,
+                    gpu_eval_payload,
                 ),
                 name=f"{variant}_worker_{worker_id}",
             )
@@ -445,6 +491,21 @@ class LeagueTrainer:
         # Wait for workers to finish
         for p in processes:
             p.join()
+
+        # Stop GPU inference process (if any)
+        if gpu_request_queue is not None:
+            try:
+                gpu_request_queue.put(None)
+            except Exception:
+                pass
+        if gpu_server_proc is not None:
+            gpu_server_proc.join(timeout=5.0)
+            if gpu_server_proc.is_alive():
+                logger.warning(f"{variant}: GPU inference process did not stop in time; terminating")
+                try:
+                    gpu_server_proc.terminate()
+                except Exception:
+                    pass
         
         if errors > 0:
             logger.warning(f"{variant}: {errors}/{num_games_expected} games failed")
@@ -746,6 +807,8 @@ class LeagueTrainer:
             if used_pct < 80:
                 self._num_self_play_workers = self.NUM_SELF_PLAY_WORKERS
                 self._variant_parallelism = self.SELF_PLAY_VARIANT_PARALLELISM
+                if self.use_gpu_batching:
+                    self._variant_parallelism = 1
                 self._buffer_target_size = self.REPLAY_BUFFER_MAX_SIZE
                 for variant in self.VARIANTS:
                     buffer = self.buffers.get(variant)
@@ -766,6 +829,9 @@ class LeagueTrainer:
                 self._variant_parallelism = max(1, self.SELF_PLAY_VARIANT_PARALLELISM - 1)
                 self._buffer_target_size = max(15000, int(self.REPLAY_BUFFER_MAX_SIZE * 0.8))
 
+            if self.use_gpu_batching:
+                self._variant_parallelism = 1
+
             logger.warning(
                 f"High RAM usage ({used_pct:.1f}%). "
                 f"Throttling self-play: workers={self._num_self_play_workers}, "
@@ -784,6 +850,8 @@ class LeagueTrainer:
             # psutil not available or error; keep defaults
             self._num_self_play_workers = self.NUM_SELF_PLAY_WORKERS
             self._variant_parallelism = self.SELF_PLAY_VARIANT_PARALLELISM
+            if self.use_gpu_batching:
+                self._variant_parallelism = 1
 
     def _check_and_manage_disk(self) -> None:
         """Check disk space and prune buffer files if needed."""

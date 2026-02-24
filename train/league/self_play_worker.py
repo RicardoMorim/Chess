@@ -22,6 +22,7 @@ def self_play_worker(
     model_config: Optional[Dict[str, Any]] = None,
     mcts_config: Optional[Dict[str, Any]] = None,
     worker_id: int = 0,
+    gpu_eval: Optional[Dict[str, Any]] = None,
 ) -> None:
 
     from core.mcts import MCTS
@@ -32,13 +33,33 @@ def self_play_worker(
     mcts_config = mcts_config or {"num_visits": 800, "temperature": 1.0, "c_puct": 4.0, "dirichlet_alpha": 0.3, "add_noise": True, "parallel_workers": 1}
 
     try:
-        # Load model on GPU (or CPU)
         torch.set_num_threads(1)  # avoid CPU oversubscription
-        model = model_constructor(**model_config)
-        model.load_state_dict(model_state_dict)
-        model.to(device)
-        model.eval()
-        # NOTE: Keep in FP32 for stability. FP16 only helpful with GPU batching of MCTS.
+
+        evaluate_fn = None
+        model = None
+
+        if gpu_eval is not None:
+            from league.gpu_inference_process import GPUInferenceClient
+
+            client = GPUInferenceClient(
+                worker_id=worker_id,
+                request_queue=gpu_eval["request_queue"],
+                response_queue=gpu_eval["response_queue"],
+            )
+
+            timeout_sec = float(gpu_eval.get("timeout_sec", 10.0))
+
+            def evaluate_fn(board: chess.Board):
+                return client.evaluate(board, timeout_sec=timeout_sec)
+
+            logger.info(f"Worker {worker_id}: Using GPU-batched evaluator (remote)")
+        else:
+            # Load model locally on CPU (legacy path)
+            model = model_constructor(**model_config)
+            model.load_state_dict(model_state_dict)
+            model.to(device)
+            model.eval()
+            logger.info(f"Worker {worker_id}: Model loaded on {device}")
 
         mcts = MCTS(
             model=model,
@@ -49,12 +70,11 @@ def self_play_worker(
             dirichlet_alpha=mcts_config["dirichlet_alpha"],
             add_noise=mcts_config["add_noise"],
             parallel_workers=mcts_config.get("parallel_workers", 1),
+            evaluate_fn=evaluate_fn,
         )
 
-        logger.info(f"Worker {worker_id}: Model loaded on {device}")
-
         for game_idx in range(num_games):
-            game_trajectory = play_game_batch_mcts(mcts, device, model_config, worker_id)
+            game_trajectory = play_game_batch_mcts(mcts, device, model_config, worker_id, gpu_eval=gpu_eval)
             if game_trajectory:
                 result_queue.put({"game_data": game_trajectory, "worker_id": worker_id, "game_idx": game_idx})
                 logger.info(f"Worker {worker_id}: Game {game_idx+1}/{num_games} finished ({len(game_trajectory)} moves)")
@@ -64,7 +84,7 @@ def self_play_worker(
         result_queue.put({"error": str(e), "worker_id": worker_id})
 
 
-def play_game_batch_mcts(mcts, device, model_config, worker_id):
+def play_game_batch_mcts(mcts, device, model_config, worker_id, gpu_eval: Optional[Dict[str, Any]] = None):
     """
     Play a single self-play game using MCTS.
     
@@ -81,7 +101,11 @@ def play_game_batch_mcts(mcts, device, model_config, worker_id):
     resigned = False
     end_reason = "unknown"
 
-    input_channels = getattr(mcts.model, "input_channels", model_config.get("input_channels", 22))
+    # If using remote evaluator, mcts.model may be None; use explicit input_channels.
+    if gpu_eval is not None and "input_channels" in gpu_eval:
+        input_channels = int(gpu_eval["input_channels"])
+    else:
+        input_channels = getattr(mcts.model, "input_channels", model_config.get("input_channels", 22))
 
     while not board.is_game_over() and move_count < max_moves:
         try:

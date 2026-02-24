@@ -292,7 +292,10 @@ class GPUInferenceServer:
         Uses board_to_tensor from train.core.data to create 22-channel board representation.
         Supports input_channels detection from model if available.
         """
-        from train.core.data import board_to_tensor
+        try:
+            from train.core.data import board_to_tensor  # type: ignore
+        except ModuleNotFoundError:
+            from core.data import board_to_tensor  # type: ignore
         
         # Determine input channels (22 for big/attack models, 18 for others)
         input_channels = 22
@@ -316,7 +319,10 @@ class GPUInferenceServer:
         Uses get_move_index from train.core.data to encode moves consistently.
         Supports standard moves and promotions via lookup table.
         """
-        from train.core.data import get_move_index
+        try:
+            from train.core.data import get_move_index  # type: ignore
+        except ModuleNotFoundError:
+            from core.data import get_move_index  # type: ignore
         return get_move_index(move)
 
 

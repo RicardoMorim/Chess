@@ -183,3 +183,31 @@ baseline:
   avg_game_length: 90.0000
 
 2026-02-24 01:39:50 [INFO] Saved metrics checkpoint: C:\Users\Ricar\Desktop\projects\Chess\traIN\logs\metrics_interrupted_20260224_013950.json
+2026-02-24 01:51:15 [INFO] Round 5 complete (250.9s) Metrics Summary (elapsed: 252.9s)
+
+baseline:
+  games: 30
+  train_steps: 10
+  buffer_size: 16181
+  buffer_fill_ratio: 0.5394
+  recent_loss: 6.5084
+  avg_game_length: 89.3667
+
+est:
+  games: 30
+  train_steps: 10
+  buffer_size: 16200
+  buffer_fill_ratio: 0.5400
+  recent_loss: 6.3532
+  avg_game_length: 90.0000
+
+attack:
+  games: 30
+  train_steps: 10
+  buffer_size: 16200
+  buffer_fill_ratio: 0.5400
+  recent_loss: 6.4476
+  avg_game_length: 90.0000
+
+2026-02-24 01:52:38 [INFO] Saved metrics checkpoint: C:\Users\Ricar\Desktop\projects\Chess\traIN\logs\metrics_interrupted_20260224_015238.json
+2026-02-24 02:01:04 [INFO] Saved metrics checkpoint: C:\Users\Ricar\Desktop\projects\Chess\train\logs\metrics_interrupted_20260224_020104.json
