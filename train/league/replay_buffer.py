@@ -17,6 +17,7 @@ from collections import deque
 import random
 import threading
 from typing import List, Tuple, Optional
+import numpy as np
 
 
 class ReplayBuffer:
@@ -109,6 +110,18 @@ class ReplayBuffer:
             self.positions.clear()
             self.policies.clear()
             self.values.clear()
+
+    def set_max_size(self, new_max_size: int) -> None:
+        """Resize the buffer capacity, keeping the most recent entries."""
+        if new_max_size <= 0:
+            return
+        with self.lock:
+            if new_max_size == self.max_size:
+                return
+            self.positions = deque(list(self.positions)[-new_max_size:], maxlen=new_max_size)
+            self.policies = deque(list(self.policies)[-new_max_size:], maxlen=new_max_size)
+            self.values = deque(list(self.values)[-new_max_size:], maxlen=new_max_size)
+            self.max_size = new_max_size
     
     def get_stats(self) -> dict:
         """
@@ -129,7 +142,6 @@ class ReplayBuffer:
                     "value_std": 0.0,
                 }
             
-            import numpy as np
             values_array = np.array(list(self.values))
             
             return {
@@ -139,3 +151,35 @@ class ReplayBuffer:
                 "value_mean": float(values_array.mean()),
                 "value_std": float(values_array.std()),
             }
+
+    def save_to_npz(self, file_path: str) -> None:
+        """Persist the buffer to a compressed .npz file."""
+        with self.lock:
+            size = len(self.positions)
+            if size == 0:
+                return
+            positions = np.stack(list(self.positions))
+            policies = np.stack(list(self.policies))
+            values = np.array(list(self.values), dtype=np.float32)
+        np.savez_compressed(file_path, positions=positions, policies=policies, values=values)
+
+    def load_from_npz(self, file_path: str) -> None:
+        """Load the buffer from a .npz file, keeping the most recent entries if oversized."""
+        data = np.load(file_path)
+        positions = data["positions"]
+        policies = data["policies"]
+        values = data["values"]
+
+        if len(positions) == 0:
+            return
+
+        # Keep the most recent samples if file exceeds max_size
+        if len(positions) > self.max_size:
+            positions = positions[-self.max_size:]
+            policies = policies[-self.max_size:]
+            values = values[-self.max_size:]
+
+        with self.lock:
+            self.positions = deque(list(positions), maxlen=self.max_size)
+            self.policies = deque(list(policies), maxlen=self.max_size)
+            self.values = deque(list(values), maxlen=self.max_size)

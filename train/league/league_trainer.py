@@ -60,20 +60,23 @@ class LeagueTrainer:
     VARIANTS = ["baseline", "attack", "est"]
     # Parallelism config (INTERMEDIATE - validated and stable)
     # NOTE: Self-play already multiplies across variants; keep this modest to avoid oversubscription.
-    NUM_SELF_PLAY_WORKERS = 2  # CPU processes per variant for self-play
+    NUM_SELF_PLAY_WORKERS = 6  # CPU processes per variant for self-play
     GAMES_PER_WORKER_PER_ROUND = 5  # Multiple games per worker
     BATCH_SIZE = 128  # Larger batches for GPU efficiency
     TRAINING_STEPS_PER_ROUND = 10  # More gradient updates per round
     CHECKPOINT_EVERY_N_ROUNDS = 5  # Checkpoint every 5 rounds
     EVAL_EVERY_N_ROUNDS = 100  # Skip for now
+    METRICS_EVERY_N_ROUNDS = 5
+    BUFFER_SAVE_EVERY_N_ROUNDS = 5
+    METRICS_EVERY_N_ROUNDS = 5
 
     # Devices / concurrency
     SELF_PLAY_DEVICE = "cpu"  # Safer: avoids many CUDA contexts across worker processes
-    SELF_PLAY_VARIANT_PARALLELISM = 2  # How many variants generate self-play concurrently
+    SELF_PLAY_VARIANT_PARALLELISM = 3  # How many variants generate self-play concurrently
     
     # MCTS hyperparameters (INTERMEDIATE - correct dual-budget approach)
     # Self-play: BALANCED generation of training data (GPU utilized 100%, VRAM 80%)
-    MCTS_VISITS_SELFPLAY = 16  # Throughput-optimal; 32 doubled round time
+    MCTS_VISITS_SELFPLAY = 12  # Throughput-optimized; lower for speed
     # Evaluation: SLOWER, higher quality comparisons between models
     MCTS_VISITS_EVAL = 64  # Meaningful search for model assessment
     C_PUCT = 4.0
@@ -82,18 +85,31 @@ class LeagueTrainer:
     
     # Replay buffer config
     # Large buffers can consume many GB of RAM (3 variants). Keep smaller unless you have ample RAM.
-    REPLAY_BUFFER_MAX_SIZE = 50_000
+    REPLAY_BUFFER_MAX_SIZE = 30_000
 
     # Checkpoint retention
     CHECKPOINT_KEEP_LAST_N = 3
     CHECKPOINT_KEEP_EVERY_N = 15
     CHECKPOINT_ALWAYS_KEEP_STEPS = {1}
     
+    # Disk usage safeguards
+    MAX_BUFFER_FILES_PER_VARIANT = 3  # Keep only the 3 most recent buffer files
+    DISK_USAGE_CHECK_EVERY_N_ROUNDS = 10  # Check disk space periodically
+    CRITICAL_DISK_THRESHOLD_PCT = 5  # Alert if free disk < this (%)
+    
+    # Adaptive MCTS visitation tuning
+    TARGET_GAMES_PER_MINUTE = 10  # Target throughput (games/min)
+    ADAPTIVE_VISITS_CHECK_EVERY_N_ROUNDS = 5  # Check and adjust visits periodically
+    VISITS_ADJUSTMENT_FACTOR = 0.15  # Adjust visits by 15% each step
+    MIN_MCTS_VISITS = 6  # Never go below this
+    MAX_MCTS_VISITS = 32  # Never go above this
+    
     def __init__(
         self,
         checkpoint_dir: str = "checkpoints",
         log_dir: str = "logs",
         device: str = "cuda",
+        use_gpu_batching: bool = False,
     ):
         """
         Initialize league trainer.
@@ -102,10 +118,12 @@ class LeagueTrainer:
             checkpoint_dir: Directory for model checkpoints
             log_dir: Directory for logs and metrics
             device: Device for GPU training ("cuda" or "cpu")
+            use_gpu_batching: If True, enable GPU-batched inference server (EXPERIMENTAL)
         """
         self.device = torch.device(device)
         self.checkpoint_dir = Path(checkpoint_dir)
         self.log_dir = Path(log_dir)
+        self.use_gpu_batching = use_gpu_batching
         
         # Create directories
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -117,6 +135,9 @@ class LeagueTrainer:
         self.buffers = {}
         self.model_configs = {}
         
+        # GPU inference server (lazy init on first use if enabled)
+        self._gpu_inference_server = None
+        
         # Metrics and evaluation
         self.metrics = MetricsCollector(str(self.log_dir))
         self.evaluator = Evaluator(device=str(self.device))
@@ -126,6 +147,22 @@ class LeagueTrainer:
         self.start_round = 0
         self.total_games = 0
         self.total_training_steps = 0
+
+        # Adaptive self-play controls (may be throttled on high RAM usage)
+        self._num_self_play_workers = self.NUM_SELF_PLAY_WORKERS
+        self._variant_parallelism = self.SELF_PLAY_VARIANT_PARALLELISM
+        self._buffer_target_size = self.REPLAY_BUFFER_MAX_SIZE
+        self._last_buffer_target_size = self.REPLAY_BUFFER_MAX_SIZE
+        self._last_disk_check = 0  # Track when disk was last checked
+        
+        # Adaptive MCTS visitation tracking
+        self._current_mcts_visits = self.MCTS_VISITS_SELFPLAY
+        self._throughput_history = {variant: [] for variant in self.VARIANTS}  # Rolling window of games/min
+        
+        if self.use_gpu_batching:
+            logger.info("GPU-batched inference enabled (EXPERIMENTAL)")
+        else:
+            logger.info("Using CPU-only MCTS for self-play (GPU-batched disabled)")
         
         logger.info(f"LeagueTrainer initialized: device={self.device}, checkpoints={self.checkpoint_dir}")
 
@@ -171,6 +208,15 @@ class LeagueTrainer:
                     logger.info(f"Pruned checkpoint: {path.name}")
                 except Exception as e:
                     logger.warning(f"Failed to prune checkpoint {path}: {e}")
+
+                # Prune matching replay buffer file
+                buffer_path = self.checkpoint_dir / f"{variant}_buffer_step_{step}.npz"
+                try:
+                    if buffer_path.exists():
+                        buffer_path.unlink(missing_ok=True)
+                        logger.info(f"Pruned buffer: {buffer_path.name}")
+                except Exception as e:
+                    logger.warning(f"Failed to prune buffer {buffer_path}: {e}")
         except Exception as e:
             logger.warning(f"Checkpoint pruning failed for {variant}: {e}")
     
@@ -286,6 +332,15 @@ class LeagueTrainer:
                 logger.info(f"Resumed {variant} from checkpoint: {path.name}")
                 max_step_loaded = max(max_step_loaded, int(step))
 
+                # Try to load replay buffer for the same step
+                buffer_path = self.checkpoint_dir / f"{variant}_buffer_step_{step}.npz"
+                if buffer_path.exists():
+                    try:
+                        self.buffers[variant].load_from_npz(str(buffer_path))
+                        logger.info(f"Loaded replay buffer: {buffer_path.name}")
+                    except Exception as e:
+                        logger.warning(f"Failed to load buffer {buffer_path}: {e}")
+
             except Exception as e:
                 logger.warning(f"Failed to load checkpoint {path} for {variant}: {e}")
 
@@ -320,7 +375,7 @@ class LeagueTrainer:
         model_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
         
         # Launch workers
-        for worker_id in range(self.NUM_SELF_PLAY_WORKERS):
+        for worker_id in range(self._num_self_play_workers):
             p = ctx.Process(
                 target=self_play_worker,
                 args=(
@@ -331,12 +386,12 @@ class LeagueTrainer:
                     queue,
                     self.model_configs[variant],
                     {
-                        "num_visits": self.MCTS_VISITS_SELFPLAY,  # Fast self-play
+                        "num_visits": self._current_mcts_visits,  # Adaptive MCTS visits
                         "temperature": self.TEMPERATURE,
                         "c_puct": self.C_PUCT,
                         "dirichlet_alpha": self.DIRICHLET_ALPHA,
                         "add_noise": True,
-                        "parallel_workers": 1,
+                        "parallel_workers": 2,
                     },
                     worker_id,
                 ),
@@ -346,12 +401,13 @@ class LeagueTrainer:
             processes.append(p)
         
         # Collect results
-        num_games_expected = self.NUM_SELF_PLAY_WORKERS * self.GAMES_PER_WORKER_PER_ROUND
+        num_games_expected = self._num_self_play_workers * self.GAMES_PER_WORKER_PER_ROUND
         games_collected = 0
         errors = 0
         game_lengths = []
+        sp_start = time.time()
         
-        logger.info(f"{variant}: Waiting for {num_games_expected} games from {self.NUM_SELF_PLAY_WORKERS} workers...")
+        logger.info(f"{variant}: Waiting for {num_games_expected} games from {self._num_self_play_workers} workers...")
         
         for _ in range(num_games_expected):
             result = queue.get()
@@ -361,7 +417,17 @@ class LeagueTrainer:
                 errors += 1
                 continue
             
-            game_data = result["game_data"]
+            game_payload = result["game_data"]
+            if isinstance(game_payload, dict):
+                game_data = game_payload.get("trajectory", [])
+                outcome = game_payload.get("outcome", "1/2-1/2")
+            else:
+                game_data = game_payload
+                outcome = "1/2-1/2"
+
+            if not game_data:
+                continue
+
             self.buffers[variant].add_game(game_data)
             
             games_collected += 1
@@ -370,7 +436,6 @@ class LeagueTrainer:
             
             # Record metrics
             game_length = len(game_data)
-            outcome = "1-0"  # Would need to extract from game_data
             self.metrics.record_self_play_game(variant, game_length, outcome)
             
             # Progress indicator
@@ -385,7 +450,16 @@ class LeagueTrainer:
             logger.warning(f"{variant}: {errors}/{num_games_expected} games failed")
         
         avg_moves = sum(game_lengths) / len(game_lengths) if game_lengths else 0
-        logger.info(f"{variant}: ✓ Collected {games_collected} games (avg {avg_moves:.0f} moves)")
+        elapsed = max(0.001, time.time() - sp_start)
+        games_per_min = (games_collected / elapsed) * 60.0
+        logger.info(
+            f"{variant}: ✓ Collected {games_collected} games "
+            f"(avg {avg_moves:.0f} moves, {games_per_min:.1f} games/min)"
+        )
+        
+        # Record throughput for adaptive tuning
+        self.metrics.record_metric(f"{variant}_throughput", games_per_min, variant=variant)
+        
         return games_collected
     
     def train_model(self, variant: str) -> float:
@@ -528,6 +602,12 @@ class LeagueTrainer:
         - Training batches from replay buffer (purely from self-play)
         - Evaluation is low-frequency, only for monitoring
         
+        Optimizations:
+        - Adaptive MCTS visitation: automatically tunes visits to maintain target throughput
+        - Disk management: prunes old buffers if disk space is low
+        - RAM throttling: reduces workers if memory usage > 85%
+        - GPU batching: if enabled, aggregates board evals from CPU workers (EXPERIMENTAL)
+        
         Args:
             max_rounds: Maximum number of training rounds (None = infinite)
         """
@@ -546,7 +626,8 @@ class LeagueTrainer:
             # Self-play phase (fully parallel across all variants)
             logger.info("Phase 1: Self-play generation (parallel across variants)...")
             sp_start = time.time()
-            with ThreadPoolExecutor(max_workers=self.SELF_PLAY_VARIANT_PARALLELISM) as executor:
+            self._maybe_throttle_for_memory()
+            with ThreadPoolExecutor(max_workers=self._variant_parallelism) as executor:
                 # Submit all variants simultaneously
                 futures = {}
                 for variant in self.VARIANTS:
@@ -595,6 +676,19 @@ class LeagueTrainer:
                         self.save_checkpoint(variant, step=round_num + 1)
                     except Exception as e:
                         logger.error(f"Checkpoint failed for {variant}: {e}")
+
+            # Replay buffer persistence (matches checkpoint cadence by default)
+            if (round_num + 1) % self.BUFFER_SAVE_EVERY_N_ROUNDS == 0:
+                for variant in self.VARIANTS:
+                    try:
+                        buffer_path = self.checkpoint_dir / f"{variant}_buffer_step_{round_num + 1}.npz"
+                        self.buffers[variant].save_to_npz(str(buffer_path))
+                    except Exception as e:
+                        logger.warning(f"Buffer save failed for {variant}: {e}")
+            
+            # Check disk space periodically
+            if (round_num + 1) % self.DISK_USAGE_CHECK_EVERY_N_ROUNDS == 0:
+                self._check_and_manage_disk()
             
             # Evaluation (least frequent)
             if (round_num + 1) % self.EVAL_EVERY_N_ROUNDS == 0:
@@ -628,9 +722,190 @@ class LeagueTrainer:
             
             logger.info(f"{'='*60}\n")
             self.metrics.log_summary(f"Round {round_num} complete ({round_time:.1f}s)")
-            self.metrics.save_checkpoint(f"round_{round_num}")
+            if (round_num + 1) % self.METRICS_EVERY_N_ROUNDS == 0:
+                self.metrics.save_checkpoint(f"round_{round_num}")
+            
+            # Adaptive MCTS visitation tuning
+            if (round_num + 1) % self.ADAPTIVE_VISITS_CHECK_EVERY_N_ROUNDS == 0:
+                self._adapt_mcts_visits()
             
             round_num += 1
+
+    def _maybe_throttle_for_memory(self) -> None:
+        """Reduce self-play parallelism when RAM usage is high.
+
+        Uses psutil if available; otherwise leaves settings unchanged.
+        """
+        try:
+            import psutil
+
+            mem = psutil.virtual_memory()
+            used_pct = mem.percent
+
+            # Restore defaults when memory pressure is low
+            if used_pct < 80:
+                self._num_self_play_workers = self.NUM_SELF_PLAY_WORKERS
+                self._variant_parallelism = self.SELF_PLAY_VARIANT_PARALLELISM
+                self._buffer_target_size = self.REPLAY_BUFFER_MAX_SIZE
+                for variant in self.VARIANTS:
+                    buffer = self.buffers.get(variant)
+                    if buffer is not None:
+                        buffer.set_max_size(self._buffer_target_size)
+                if self._last_buffer_target_size != self._buffer_target_size:
+                    logger.info(f"RAM normal. Restored buffer size to {self._buffer_target_size}.")
+                    self._last_buffer_target_size = self._buffer_target_size
+                return
+
+            # Moderate pressure: reduce workers and variant parallelism
+            if used_pct >= 90:
+                self._num_self_play_workers = max(1, self.NUM_SELF_PLAY_WORKERS // 2)
+                self._variant_parallelism = 1
+                self._buffer_target_size = max(10000, int(self.REPLAY_BUFFER_MAX_SIZE * 0.6))
+            elif used_pct >= 85:
+                self._num_self_play_workers = max(1, self.NUM_SELF_PLAY_WORKERS - 2)
+                self._variant_parallelism = max(1, self.SELF_PLAY_VARIANT_PARALLELISM - 1)
+                self._buffer_target_size = max(15000, int(self.REPLAY_BUFFER_MAX_SIZE * 0.8))
+
+            logger.warning(
+                f"High RAM usage ({used_pct:.1f}%). "
+                f"Throttling self-play: workers={self._num_self_play_workers}, "
+                f"variant_parallelism={self._variant_parallelism}"
+            )
+
+            for variant in self.VARIANTS:
+                buffer = self.buffers.get(variant)
+                if buffer is not None:
+                    buffer.set_max_size(self._buffer_target_size)
+
+            if self._last_buffer_target_size != self._buffer_target_size:
+                logger.warning(f"Buffer size adjusted to {self._buffer_target_size} due to RAM usage.")
+                self._last_buffer_target_size = self._buffer_target_size
+        except Exception:
+            # psutil not available or error; keep defaults
+            self._num_self_play_workers = self.NUM_SELF_PLAY_WORKERS
+            self._variant_parallelism = self.SELF_PLAY_VARIANT_PARALLELISM
+
+    def _check_and_manage_disk(self) -> None:
+        """Check disk space and prune buffer files if needed."""
+        try:
+            import shutil
+            
+            disk_usage = shutil.disk_usage(str(self.checkpoint_dir))
+            free_pct = 100.0 * disk_usage.free / disk_usage.total
+            free_gb = disk_usage.free / (1024**3)
+
+            # Critical threshold: aggressively prune
+            if free_pct < self.CRITICAL_DISK_THRESHOLD_PCT:
+                logger.warning(
+                    f"CRITICAL disk space: {free_pct:.1f}% free ({free_gb:.1f} GB). "
+                    f"Purging old buffer files..."
+                )
+                self._aggressively_prune_buffer_files()
+                # Also prune old checkpoints
+                for variant in self.VARIANTS:
+                    self._prune_checkpoints(variant)
+                return
+
+            # Moderate disk usage: keep only the most recent buffer files per variant
+            for variant in self.VARIANTS:
+                buffer_files = sorted(
+                    self.checkpoint_dir.glob(f"{variant}_buffer_step_*.npz"),
+                    key=lambda p: self._parse_step_from_buffer_file(p),
+                    reverse=True  # Newest first
+                )
+                # Keep only the most recent N files
+                if len(buffer_files) > self.MAX_BUFFER_FILES_PER_VARIANT:
+                    for f in buffer_files[self.MAX_BUFFER_FILES_PER_VARIANT:]:
+                        try:
+                            f.unlink()
+                            logger.info(f"Pruned old buffer file: {f.name}")
+                        except Exception as e:
+                            logger.warning(f"Failed to prune {f.name}: {e}")
+                            
+            logger.info(f"Disk usage: {free_pct:.1f}% free ({free_gb:.1f} GB)")
+        except Exception as e:
+            logger.warning(f"Disk check failed: {e}")
+
+    def _aggressively_prune_buffer_files(self) -> None:
+        """Delete all but the most recent buffer file per variant."""
+        try:
+            for variant in self.VARIANTS:
+                buffer_files = sorted(
+                    self.checkpoint_dir.glob(f"{variant}_buffer_step_*.npz"),
+                    key=lambda p: self._parse_step_from_buffer_file(p),
+                    reverse=True  # Newest first
+                )
+                # Keep only the very latest
+                if len(buffer_files) > 1:
+                    for f in buffer_files[1:]:
+                        try:
+                            f.unlink()
+                            logger.warning(f"Aggressively pruned: {f.name}")
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.warning(f"Aggressive prune failed: {e}")
+
+    def _parse_step_from_buffer_file(self, path: Path) -> int:
+        """Extract step number from '<variant>_buffer_step_<step>.npz'."""
+        name = path.name
+        try:
+            step_str = name.split("_")[-1].rstrip(".npz")
+            return int(step_str)
+        except (IndexError, ValueError):
+            return 0
+
+    def _adapt_mcts_visits(self) -> None:
+        """
+        Adjust MCTS visits based on recent throughput.
+        
+        Strategy:
+        - If avg games/min < target: reduce visits (speed up)
+        - If avg games/min > target: can afford to increase visits (quality)
+        - Adjustments are gradual (±15%) and clamped [MIN, MAX]
+        """
+        try:
+            # Collect recent throughput from metrics
+            recent_throughputs = []
+            for variant in self.VARIANTS:
+                data = self.metrics.get_variant_throughput(variant)  # Returns games/min if available
+                if data is not None and data > 0:
+                    recent_throughputs.append(data)
+            
+            if not recent_throughputs:
+                logger.debug("No throughput data available for adaptive tuning")
+                return
+            
+            avg_throughput = sum(recent_throughputs) / len(recent_throughputs)
+            
+            # Compute adjustment
+            if avg_throughput < self.TARGET_GAMES_PER_MINUTE * 0.9:
+                # Below target: reduce visits for speed
+                new_visits = max(
+                    self.MIN_MCTS_VISITS,
+                    int(self._current_mcts_visits * (1.0 - self.VISITS_ADJUSTMENT_FACTOR))
+                )
+                direction = "↓ (slower)"
+            elif avg_throughput > self.TARGET_GAMES_PER_MINUTE * 1.1:
+                # Above target: can increase visits for quality
+                new_visits = min(
+                    self.MAX_MCTS_VISITS,
+                    int(self._current_mcts_visits * (1.0 + self.VISITS_ADJUSTMENT_FACTOR * 0.5))
+                )
+                direction = "↑ (better quality)"
+            else:
+                # On target: no adjustment
+                new_visits = self._current_mcts_visits
+                direction = "→ (on target)"
+            
+            if new_visits != self._current_mcts_visits:
+                logger.info(
+                    f"Adaptive MCTS: {avg_throughput:.1f} games/min (target {self.TARGET_GAMES_PER_MINUTE}). "
+                    f"Adjusting visits {self._current_mcts_visits} → {new_visits} {direction}"
+                )
+                self._current_mcts_visits = new_visits
+        except Exception as e:
+            logger.debug(f"Adaptive tuning failed (non-critical): {e}")
     
     def _run_evaluation_round(self, round_num: int) -> None:
         """

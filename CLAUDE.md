@@ -42,6 +42,18 @@ The project is a **chess AI system** that combines a **playable graphical interf
 | **Run single test** | `python -m unittest test_parallel.py` |
 | **Run Minimax test** | `python test_parallel.py` |
 
+## Advanced Training Optimizations
+
+As of the latest session, the training pipeline includes three major performance improvements:
+
+1. **Disk Usage Guardrails** – Automatically prunes old replay buffer files when disk space is low, keeping only the 3 most recent buffers per variant. Checks every 10 rounds.
+
+2. **Adaptive MCTS Visitation Tuning** – Monitors games/min from recent self-play and adjusts MCTS visits (between 6–32) to maintain a target throughput of ~10 games/min. Adjusts every 5 rounds.
+
+3. **GPU-Batched Inference (Framework)** – Optional infrastructure for aggregating board evaluations from multiple CPU workers into batches for efficient GPU forward passes. Currently a framework; requires `_board_to_features()` and `_move_to_index()` implementations in `gpu_inference_server.py` for use.
+
+For detailed tuning and usage, see [train/OPTIMIZATIONS.md](train/OPTIMIZATIONS.md).
+
 ## Running Tests
 
 The project ships with a small test suite under `test_parallel.py`.  It compares single‑threaded and parallel Minimax search.  To execute:

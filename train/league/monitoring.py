@@ -339,6 +339,28 @@ class MetricsCollector:
                 for ts, val in self.metrics[metric_name]
             ]
 
+    def get_variant_throughput(self, variant: str) -> Optional[float]:
+        """
+        Get the most recent throughput (games/min) for a variant.
+        
+        Args:
+            variant: Model variant name
+        
+        Returns:
+            Most recent games/min value, or None if not available
+        """
+        with self.lock:
+            metric_name = f"{variant}_throughput"
+            if metric_name not in self.metrics:
+                return None
+            
+            points = self.metrics[metric_name]
+            if not points:
+                return None
+            
+            # Return the most recent value
+            return points[-1][1]
+
 
 class MetricsServer:
     """

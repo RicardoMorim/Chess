@@ -71,13 +71,15 @@ def play_game_batch_mcts(mcts, device, model_config, worker_id):
     CRITICAL: Must use mcts.search() to get MCTS-guided moves, NOT just policy sampling.
     """
     import chess
-    max_moves = 120
+    max_moves = 90
     game_data = []
     board = chess.Board()
     move_count = 0
     recent_values = []
     resignation_threshold = -0.8
     resignation_count_needed = 2
+    resigned = False
+    end_reason = "unknown"
 
     input_channels = getattr(mcts.model, "input_channels", model_config.get("input_channels", 22))
 
@@ -106,20 +108,61 @@ def play_game_batch_mcts(mcts, device, model_config, worker_id):
             recent_values = recent_values[-resignation_count_needed:]
             if len(recent_values) >= resignation_count_needed and all(v < resignation_threshold for v in recent_values):
                 logger.info(f"Worker {worker_id}: Resignation at move {move_count} (value={recent_values[-1]:.3f})")
+                resigned = True
+                end_reason = "resign"
                 break
         
         # Make the move
         board.push(selected_move)
         move_count += 1
 
+    def _material_balance(b):
+        values = {
+            chess.PAWN: 1.0,
+            chess.KNIGHT: 3.0,
+            chess.BISHOP: 3.0,
+            chess.ROOK: 5.0,
+            chess.QUEEN: 9.0,
+        }
+        white = 0.0
+        black = 0.0
+        for piece_type, val in values.items():
+            white += val * len(b.pieces(piece_type, chess.WHITE))
+            black += val * len(b.pieces(piece_type, chess.BLACK))
+        return white - black
+
     # Determine outcome and backfill values
-    outcome = board.result()
-    if outcome == "1-0":
-        white_result = 1.0
-    elif outcome == "0-1":
-        white_result = -1.0
+    if resigned:
+        # Side to move resigned; opponent wins.
+        if board.turn == chess.WHITE:
+            outcome = "0-1"
+            white_result = -1.0
+        else:
+            outcome = "1-0"
+            white_result = 1.0
     else:
-        white_result = 0.0
+        outcome = board.result()
+        if outcome == "1-0":
+            white_result = 1.0
+            end_reason = "checkmate"
+        elif outcome == "0-1":
+            white_result = -1.0
+            end_reason = "checkmate"
+        elif outcome == "1/2-1/2":
+            white_result = 0.0
+            end_reason = "draw"
+        else:
+            # Adjudicate if game hit move cap (board.result() == "*")
+            score = _material_balance(board)
+            score_norm = max(-1.0, min(1.0, score / 39.0))
+            if score_norm > 0.2:
+                outcome = "1-0"
+            elif score_norm < -0.2:
+                outcome = "0-1"
+            else:
+                outcome = "1/2-1/2"
+            white_result = score_norm
+            end_reason = "max_moves"
     
     # Backfill values (alternate signs for alternating colors)
     trajectory = []
@@ -128,4 +171,9 @@ def play_game_batch_mcts(mcts, device, model_config, worker_id):
         value = white_result if idx % 2 == 0 else -white_result
         trajectory.append((position, policy, value))
     
-    return trajectory
+    return {
+        "trajectory": trajectory,
+        "outcome": outcome,
+        "end_reason": end_reason,
+        "moves": move_count,
+    }
