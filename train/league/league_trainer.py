@@ -77,7 +77,7 @@ class LeagueTrainer:
 
     # When GPU batching is enabled, self-play is often bottlenecked by request concurrency.
     # More CPU workers helps fill GPU batches even if CPU utilization stays moderate.
-    GPU_SELF_PLAY_WORKERS = 10
+    GPU_SELF_PLAY_WORKERS = 14
     
     # MCTS hyperparameters (INTERMEDIATE - correct dual-budget approach)
     # Self-play: BALANCED generation of training data (GPU utilized 100%, VRAM 80%)
@@ -110,8 +110,8 @@ class LeagueTrainer:
     MAX_MCTS_VISITS = 32  # Never go above this
 
     # GPU-batched inference (self-play) tuning
-    GPU_INFER_BATCH_SIZE = 128
-    GPU_INFER_POST_WAIT_MS = 20
+    GPU_INFER_BATCH_SIZE = 64
+    GPU_INFER_POST_WAIT_MS = 3
     GPU_MCTS_PARALLEL_WORKERS = 8
     
     def __init__(

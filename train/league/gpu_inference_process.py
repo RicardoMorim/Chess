@@ -164,7 +164,7 @@ def gpu_inference_server_main(
         while True:
             # Block briefly waiting for requests
             try:
-                item = request_queue.get(timeout=0.01)
+                item = request_queue.get(timeout=0.002)
             except Empty:
                 item = "__EMPTY__"
                 # Heartbeat: warn if no requests for 30 seconds
