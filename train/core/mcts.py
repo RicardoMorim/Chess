@@ -161,13 +161,13 @@ def expand_node(
     if evaluate_fn is not None:
         try:
             legal_logits, value_pred = evaluate_fn(node.board)
-        except Exception:
+        except Exception as eval_err:
             legal_logits, value_pred = None, 0.0
 
         if not legal_moves:
             return float(value_pred)
 
-        if not legal_logits or len(legal_logits) != len(legal_moves):
+        if legal_logits is None or len(legal_logits) != len(legal_moves):
             move_priors = np.ones(len(legal_moves), dtype=np.float32) / max(1, len(legal_moves))
         else:
             logits = np.asarray(legal_logits, dtype=np.float32)

@@ -79,6 +79,12 @@ class GPUInferenceServer:
         self.model = model
         self.device = torch.device(device)
         self.batch_size = batch_size
+
+        if self.device.type == "cuda":
+            try:
+                torch.backends.cudnn.benchmark = True
+            except Exception:
+                pass
         
         # Move model to device
         self.model.to(self.device)

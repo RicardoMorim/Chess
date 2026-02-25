@@ -1,0 +1,55 @@
+{
+  "timestamp": "2026-02-24T20:09:16.638511",
+  "elapsed_seconds": 3515.7447962760925,
+  "counters": {
+    "est_games": 945,
+    "attack_games": 900,
+    "baseline_games": 950,
+    "baseline_train_steps": 180,
+    "attack_train_steps": 180,
+    "est_train_steps": 180
+  },
+  "gauges": {
+    "baseline_lr": 0.01,
+    "attack_lr": 0.01,
+    "est_lr": 0.01,
+    "baseline_buffer_size": 30000,
+    "baseline_buffer_fill": 1.0,
+    "baseline_buffer_value_mean": -8.547008547009395e-07,
+    "baseline_buffer_value_std": 0.14951898915099737,
+    "attack_buffer_size": 30000,
+    "attack_buffer_fill": 1.0,
+    "attack_buffer_value_mean": 0.0,
+    "attack_buffer_value_std": 0.15414813666915053,
+    "est_buffer_size": 30000,
+    "est_buffer_fill": 1.0,
+    "est_buffer_value_mean": 0.0,
+    "est_buffer_value_std": 0.14317461358737119
+  },
+  "variants": {
+    "est": {
+      "games": 945,
+      "train_steps": 180,
+      "buffer_size": 30000,
+      "buffer_fill_ratio": 1.0,
+      "recent_loss": 2.4525444507598877,
+      "avg_game_length": 119.14
+    },
+    "attack": {
+      "games": 900,
+      "train_steps": 180,
+      "buffer_size": 30000,
+      "buffer_fill_ratio": 1.0,
+      "recent_loss": 2.6304261684417725,
+      "avg_game_length": 119.56
+    },
+    "baseline": {
+      "games": 950,
+      "train_steps": 180,
+      "buffer_size": 30000,
+      "buffer_fill_ratio": 1.0,
+      "recent_loss": 2.5638301372528076,
+      "avg_game_length": 119.58
+    }
+  }
+}

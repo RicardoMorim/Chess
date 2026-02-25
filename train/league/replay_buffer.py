@@ -55,9 +55,9 @@ class ReplayBuffer:
         """
         with self.lock:
             for position, policy, value in game_trajectory:
-                self.positions.append(position)
-                self.policies.append(policy)
-                self.values.append(value)
+                self.positions.append(np.array(position, dtype=np.float16))
+                self.policies.append(np.array(policy, dtype=np.float16))
+                self.values.append(np.float32(value))
     
     def sample(self, batch_size: int) -> Tuple[List, List, List]:
         """
@@ -81,8 +81,9 @@ class ReplayBuffer:
             # Sample indices uniformly from buffer
             indices = random.sample(range(len(self.positions)), batch_size)
             
-            positions = [self.positions[i] for i in indices]
-            policies = [self.policies[i] for i in indices]
+            # Upcast string arrays back to float32 for model consumption
+            positions = [np.array(self.positions[i], dtype=np.float32) for i in indices]
+            policies = [np.array(self.policies[i], dtype=np.float32) for i in indices]
             values = [self.values[i] for i in indices]
         
         return positions, policies, values

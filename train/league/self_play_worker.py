@@ -47,10 +47,21 @@ def self_play_worker(
                 response_queue=gpu_eval["response_queue"],
             )
 
-            timeout_sec = float(gpu_eval.get("timeout_sec", 10.0))
+            timeout_sec = float(gpu_eval.get("timeout_sec", 30.0))
+            input_channels_remote = int(gpu_eval.get("input_channels", 22))
 
             def evaluate_fn(board: chess.Board):
-                return client.evaluate(board, timeout_sec=timeout_sec)
+                legal_moves = list(board.legal_moves)
+                legal_indices = [get_move_index(m) for m in legal_moves]
+                features = board_to_tensor(board, board.fullmove_number, input_channels_remote)
+                logits, value = client.evaluate_features(
+                    features,
+                    legal_indices,
+                    timeout_sec=timeout_sec,
+                )
+                if logits is None:
+                    logger.warning(f"Worker {worker_id}: GPU evaluation returned None (timeout or error)")
+                return logits, value
 
             logger.info(f"Worker {worker_id}: Using GPU-batched evaluator (remote)")
         else:
@@ -74,10 +85,18 @@ def self_play_worker(
         )
 
         for game_idx in range(num_games):
-            game_trajectory = play_game_batch_mcts(mcts, device, model_config, worker_id, gpu_eval=gpu_eval)
-            if game_trajectory:
-                result_queue.put({"game_data": game_trajectory, "worker_id": worker_id, "game_idx": game_idx})
-                logger.info(f"Worker {worker_id}: Game {game_idx+1}/{num_games} finished ({len(game_trajectory)} moves)")
+            try:
+                logger.info(f"Worker {worker_id}: Starting game {game_idx+1}/{num_games}")
+                game_trajectory = play_game_batch_mcts(mcts, device, model_config, worker_id, gpu_eval=gpu_eval)
+                if game_trajectory:
+                    result_queue.put({"game_data": game_trajectory, "worker_id": worker_id, "game_idx": game_idx})
+                    logger.info(f"Worker {worker_id}: Game {game_idx+1}/{num_games} finished ({len(game_trajectory)} moves)")
+                else:
+                    logger.warning(f"Worker {worker_id}: Game {game_idx+1}/{num_games} returned None")
+                    result_queue.put({"error": f"Game {game_idx} returned None", "worker_id": worker_id})
+            except Exception as game_err:
+                logger.error(f"Worker {worker_id}: Game {game_idx+1}/{num_games} failed: {game_err}", exc_info=True)
+                result_queue.put({"error": f"Game {game_idx} failed: {str(game_err)}", "worker_id": worker_id})
 
     except Exception as e:
         logger.error(f"Worker {worker_id} failed: {e}", exc_info=True)
@@ -91,7 +110,7 @@ def play_game_batch_mcts(mcts, device, model_config, worker_id, gpu_eval: Option
     CRITICAL: Must use mcts.search() to get MCTS-guided moves, NOT just policy sampling.
     """
     import chess
-    max_moves = 90
+    max_moves = 120
     game_data = []
     board = chess.Board()
     move_count = 0

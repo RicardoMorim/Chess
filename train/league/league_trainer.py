@@ -74,6 +74,10 @@ class LeagueTrainer:
     # Devices / concurrency
     SELF_PLAY_DEVICE = "cpu"  # Safer: avoids many CUDA contexts across worker processes
     SELF_PLAY_VARIANT_PARALLELISM = 3  # How many variants generate self-play concurrently
+
+    # When GPU batching is enabled, self-play is often bottlenecked by request concurrency.
+    # More CPU workers helps fill GPU batches even if CPU utilization stays moderate.
+    GPU_SELF_PLAY_WORKERS = 10
     
     # MCTS hyperparameters (INTERMEDIATE - correct dual-budget approach)
     # Self-play: BALANCED generation of training data (GPU utilized 100%, VRAM 80%)
@@ -104,6 +108,11 @@ class LeagueTrainer:
     VISITS_ADJUSTMENT_FACTOR = 0.15  # Adjust visits by 15% each step
     MIN_MCTS_VISITS = 6  # Never go below this
     MAX_MCTS_VISITS = 32  # Never go above this
+
+    # GPU-batched inference (self-play) tuning
+    GPU_INFER_BATCH_SIZE = 128
+    GPU_INFER_POST_WAIT_MS = 20
+    GPU_MCTS_PARALLEL_WORKERS = 8
     
     def __init__(
         self,
@@ -162,8 +171,9 @@ class LeagueTrainer:
         
         if self.use_gpu_batching:
             logger.info("GPU-batched inference enabled (EXPERIMENTAL)")
-            # Single GPU: avoid running multiple self-play variants concurrently.
-            self._variant_parallelism = 1
+            # Each variant gets its own dedicated GPU process; they can run in parallel.
+            # Keep variant parallelism = 3 (all variants simultaneously)
+            self._num_self_play_workers = self.GPU_SELF_PLAY_WORKERS
         else:
             logger.info("Using CPU-only MCTS for self-play (GPU-batched disabled)")
         
@@ -400,13 +410,14 @@ class LeagueTrainer:
                     str(self.device),
                     gpu_request_queue,
                     gpu_response_queues,
-                    32,
-                    10,
+                    self.GPU_INFER_BATCH_SIZE,
+                    self.GPU_INFER_POST_WAIT_MS,
+                    variant,
                 ),
                 name=f"{variant}_gpu_inference",
             )
             gpu_server_proc.start()
-            logger.info(f"{variant}: GPU inference process started (device={self.device})")
+            logger.info(f"{variant}: GPU inference process started")
         elif self.use_gpu_batching and self.device.type != "cuda":
             logger.warning(f"{variant}: GPU batching requested but trainer device={self.device}; falling back to CPU-only self-play")
         
@@ -417,7 +428,7 @@ class LeagueTrainer:
                 gpu_eval_payload = {
                     "request_queue": gpu_request_queue,
                     "response_queue": gpu_response_queues[worker_id],
-                    "timeout_sec": 15.0,
+                    "timeout_sec": 30.0,
                     "input_channels": input_channels,
                 }
 
@@ -436,7 +447,7 @@ class LeagueTrainer:
                         "c_puct": self.C_PUCT,
                         "dirichlet_alpha": self.DIRICHLET_ALPHA,
                         "add_noise": True,
-                        "parallel_workers": 2,
+                        "parallel_workers": (self.GPU_MCTS_PARALLEL_WORKERS if use_gpu_eval else 2),
                     },
                     worker_id,
                     gpu_eval_payload,
@@ -456,7 +467,26 @@ class LeagueTrainer:
         logger.info(f"{variant}: Waiting for {num_games_expected} games from {self._num_self_play_workers} workers...")
         
         for _ in range(num_games_expected):
-            result = queue.get()
+            try:
+                # Timeout after 120 seconds to detect hung workers
+                result = queue.get(timeout=120.0)
+            except Exception as queue_timeout:
+                logger.error(f"{variant}: Timeout waiting for game result (worker may be hung). Games so far: {games_collected}/{num_games_expected}")
+                # Check which workers are still alive
+                alive_count = sum(1 for p in processes if p.is_alive())
+                logger.error(f"{variant}: {alive_count}/{len(processes)} workers still alive")
+                
+                # Check if GPU server is alive
+                if gpu_server_proc is not None:
+                    if gpu_server_proc.is_alive():
+                        logger.error(f"{variant}: GPU inference process is ALIVE (may be stuck or not responding)")
+                    else:
+                        logger.error(f"{variant}: GPU inference process is DEAD (likely cause of worker failure)")
+                
+                if alive_count == 0:
+                    logger.error(f"{variant}: All workers dead; aborting self-play phase")
+                    break
+                continue
             
             if "error" in result:
                 logger.error(f"Worker {result.get('worker_id', '?')} error: {result['error']}")
@@ -491,13 +521,30 @@ class LeagueTrainer:
         # Wait for workers to finish
         for p in processes:
             p.join()
+        
+        # Free queue memory properly
+        try:
+            queue.close()
+            queue.join_thread()
+        except Exception as e:
+            logger.warning(f"{variant}: Failed to close queue: {e}")
 
         # Stop GPU inference process (if any)
         if gpu_request_queue is not None:
             try:
                 gpu_request_queue.put(None)
+                gpu_request_queue.close()
+                gpu_request_queue.join_thread()
             except Exception:
                 pass
+                
+        if gpu_response_queues is not None:
+            for q in gpu_response_queues:
+                try:
+                    q.close()
+                    q.join_thread()
+                except Exception:
+                    pass
         if gpu_server_proc is not None:
             gpu_server_proc.join(timeout=5.0)
             if gpu_server_proc.is_alive():
@@ -808,7 +855,8 @@ class LeagueTrainer:
                 self._num_self_play_workers = self.NUM_SELF_PLAY_WORKERS
                 self._variant_parallelism = self.SELF_PLAY_VARIANT_PARALLELISM
                 if self.use_gpu_batching:
-                    self._variant_parallelism = 1
+                    # Keep parallelism = 3 (each variant has independent GPU process)
+                    self._num_self_play_workers = self.GPU_SELF_PLAY_WORKERS
                 self._buffer_target_size = self.REPLAY_BUFFER_MAX_SIZE
                 for variant in self.VARIANTS:
                     buffer = self.buffers.get(variant)
@@ -829,8 +877,7 @@ class LeagueTrainer:
                 self._variant_parallelism = max(1, self.SELF_PLAY_VARIANT_PARALLELISM - 1)
                 self._buffer_target_size = max(15000, int(self.REPLAY_BUFFER_MAX_SIZE * 0.8))
 
-            if self.use_gpu_batching:
-                self._variant_parallelism = 1
+            # Keep GPU batching parallelism enabled (independent GPU processes per variant)
 
             logger.warning(
                 f"High RAM usage ({used_pct:.1f}%). "
@@ -850,8 +897,6 @@ class LeagueTrainer:
             # psutil not available or error; keep defaults
             self._num_self_play_workers = self.NUM_SELF_PLAY_WORKERS
             self._variant_parallelism = self.SELF_PLAY_VARIANT_PARALLELISM
-            if self.use_gpu_batching:
-                self._variant_parallelism = 1
 
     def _check_and_manage_disk(self) -> None:
         """Check disk space and prune buffer files if needed."""
