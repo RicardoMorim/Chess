@@ -214,7 +214,6 @@ def expand_node(
             move_priors.append(policy[move_index])
         else:
             move_priors.append(1e-6)  # Small prior for unmapped moves
-
     move_priors = np.array(move_priors, dtype=np.float32)
     
     # Normalize priors
