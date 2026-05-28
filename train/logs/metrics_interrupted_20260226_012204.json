@@ -1,0 +1,33 @@
+{
+  "timestamp": "2026-02-26T01:22:04.230180",
+  "elapsed_seconds": 608.5266101360321,
+  "counters": {
+    "est_games": 31,
+    "baseline_games": 28,
+    "attack_games": 28
+  },
+  "gauges": {},
+  "variants": {
+    "est": {
+      "games": 31,
+      "train_steps": 0,
+      "buffer_size": 0,
+      "buffer_fill_ratio": 0,
+      "avg_game_length": 111.0
+    },
+    "baseline": {
+      "games": 28,
+      "train_steps": 0,
+      "buffer_size": 0,
+      "buffer_fill_ratio": 0,
+      "avg_game_length": 120.0
+    },
+    "attack": {
+      "games": 28,
+      "train_steps": 0,
+      "buffer_size": 0,
+      "buffer_fill_ratio": 0,
+      "avg_game_length": 120.0
+    }
+  }
+}
