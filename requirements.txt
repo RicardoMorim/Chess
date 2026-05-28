@@ -3,3 +3,4 @@ Pillow
 numpy
 torch
 psutil
+optuna

@@ -143,9 +143,6 @@ def run_repro_train(seed: int = 42):
         import multiprocessing as mp
         mp.freeze_support()
         indiv_main.main()
-    except SystemExit as e:
-        # Trainer may call SystemExit on normal completion; treat as success
-        print(f"Trainer exited: {e}")
     except Exception as e:
         print(f"Repro train failed: {e}")
     finally:
