@@ -417,7 +417,15 @@ def main():
     if args.study_name is not None:
         config = HPOConfig(**{**config.__dict__, "study_name": args.study_name})
 
-    set_global_seed(config.seed)
+    # Use centralized reproducibility helper
+    try:
+        from train.core.repro import set_seed
+    except Exception:
+        # Fallback to local setter if centralized helper is unavailable
+        from tools.optuna_hpo import set_global_seed as _local_set
+        set_seed = _local_set
+
+    set_seed(config.seed)
     objective = objective_factory(config)
 
     sampler = optuna.samplers.TPESampler(seed=config.seed)
