@@ -25,7 +25,11 @@ if str(project_root) not in sys.path:
 
 # Import from core
 from core.models import create_model, load_model_with_compatibility
-from core.data import PuzzleDataset, load_lichess_puzzles
+from core.data import (
+    PuzzleDataset,
+    load_lichess_puzzles,
+    load_training_examples_from_chess_pgns,
+)
 from core.constants import MODEL_CONFIG, VALID_VARIANTS, HARDWARE_CONFIG
 from core.utils import model_summary
 
@@ -234,7 +238,12 @@ def main():
     puzzle_dataset = None
     if args.start_phase >= 3:
         try:
-            puzzles = load_lichess_puzzles()
+            bundle = load_training_examples_from_chess_pgns(
+                root_dir=str(project_root / "chess_pgns"),
+                include_games=False,
+                include_puzzles=True,
+            )
+            puzzles = bundle["puzzles"] or load_lichess_puzzles()
             input_channels = MODEL_CONFIG[args.variant]["input_channels"]
             model_type = "big" if input_channels >= 22 else ("medium" if input_channels >= 20 else "small")
             puzzle_dataset = PuzzleDataset(

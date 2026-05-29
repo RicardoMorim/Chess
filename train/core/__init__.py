@@ -56,6 +56,10 @@ from .data import (
     PuzzleDataset,
     SelfPlayDataset,
     load_lichess_puzzles,
+    discover_pgn_files,
+    load_pgn_games_from_directory,
+    load_puzzle_examples_from_directory,
+    load_training_examples_from_chess_pgns,
 )
 
 # Constants
@@ -89,8 +93,6 @@ __all__ = [
     # MCTS
     "MCTS",
     "MCTSNode",
-    "expand_node",
-    "select_child",
     "simulate",
     "run_mcts",
     "update_tree",
@@ -112,6 +114,10 @@ __all__ = [
     "PuzzleDataset",
     "SelfPlayDataset",
     "load_lichess_puzzles",
+    "discover_pgn_files",
+    "load_pgn_games_from_directory",
+    "load_puzzle_examples_from_directory",
+    "load_training_examples_from_chess_pgns",
     
     # Constants
     "ACTION_SPACE_SIZE",

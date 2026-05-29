@@ -19,7 +19,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 # Import from core
 from core.models import create_model
-from core.data import PuzzleDataset, ChessDataset, load_lichess_puzzles
+from core.data import (
+    PuzzleDataset,
+    ChessDataset,
+    load_lichess_puzzles,
+    load_training_examples_from_chess_pgns,
+)
 from core.constants import (
     MODEL_CONFIG, CURRICULUM_CONFIG, TRAINING_CONFIG, HARDWARE_CONFIG
 )
@@ -41,6 +46,10 @@ def _variant_model_type(variant: str) -> str:
     if input_channels >= 20:
         return "medium"
     return "small"
+
+
+def _chess_pgn_root() -> str:
+    return str(Path(__file__).resolve().parents[1] / "chess_pgns")
 
 
 def _create_dataloader(dataset, batch_size, shuffle=True, num_workers=None):
@@ -106,9 +115,14 @@ def phase1_puzzle_bootcamp(model, variant, checkpoint_dir, skip_bootcamp=False):
     
     os.makedirs(checkpoint_dir, exist_ok=True)
     
-    # Load puzzles
-    print("Loading Lichess puzzle database...")
-    puzzles = load_lichess_puzzles()
+    # Load puzzles from local PGN corpus first, then fall back to Lichess cache
+    print("Loading puzzle dataset from train/chess_pgns/puzzles (or Lichess fallback)...")
+    bundle = load_training_examples_from_chess_pgns(
+        root_dir=_chess_pgn_root(),
+        include_games=False,
+        include_puzzles=True,
+    )
+    puzzles = bundle["puzzles"] or load_lichess_puzzles()
     print(f"✓ Loaded {len(puzzles)} puzzles\n")
     
     puzzle_dataset = PuzzleDataset(
@@ -278,15 +292,41 @@ def phase2_transition(model, variant, checkpoint_dir, generate_games_fn=None):
         augment=True,
         model_type=_variant_model_type(variant),
     )
+
+    # Optional supervised dataset from local pro/high-elo PGNs.
+    supervised_bundle = load_training_examples_from_chess_pgns(
+        root_dir=_chess_pgn_root(),
+        include_games=True,
+        include_puzzles=False,
+        game_subdirs=("pros", "high_elo"),
+    )
+    supervised_games = supervised_bundle["games"]
+    supervised_dataset = None
+    if supervised_games:
+        supervised_dataset = ChessDataset(
+            games=supervised_games,
+            augment=True,
+            model_type=_variant_model_type(variant),
+        )
     
-    puzzles = load_lichess_puzzles()
+    bundle = load_training_examples_from_chess_pgns(
+        root_dir=_chess_pgn_root(),
+        include_games=False,
+        include_puzzles=True,
+    )
+    puzzles = bundle["puzzles"] or load_lichess_puzzles()
     puzzle_dataset = PuzzleDataset(
         puzzles=puzzles[:10000],
         model_type=_variant_model_type(variant),
         cache_dir=os.path.join(checkpoint_dir, "cache"),
     )
     
-    combined_dataset = ConcatDataset([selfplay_dataset, puzzle_dataset])
+    datasets = [selfplay_dataset]
+    if supervised_dataset is not None:
+        datasets.append(supervised_dataset)
+    datasets.append(puzzle_dataset)
+
+    combined_dataset = ConcatDataset(datasets)
     
     dataloader = _create_dataloader(
         combined_dataset,

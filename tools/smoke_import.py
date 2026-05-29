@@ -1,24 +1,23 @@
-"""Simple smoke test to import standalone modules we just added.
+"""Simple smoke test to import the training modules we just added.
 
-This bypasses package import paths by loading modules directly from file
-locations so we avoid circular or relative import issues during quick checks.
+Imports through the package namespace so relative imports resolve correctly.
 """
 from pathlib import Path
-import importlib.util
+import importlib
 import sys
 
-base = Path(__file__).resolve().parents[1] / 'train' / 'core'
-files = ['repro.py', 'lightning_module.py']
+repo_root = Path(__file__).resolve().parents[1]
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
 
-for f in files:
-    p = base / f
-    spec = importlib.util.spec_from_file_location(f[:-3], str(p))
-    mod = importlib.util.module_from_spec(spec)
+modules = ["train.core.repro", "train.core.lightning_module"]
+
+for name in modules:
     try:
-        spec.loader.exec_module(mod)
-        print('LOADED', f)
+        importlib.import_module(name)
+        print("LOADED", name)
     except Exception as e:
-        print('ERROR', f, e)
+        print("ERROR", name, e)
         sys.exit(2)
 
-print('SMOKE_OK')
+print("SMOKE_OK")

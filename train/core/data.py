@@ -9,6 +9,7 @@ import hashlib
 import random
 import glob
 import time
+from pathlib import Path
 from torch.utils.data import Dataset
 
 from .constants import promotion_moves
@@ -881,6 +882,117 @@ def expand_mate_sequences(puzzles, max_expand_depth=4, cache_dir="./cache"):
         print(f"Warning: Could not cache expanded puzzles: {e}")
     
     return expanded
+
+
+def _resolve_chess_pgn_root(root_dir=None):
+    """Resolve the chess PGN root directory.
+
+    Defaults to ``train/chess_pgns`` relative to this module.
+    """
+    if root_dir is not None:
+        return Path(root_dir)
+    return Path(__file__).resolve().parents[1] / "chess_pgns"
+
+
+def discover_pgn_files(root_dir=None, subdirs=None):
+    """Recursively discover PGN files under the chess PGN root.
+
+    Args:
+        root_dir: Root directory (defaults to ``train/chess_pgns``)
+        subdirs: Optional iterable of subdirectories to search
+
+    Returns:
+        List of absolute PGN file paths as strings
+    """
+    root = _resolve_chess_pgn_root(root_dir)
+    if subdirs is None:
+        subdirs = ("pros", "high_elo", "puzzles")
+
+    pgn_files = []
+    for subdir in subdirs:
+        folder = root / subdir
+        if not folder.exists():
+            continue
+        for path in sorted(folder.rglob("*.pgn")):
+            pgn_files.append(str(path))
+    return pgn_files
+
+
+def load_pgn_games_from_directory(root_dir=None, subdirs=None, max_games_per_file=None):
+    """Load chess.pgn.Game objects from a directory tree.
+
+    This is the supervised training source for pro/high-elo game data.
+    """
+    import chess.pgn
+
+    games = []
+    for pgn_file in discover_pgn_files(root_dir=root_dir, subdirs=subdirs):
+        try:
+            with open(pgn_file, "r", encoding="utf-8", errors="ignore") as f:
+                loaded = 0
+                while True:
+                    game = chess.pgn.read_game(f)
+                    if game is None:
+                        break
+                    games.append(game)
+                    loaded += 1
+                    if max_games_per_file is not None and loaded >= int(max_games_per_file):
+                        break
+        except Exception:
+            continue
+    return games
+
+
+def load_puzzle_examples_from_directory(root_dir=None, subdirs=None, max_files=None):
+    """Load puzzle tuples from PGN files under the chess PGN tree.
+
+    Returns the same tuple shape as :func:`load_puzzles`.
+    """
+    root = _resolve_chess_pgn_root(root_dir)
+    if subdirs is None:
+        subdirs = ("puzzles",)
+
+    examples = []
+    files = []
+    for subdir in subdirs:
+        folder = root / subdir
+        if not folder.exists():
+            continue
+        files.extend(sorted(folder.rglob("*.pgn")))
+
+    if max_files is not None:
+        files = files[: int(max_files)]
+
+    for path in files:
+        try:
+            examples.extend(load_puzzles(str(path)))
+        except Exception:
+            continue
+    return examples
+
+
+def load_training_examples_from_chess_pgns(root_dir=None, include_games=True, include_puzzles=True,
+                                          game_subdirs=("pros", "high_elo"), puzzle_subdirs=("puzzles",),
+                                          max_games_per_file=None, max_puzzle_files=None):
+    """Convenience helper that loads both supervised games and tactical puzzles.
+
+    Returns:
+        dict with keys ``games`` and ``puzzles``.
+    """
+    result = {"games": [], "puzzles": []}
+    if include_games:
+        result["games"] = load_pgn_games_from_directory(
+            root_dir=root_dir,
+            subdirs=game_subdirs,
+            max_games_per_file=max_games_per_file,
+        )
+    if include_puzzles:
+        result["puzzles"] = load_puzzle_examples_from_directory(
+            root_dir=root_dir,
+            subdirs=puzzle_subdirs,
+            max_files=max_puzzle_files,
+        )
+    return result
 
 
 def filter_and_prioritize_puzzles_cached(puzzles, cache_dir="./cache"):

@@ -9,13 +9,18 @@ from __future__ import annotations
 import typing
 
 import torch
-import pytorch_lightning as pl
+
+try:
+    import pytorch_lightning as pl
+except Exception as _pl_import_error:
+    pl = None
+    _PL_IMPORT_ERROR = _pl_import_error
 
 from .models import create_model
 from .training import PolicyLoss, ValueLoss, create_optimizer, create_scheduler, TRAIN_CONFIG
 
 
-class ChessLightning(pl.LightningModule):
+class ChessLightning(pl.LightningModule if pl is not None else object):
     """LightningModule wrapping the project's chess networks.
 
     Args:
@@ -24,6 +29,11 @@ class ChessLightning(pl.LightningModule):
         config: Optional training config; falls back to TRAIN_CONFIG.
     """
     def __init__(self, variant: str = 'baseline', lr_epochs: int = 10, config: typing.Optional[dict] = None):
+        if pl is None:
+            raise ImportError(
+                "pytorch_lightning is required to instantiate ChessLightning "
+                f"(import error: {_PL_IMPORT_ERROR})"
+            )
         super().__init__()
         self.save_hyperparameters()
         self.config = config or TRAIN_CONFIG

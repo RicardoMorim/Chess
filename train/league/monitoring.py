@@ -19,6 +19,12 @@ from typing import Dict, List, Any, Optional
 from collections import defaultdict
 from datetime import datetime
 import threading
+from typing import Tuple
+
+try:
+    import wandb
+except Exception:
+    wandb = None
 
 
 class MetricsCollector:
@@ -55,6 +61,9 @@ class MetricsCollector:
         
         # Buffer for high-frequency events
         self.event_buffer = defaultdict(list)
+
+        # Optional W&B run (lazy-initialized)
+        self.wandb_run = None
         
         # Logger setup
         self.logger = logging.getLogger("LeagueMetrics")
@@ -66,6 +75,75 @@ class MetricsCollector:
         handler.setFormatter(formatter)
         self.logger.addHandler(handler)
         self.logger.setLevel(logging.INFO)
+
+    def enable_wandb(
+        self,
+        project: str = "chess-league",
+        run_name: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None,
+        tags: Optional[List[str]] = None,
+        mode: str = "offline",
+    ) -> bool:
+        """Initialize a W&B run if the package is available.
+
+        Returns True if a run was created, False otherwise.
+        """
+        if wandb is None:
+            self.logger.info("W&B not available; skipping experiment tracking")
+            return False
+        if self.wandb_run is not None:
+            return True
+
+        try:
+            self.wandb_run = wandb.init(
+                project=project,
+                name=run_name,
+                config=config or {},
+                tags=tags,
+                mode=mode,
+                reinit=True,
+            )
+            return True
+        except Exception as e:
+            self.logger.warning(f"Could not initialize W&B: {e}")
+            self.wandb_run = None
+            return False
+
+    def _flatten_summary(self, summary: Dict[str, Any]) -> Dict[str, Any]:
+        flat = {}
+
+        def _walk(prefix: str, value: Any):
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    _walk(f"{prefix}{key}." if prefix else f"{key}.", child)
+            else:
+                flat[prefix[:-1] if prefix.endswith(".") else prefix] = value
+
+        _walk("", summary)
+        return flat
+
+    def log_wandb_summary(self, summary: Optional[Dict[str, Any]] = None, step: Optional[int] = None) -> None:
+        """Log a flattened metrics summary to W&B if enabled."""
+        if self.wandb_run is None:
+            return
+        try:
+            if summary is None:
+                summary = self.get_summary()
+            payload = self._flatten_summary(summary)
+            self.wandb_run.log(payload, step=step)
+        except Exception as e:
+            self.logger.warning(f"W&B logging failed: {e}")
+
+    def finish_wandb(self) -> None:
+        """Finish the W&B run if one is active."""
+        if self.wandb_run is None:
+            return
+        try:
+            self.wandb_run.finish()
+        except Exception:
+            pass
+        finally:
+            self.wandb_run = None
     
     def record_metric(
         self,

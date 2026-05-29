@@ -69,7 +69,6 @@ class LeagueTrainer:
     EVAL_EVERY_N_ROUNDS = 100  # Skip for now
     METRICS_EVERY_N_ROUNDS = 5
     BUFFER_SAVE_EVERY_N_ROUNDS = 5
-    METRICS_EVERY_N_ROUNDS = 5
 
     # Devices / concurrency
     SELF_PLAY_DEVICE = "cpu"  # Safer: avoids many CUDA contexts across worker processes
@@ -151,6 +150,21 @@ class LeagueTrainer:
         # Metrics and evaluation
         self.metrics = MetricsCollector(str(self.log_dir))
         self.evaluator = Evaluator(device=str(self.device))
+        
+        # Optional W&B tracking via environment configuration
+        self.metrics.enable_wandb(
+            project=os.environ.get("WANDB_PROJECT", "chess-league"),
+            run_name=os.environ.get("WANDB_RUN_NAME"),
+            config={
+                "device": device,
+                "checkpoint_dir": str(self.checkpoint_dir),
+                "log_dir": str(self.log_dir),
+                "use_gpu_batching": self.use_gpu_batching,
+                "variants": self.VARIANTS,
+            },
+            tags=["self-play", "league", "chess"],
+            mode=os.environ.get("WANDB_MODE", "offline"),
+        )
         
         # State tracking
         self.round = 0
@@ -830,6 +844,7 @@ class LeagueTrainer:
             
             logger.info(f"{'='*60}\n")
             self.metrics.log_summary(f"Round {round_num} complete ({round_time:.1f}s)")
+            self.metrics.log_wandb_summary(summary, step=round_num)
             if (round_num + 1) % self.METRICS_EVERY_N_ROUNDS == 0:
                 self.metrics.save_checkpoint(f"round_{round_num}")
             
@@ -838,6 +853,8 @@ class LeagueTrainer:
                 self._adapt_mcts_visits()
             
             round_num += 1
+
+        self.metrics.finish_wandb()
 
     def _maybe_throttle_for_memory(self) -> None:
         """Reduce self-play parallelism when RAM usage is high.

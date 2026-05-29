@@ -292,56 +292,83 @@ def run_training_epoch(
 
 
 def optuna_objective(trial, *, config: HPOConfig, train_examples, valid_examples):
+    # Use Lightning Trainer for training within Optuna trials.
     from core.constants import MODEL_CONFIG
     from core.models import create_model
-    from core.training import PolicyLoss, ValueLoss
+    from core.training import PolicyLoss, ValueLoss, TRAIN_CONFIG
+    from train.core.lightning_module import ChessLightning
+    from train.core.repro import set_seed
 
+    # Per-trial suggestions
     params = suggest_trial_params(trial, config)
     variant = params["variant"]
     input_channels = MODEL_CONFIG[variant]["input_channels"]
     batch_size = params["batch_size"]
 
+    # Build DataLoaders
     train_loader = make_loader(train_examples, batch_size=batch_size, shuffle=True, input_channels=input_channels)
     valid_loader = make_loader(valid_examples, batch_size=batch_size, shuffle=False, input_channels=input_channels)
 
-    model = create_model(variant)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-    optimizer = choose_optimizer(model, trial, params["learning_rate"], params["weight_decay"])
+    # Seed per-trial for determinism
+    set_seed(config.seed + int(trial.number))
 
-    policy_loss_fn = PolicyLoss()
-    value_loss_fn = ValueLoss(use_huber=True)
-    scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+    # Build Lightning model and pass minimal config overrides
+    lit_config = dict(TRAIN_CONFIG)
+    lit_config.update({
+        "policy_weight": params["policy_weight"],
+        "value_weight": params["value_weight"],
+    })
 
-    best_score = math.inf
-    for epoch in range(config.epochs):
-        run_training_epoch(
-            model,
-            train_loader,
-            optimizer,
-            device,
-            policy_loss_fn,
-            value_loss_fn,
-            params["policy_weight"],
-            params["value_weight"],
-            scaler,
-        )
+    model = ChessLightning(variant=variant, lr_epochs=config.epochs, config=lit_config)
 
-        val_policy_loss, val_value_loss, val_policy_accuracy = evaluate(
-            model, valid_loader, policy_loss_fn, value_loss_fn, device
-        )
+    # Configure Trainer
+    import pytorch_lightning as pl
+    try:
+        from optuna.integration import PyTorchLightningPruningCallback
+        pruning_cb = PyTorchLightningPruningCallback(trial, monitor="val/loss")
+        callbacks = [pruning_cb]
+    except Exception:
+        callbacks = []
 
-        score = val_policy_loss + val_value_loss + (1.0 - val_policy_accuracy)
-        trial.report(score, epoch)
-        best_score = min(best_score, score)
+    accelerator = "gpu" if torch and torch.cuda.is_available() else "cpu"
+    trainer = pl.Trainer(
+        max_epochs=config.epochs,
+        accelerator=accelerator,
+        devices=1,
+        callbacks=callbacks,
+        logger=False,
+        limit_train_batches=1.0,
+        limit_val_batches=1.0,
+        enable_progress_bar=False,
+    )
 
-        if trial.should_prune():
-            raise __import__("optuna").TrialPruned()
+    # Run training
+    trainer.fit(model, train_loader, valid_loader)
 
-    trial.set_user_attr("val_policy_loss", val_policy_loss)
-    trial.set_user_attr("val_value_loss", val_value_loss)
-    trial.set_user_attr("val_policy_accuracy", val_policy_accuracy)
-    return best_score
+    # Prefer Lightning's validation metrics if available
+    try:
+        val_results = trainer.validate(model, valid_loader, verbose=False)
+        # val_results is a list of dicts; take first
+        if val_results and isinstance(val_results, list):
+            vr = val_results[0]
+            # Our LightningModule logs 'val/loss'
+            val_loss = vr.get("val/loss") or vr.get("val_loss") or float('inf')
+        else:
+            val_loss = float('inf')
+    except Exception:
+        # Fallback: evaluate with existing function
+        policy_loss_fn = PolicyLoss()
+        value_loss_fn = ValueLoss(use_huber=True)
+        val_policy_loss, val_value_loss, val_policy_accuracy = evaluate(model, valid_loader, policy_loss_fn, value_loss_fn, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        val_loss = val_policy_loss + val_value_loss + (1.0 - val_policy_accuracy)
+
+    # Report to Optuna and allow pruning logic to use PyTorchLightningPruningCallback
+    trial.report(val_loss, 0)
+    if trial.should_prune():
+        raise __import__("optuna").TrialPruned()
+
+    trial.set_user_attr("val_loss", float(val_loss))
+    return float(val_loss)
 
 
 def evaluate(model, loader, policy_loss_fn, value_loss_fn, device):

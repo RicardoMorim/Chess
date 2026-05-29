@@ -22,9 +22,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Build Cython extension
+        run: |
+          python compile_cython.py
+
       - name: Run smoke import
         run: |
           python tools/smoke_import.py
+
+      - name: Run unit tests
+        run: |
+          python -m unittest discover -s tests -p "test_*.py" -v
 
       - name: Run Lightning quickstart (fast)
         run: |
