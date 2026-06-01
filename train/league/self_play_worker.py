@@ -63,7 +63,7 @@ def self_play_worker(
                     logger.warning(f"Worker {worker_id}: GPU evaluation returned None (timeout or error)")
                 return logits, value
 
-            logger.info(f"Worker {worker_id}: Using GPU-batched evaluator (remote)")
+            logger.info(f"Worker {worker_id}: Using GPU-batched evaluator (batch={gpu_eval.get('batch_size', 8)})")
         else:
             # Load model locally on CPU (legacy path)
             model = model_constructor(**model_config)
@@ -90,7 +90,7 @@ def self_play_worker(
                 game_trajectory = play_game_batch_mcts(mcts, device, model_config, worker_id, gpu_eval=gpu_eval)
                 if game_trajectory:
                     result_queue.put({"game_data": game_trajectory, "worker_id": worker_id, "game_idx": game_idx})
-                    logger.info(f"Worker {worker_id}: Game {game_idx+1}/{num_games} finished ({len(game_trajectory)} moves)")
+                    logger.info(f"Worker {worker_id}: Game {game_idx+1}/{num_games} finished ({game_trajectory['moves']} moves, outcome={game_trajectory['outcome']}, reason={game_trajectory['end_reason']})")
                 else:
                     logger.warning(f"Worker {worker_id}: Game {game_idx+1}/{num_games} returned None")
                     result_queue.put({"error": f"Game {game_idx} returned None", "worker_id": worker_id})
