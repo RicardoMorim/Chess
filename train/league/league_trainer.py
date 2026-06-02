@@ -165,6 +165,8 @@ class LeagueTrainer:
     STOCKFISH_BENCH_NUM_GAMES = 20
     STOCKFISH_BENCH_EVERY_N_ROUNDS = 25
     STOCKFISH_BENCH_TIME_LIMIT_MS = 200
+    STOCKFISH_NUM_WORKERS = 2     # Stockfish processes; each uses STOCKFISH_THREADS
+    STOCKFISH_THREADS = 4        # threads per Stockfish process
     
     def __init__(
         self,
@@ -244,6 +246,8 @@ class LeagueTrainer:
             use_pro_games=self.USE_PRO_GAMES,
             use_stockfish_eval=self.USE_STOCKFISH_EVAL,
             stockfish_depth=self.STOCKFISH_DEPTH_LABEL,
+            stockfish_threads=self.STOCKFISH_THREADS,
+            stockfish_num_workers=self.STOCKFISH_NUM_WORKERS,
         )
         self.aux_loader = AuxDataLoader(self.aux_config)
         if self.USE_PUZZLE_INJECTION or self.USE_PRO_GAMES:

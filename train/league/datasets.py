@@ -49,10 +49,10 @@ class AuxDataConfig:
         progame_pgn_file_limit: int = 0,
         cache_dir: str = "train/cache",
         stockfish_depth: int = 12,
-        stockfish_threads: int = 2,
-        stockfish_hash_mb: int = 256,
+        stockfish_threads: int = 4,
+        stockfish_hash_mb: int = 512,
         stockfish_per_position_timeout_sec: float = 600.0,
-        stockfish_num_workers: int = 0,
+        stockfish_num_workers: int = 2,
         puzzle_max_expand_depth: int = 4,
         model_type: str = "big",
     ):
