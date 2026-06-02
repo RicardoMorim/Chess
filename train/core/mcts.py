@@ -661,8 +661,17 @@ class MCTS:
         self.virtual_loss = virtual_loss
         self.evaluate_fn = evaluate_fn
 
-    def search(self, board: chess.Board):
-        """Run MCTS and return (policy_vector, selected_move)."""
+    def search(self, board: chess.Board, temperature: Optional[float] = None):
+        """Run MCTS and return (policy_vector, selected_move).
+
+        Args:
+            board: Position to search from.
+            temperature: Optional per-call override for the move-selection
+                temperature. If None, uses the temperature passed to the
+                constructor. Use 0 for greedy selection (AlphaZero: τ=0
+                after the first 30 half-moves).
+        """
+        effective_temperature = self.temperature if temperature is None else temperature
         visit_counts, _root = run_mcts(
             board,
             self.model,
@@ -685,11 +694,11 @@ class MCTS:
         counts = np.array([visit_counts[m] for m in legal_moves], dtype=np.float32)
 
         # Temperature-scaled selection
-        if self.temperature == 0 or np.sum(counts) == 0:
+        if effective_temperature == 0 or np.sum(counts) == 0:
             probs = np.zeros_like(counts)
             probs[np.argmax(counts)] = 1.0
         else:
-            counts_temp = np.power(counts + 1e-8, 1.0 / self.temperature)
+            counts_temp = np.power(counts + 1e-8, 1.0 / effective_temperature)
             probs = counts_temp / np.sum(counts_temp)
 
         # Build full policy vector

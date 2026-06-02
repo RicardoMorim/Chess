@@ -96,7 +96,16 @@ def self_play_worker(
     # Default configs
     model_config = model_config or {"input_channels": 22, "num_blocks": 15, "channels": 256}
     # NOTE: Self-play runs in multiple processes; keep MCTS inner threading low to avoid oversubscription.
-    mcts_config = mcts_config or {"num_visits": 800, "temperature": 1.0, "c_puct": 4.0, "dirichlet_alpha": 0.3, "add_noise": True, "parallel_workers": 1}
+    mcts_config = mcts_config or {
+        "num_visits": 800,
+        "temperature": 1.0,
+        "temperature_move_threshold": 30,
+        "max_moves": 200,
+        "c_puct": 4.0,
+        "dirichlet_alpha": 0.3,
+        "add_noise": True,
+        "parallel_workers": 1,
+    }
 
     try:
         torch.set_num_threads(1)  # avoid CPU oversubscription
@@ -162,7 +171,10 @@ def self_play_worker(
         for game_idx in range(num_games):
             try:
                 logger.info(f"Worker {worker_id}: Starting game {game_idx+1}/{num_games}")
-                game_trajectory = play_game_batch_mcts(mcts, device, model_config, worker_id, gpu_eval=gpu_eval)
+                game_trajectory = play_game_batch_mcts(
+                    mcts, device, model_config, worker_id,
+                    gpu_eval=gpu_eval, mcts_config=mcts_config,
+                )
                 if game_trajectory:
                     result_queue.put({"game_data": game_trajectory, "worker_id": worker_id, "game_idx": game_idx})
                     logger.info(f"Worker {worker_id}: Game {game_idx+1}/{num_games} finished ({game_trajectory['moves']} moves, outcome={game_trajectory['outcome']}, reason={game_trajectory['end_reason']})")
@@ -178,14 +190,23 @@ def self_play_worker(
         result_queue.put({"error": str(e), "worker_id": worker_id})
 
 
-def play_game_batch_mcts(mcts, device, model_config, worker_id, gpu_eval: Optional[Dict[str, Any]] = None):
+def play_game_batch_mcts(mcts, device, model_config, worker_id, gpu_eval: Optional[Dict[str, Any]] = None,
+                          mcts_config: Optional[Dict[str, Any]] = None):
     """
     Play a single self-play game using MCTS.
-    
+
     CRITICAL: Must use mcts.search() to get MCTS-guided moves, NOT just policy sampling.
+
+    Implements AlphaZero temperature annealing: τ=1 for the first
+    `temperature_move_threshold` half-moves (exploration), then τ=0
+    (greedy, argmax of visit counts) for the remainder.
     """
     import chess
-    max_moves = 100
+    mcts_config = mcts_config or {}
+    max_moves = int(mcts_config.get("max_moves", 200))
+    initial_temperature = float(mcts_config.get("temperature", 1.0))
+    temperature_move_threshold = int(mcts_config.get("temperature_move_threshold", 30))
+
     game_data = []
     board = chess.Board()
     move_count = 0
@@ -202,11 +223,15 @@ def play_game_batch_mcts(mcts, device, model_config, worker_id, gpu_eval: Option
         input_channels = getattr(mcts.model, "input_channels", model_config.get("input_channels", 22))
 
     while not board.is_game_over() and move_count < max_moves:
+        # AlphaZero temperature schedule: τ=initial_temperature for the
+        # opening, then τ=0 (greedy) for the rest of the game.
+        current_temperature = initial_temperature if move_count < temperature_move_threshold else 0.0
+
         try:
             # MCTS search - this is the KEY difference
             # Returns policy (4672-dim) and selected move
-            policy, selected_move = mcts.search(board)
-            
+            policy, selected_move = mcts.search(board, temperature=current_temperature)
+
         except Exception as e:
             logger.error(f"Worker {worker_id}: MCTS search failed at move {move_count}: {e}")
             logger.error("Aborting game")

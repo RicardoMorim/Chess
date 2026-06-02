@@ -132,7 +132,10 @@ def main():
     logger.info(f"Evaluate every N rounds: {trainer.EVAL_EVERY_N_ROUNDS}")
     logger.info(f"MCTS visits (self-play): {trainer.MCTS_VISITS_SELFPLAY}")
     logger.info(f"MCTS visits (evaluation): {trainer.MCTS_VISITS_EVAL}")
-    logger.info(f"Temperature: {trainer.TEMPERATURE}")
+    logger.info(f"Temperature schedule: {trainer.TEMPERATURE_INITIAL} for first {trainer.TEMPERATURE_MOVE_THRESHOLD} half-moves, then 0 (greedy)")
+    logger.info(f"Max game moves: {trainer.MAX_GAME_MOVES}")
+    logger.info(f"Replay buffer size: {trainer.REPLAY_BUFFER_MAX_SIZE}")
+    logger.info(f"Initial LR: {trainer.INITIAL_LR}, milestones @ {trainer.LR_MILESTONE_1}/{trainer.LR_MILESTONE_2}, warmup {trainer.LR_WARMUP_STEPS}")
     logger.info("="*60 + "\n")
     
     # Run training loop

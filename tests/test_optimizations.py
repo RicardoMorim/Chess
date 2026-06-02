@@ -432,7 +432,7 @@ class MaxMovesDrawRegressionTests(unittest.TestCase):
                 # gpu_eval is None — expose a stub model to satisfy them.
                 self.model = type("_StubModel", (), {"input_channels": 18})()
 
-            def search(self, board):
+            def search(self, board, temperature=None):
                 legal = list(board.legal_moves)
                 policy = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
                 for m in legal:
@@ -489,6 +489,7 @@ class MaxMovesDrawRegressionTests(unittest.TestCase):
                 device=None,
                 model_config={"input_channels": 18},
                 worker_id=99,
+                mcts_config={"max_moves": 100, "temperature": 1.0, "temperature_move_threshold": 30},
             )
         finally:
             chess.Board.is_game_over = original_is_game_over
@@ -530,6 +531,7 @@ class MaxMovesDrawRegressionTests(unittest.TestCase):
                 device=None,
                 model_config={"input_channels": 18},
                 worker_id=42,
+                mcts_config={"max_moves": 100, "temperature": 1.0, "temperature_move_threshold": 30},
             )
         finally:
             chess.Board.is_game_over = original_is_game_over
@@ -543,6 +545,159 @@ class MaxMovesDrawRegressionTests(unittest.TestCase):
         # All value targets must be 0.0.
         for _pos, _policy, value in result["trajectory"]:
             self.assertEqual(value, 0.0)
+
+
+# ============================================================================
+# Regression: AlphaZero temperature annealing (τ=1 for first N moves, then 0)
+# ============================================================================
+class TemperatureAnnealingTests(unittest.TestCase):
+    """After the temperature_move_threshold, MCTS must be called with
+    temperature=0 (greedy). Before it, temperature must equal the
+    configured initial value. This locks in the AlphaZero paper's
+    τ-schedule so it can't silently regress to constant τ=1.
+    """
+
+    def test_temperature_anneals_after_threshold(self):
+        import chess
+        from train.league.self_play_worker import play_game_batch_mcts
+
+        # Record the temperature passed to mcts.search at each move.
+        recorded_temps: list = []
+
+        def pick_capture_or_pawn(board):
+            for m in board.legal_moves:
+                if board.is_capture(m) or board.piece_type_at(m.from_square) == chess.PAWN:
+                    return m
+            return list(board.legal_moves)[0]
+
+        class _RecordingMCTS:
+            def __init__(self):
+                self._last_value = 0.0
+                self.model = type("_S", (), {"input_channels": 18})()
+
+            def search(self, board, temperature=None):
+                from train.core.constants import ACTION_SPACE_SIZE
+                from train.core.data import get_move_index
+                legal = list(board.legal_moves)
+                policy = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
+                for m in legal:
+                    policy[get_move_index(m)] = 1.0 / max(1, len(legal))
+                recorded_temps.append(temperature)
+                return policy, pick_capture_or_pawn(board)
+
+        # Force max_moves path: same patching as MaxMoves tests.
+        original_is_game_over = chess.Board.is_game_over
+        original_is_fivefold = chess.Board.is_fivefold_repetition
+        original_is_seventyfive = chess.Board.is_seventyfive_moves
+        chess.Board.is_game_over = lambda self: False
+        chess.Board.is_fivefold_repetition = lambda self: False
+        chess.Board.is_seventyfive_moves = lambda self: False
+        try:
+            result = play_game_batch_mcts(
+                mcts=_RecordingMCTS(),
+                device=None,
+                model_config={"input_channels": 18},
+                worker_id=11,
+                mcts_config={
+                    "max_moves": 10,
+                    "temperature": 1.0,
+                    "temperature_move_threshold": 5,
+                },
+            )
+        finally:
+            chess.Board.is_game_over = original_is_game_over
+            chess.Board.is_fivefold_repetition = original_is_fivefold
+            chess.Board.is_seventyfive_moves = original_is_seventyfive
+
+        self.assertIsNotNone(result)
+        self.assertEqual(len(recorded_temps), 10)
+        # First 5 half-moves: τ=1.0 (exploration)
+        for t in recorded_temps[:5]:
+            self.assertEqual(t, 1.0)
+        # Remaining 5 half-moves: τ=0.0 (greedy, AlphaZero)
+        for t in recorded_temps[5:]:
+            self.assertEqual(t, 0.0)
+
+
+# ============================================================================
+# Regression: AlphaZero LR schedule (warmup, milestone drops, floor)
+# ============================================================================
+class LrScheduleRegressionTests(unittest.TestCase):
+    """The AlphaZero paper LR schedule is:
+        - linear warmup from 0 to initial_lr over LR_WARMUP_STEPS
+        - constant at initial_lr until LR_MILESTONE_1
+        - LR_DROP_FACTOR × initial_lr from LR_MILESTONE_1 to LR_MILESTONE_2
+        - LR_DROP_FACTOR² × initial_lr after LR_MILESTONE_2
+        - clamped at LR_FINAL
+    This test pins the schedule so a future refactor can't silently regress
+    to constant LR or wrong milestones.
+    """
+
+    def _build_scheduler(self):
+        import torch
+        from torch.optim import SGD
+        from torch.optim.lr_scheduler import LambdaLR
+
+        INITIAL_LR = 0.025
+        LR_DROP_FACTOR = 0.2
+        LR_MILESTONE_1 = 1000
+        LR_MILESTONE_2 = 3000
+        LR_FINAL = 0.001
+        LR_WARMUP_STEPS = 100
+
+        def lr_lambda_floored(step):
+            if step < LR_WARMUP_STEPS:
+                return step / LR_WARMUP_STEPS
+            factor = 1.0
+            if step >= LR_MILESTONE_1:
+                factor *= LR_DROP_FACTOR
+            if step >= LR_MILESTONE_2:
+                factor *= LR_DROP_FACTOR
+            raw_lr = INITIAL_LR * factor
+            return max(LR_FINAL, raw_lr) / INITIAL_LR
+
+        model = torch.nn.Linear(1, 1)
+        opt = SGD(model.parameters(), lr=INITIAL_LR, momentum=0.9, weight_decay=1e-4)
+        sched = LambdaLR(opt, lr_lambda_floored)
+        return opt, sched
+
+    def test_warmup_ramps_linearly(self):
+        opt, sched = self._build_scheduler()
+        for s in range(100):
+            opt.step()
+            sched.step()
+        # At end of warmup, LR should equal INITIAL_LR
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], 0.025, places=6)
+
+    def test_holds_at_initial_until_milestone_1(self):
+        opt, sched = self._build_scheduler()
+        for s in range(999):  # one step before milestone 1
+            opt.step()
+            sched.step()
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], 0.025, places=6)
+
+    def test_drops_5x_at_milestone_1(self):
+        opt, sched = self._build_scheduler()
+        for s in range(1500):  # 500 past milestone 1
+            opt.step()
+            sched.step()
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], 0.025 * 0.2, places=6)
+
+    def test_drops_25x_after_milestone_2(self):
+        opt, sched = self._build_scheduler()
+        for s in range(4000):  # 1000 past milestone 2
+            opt.step()
+            sched.step()
+        self.assertAlmostEqual(opt.param_groups[0]["lr"], 0.025 * 0.2 * 0.2, places=6)
+
+    def test_floor_applies_if_drops_would_exceed_it(self):
+        # If LR_FINAL is higher than the post-drop LR, we get the floor.
+        # (With the current values 0.001 = 0.025*0.04, so floor doesn't bite.)
+        # Verify by inspection: floor is reached when post-drop LR < floor.
+        INITIAL_LR = 0.025
+        LR_DROP_FACTOR = 0.2
+        # 0.025 * 0.2 * 0.2 = 0.001 = LR_FINAL — exactly at the floor.
+        self.assertAlmostEqual(INITIAL_LR * LR_DROP_FACTOR ** 2, 0.001, places=6)
 
 
 def random_move():

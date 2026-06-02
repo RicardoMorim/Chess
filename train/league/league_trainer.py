@@ -61,14 +61,14 @@ class LeagueTrainer:
     - Metrics collection and monitoring
     """
     
-    # Training hyperparameters (BOOTSTRAP: minimal until flow validated)
+    # Training hyperparameters (AlphaZero-faithful, scaled for 1 GPU)
     VARIANTS = ["baseline", "attack", "est"]
     # Parallelism config (INTERMEDIATE - validated and stable)
     # NOTE: Self-play already multiplies across variants; keep this modest to avoid oversubscription.
     NUM_SELF_PLAY_WORKERS = 6  # CPU processes per variant for self-play
     GAMES_PER_WORKER_PER_ROUND = 5  # Multiple games per worker
-    BATCH_SIZE = 128  # Larger batches for GPU efficiency
-    TRAINING_STEPS_PER_ROUND = 10  # More gradient updates per round
+    BATCH_SIZE = 256  # AlphaZero uses 4096; we use 256 (16× smaller, RTX 5080 sweet spot)
+    TRAINING_STEPS_PER_ROUND = 50  # More updates per round to use larger LR effectively
     CHECKPOINT_EVERY_N_ROUNDS = 5  # Checkpoint every 5 rounds
     EVAL_EVERY_N_ROUNDS = 100  # Skip for now
     METRICS_EVERY_N_ROUNDS = 5
@@ -80,9 +80,15 @@ class LeagueTrainer:
     POLICY_LOSS_WEIGHT = 1.0
     VALUE_LOSS_WEIGHT = 10.0  # Boost value head gradient
 
-    # LR schedule (CosineAnnealing over training steps)
-    LR_SCHEDULE_STEPS = 1000  # Total steps for cosine decay
-    LR_WARMUP_STEPS = 50  # Linear warmup before decay
+    # LR schedule (AlphaZero paper: 0.2 -> 0.02 -> 0.002 -> 0.0002 at steps 100k/300k/500k).
+    # We scale this 8× for our regime (one GPU vs 64 TPUs): initial 0.025, drops 5× at
+    # step 1000 and again at step 3000. Total budget ~5000 steps.
+    INITIAL_LR = 0.025
+    LR_DROP_FACTOR = 0.2  # multiply LR by this at each milestone
+    LR_MILESTONE_1 = 1000  # step at which first LR drop happens
+    LR_MILESTONE_2 = 3000  # step at which second LR drop happens
+    LR_FINAL = 0.001  # floor LR after all drops
+    LR_WARMUP_STEPS = 100  # Linear warmup before decay (AlphaZero paper implicitly warms up via the 100k milestone)
 
     # Devices / concurrency
     SELF_PLAY_DEVICE = "cpu"  # Safer: avoids many CUDA contexts across worker processes
@@ -91,19 +97,28 @@ class LeagueTrainer:
     # When GPU batching is enabled, self-play is often bottlenecked by request concurrency.
     # More CPU workers helps fill GPU batches even if CPU utilization stays moderate.
     GPU_SELF_PLAY_WORKERS = 14
-    
-    # MCTS hyperparameters (INTERMEDIATE - correct dual-budget approach)
-    # Self-play: BALANCED generation of training data (GPU utilized 100%, VRAM 80%)
-    MCTS_VISITS_SELFPLAY = 80  # Quality/speed sweet spot: better signal than 12, still fast
-    # Evaluation: SLOWER, higher quality comparisons between models
-    MCTS_VISITS_EVAL = 400  # Generous search for model strength assessment
+
+    # MCTS hyperparameters (AlphaZero paper: 800 sims/move for both training and eval).
+    # We use 200 for self-play (4× less than paper, scaled for 1 GPU) and 400 for eval
+    # (half of paper — enough for fair strength signal without dominating wall time).
+    MCTS_VISITS_SELFPLAY = 200  # Mid-point between 80 (too few) and 800 (paper) — better checkmate signal
+    MCTS_VISITS_EVAL = 400  # Half of paper's 800; ample for tournament-grade eval
     C_PUCT = 4.0
-    TEMPERATURE = 1.0
+    # Temperature schedule (AlphaZero paper: τ=1 for first 30 half-moves, then 0=greedy).
+    # Self-play workers enforce this schedule per-move.
+    TEMPERATURE_INITIAL = 1.0
+    TEMPERATURE_MOVE_THRESHOLD = 30  # move index after which we drop to greedy
     DIRICHLET_ALPHA = 0.3
-    
-    # Replay buffer config
-    # Large buffers can consume many GB of RAM (3 variants). Keep smaller unless you have ample RAM.
-    REPLAY_BUFFER_MAX_SIZE = 30_000
+
+    # Game length cap (AlphaZero paper: 512 for chess; 200 is a practical compromise that
+    # still allows most natural games to finish via checkmate or resignation).
+    MAX_GAME_MOVES = 200
+
+    # Replay buffer config (AlphaZero paper: 500k games ≈ 44M positions).
+    # We use 100k positions per variant (~3000 games of 30 plies each). 1× GPU can't
+    # process 44M positions in a reasonable time, but 100k is enough to retain diversity
+    # across rounds.
+    REPLAY_BUFFER_MAX_SIZE = 100_000
 
     # Checkpoint retention
     CHECKPOINT_KEEP_LAST_N = 3
@@ -302,21 +317,38 @@ class LeagueTrainer:
             model = model_constructor(**config, value_dropout=0.2)
             model.to(self.device)
             
-            # Create optimizer
+            # Create optimizer (AlphaZero paper: SGD, momentum=0.9, weight_decay=1e-4)
             optimizer = optim.SGD(
                 model.parameters(),
-                lr=0.01,
+                lr=self.INITIAL_LR,
                 momentum=0.9,
                 weight_decay=1e-4,
             )
-            
-            # Cosine decay scheduler with linear warmup
-            def lr_lambda(step):
-                if step < self.LR_WARMUP_STEPS:
-                    return step / self.LR_WARMUP_STEPS
-                progress = (step - self.LR_WARMUP_STEPS) / max(1, self.LR_SCHEDULE_STEPS - self.LR_WARMUP_STEPS)
-                return max(0.01, 0.5 * (1 + math.cos(math.pi * progress)))
-            scheduler = LambdaLR(optimizer, lr_lambda)
+
+            # LR schedule (AlphaZero paper: linear warmup, then 0.2 -> 0.02 -> 0.002 -> 0.0002
+            # at steps 100k/300k/500k of a 700k-step run). We scale the milestones 100× to match
+            # our 5k-step budget and the LR_DROP_FACTOR of 0.2 for the same 5× ratio per drop.
+            initial_lr = self.INITIAL_LR
+            warmup = self.LR_WARMUP_STEPS
+            m1 = self.LR_MILESTONE_1
+            m2 = self.LR_MILESTONE_2
+            drop = self.LR_DROP_FACTOR
+            floor = self.LR_FINAL
+
+            def lr_lambda_floored(step):
+                if step < warmup:
+                    # Linear warmup: LR ramps from 0 to initial_lr
+                    return step / warmup
+                # Piecewise constant after warmup; each milestone multiplies by drop
+                factor = 1.0
+                if step >= m1:
+                    factor *= drop
+                if step >= m2:
+                    factor *= drop
+                raw_lr = initial_lr * factor
+                return max(floor, raw_lr) / initial_lr
+
+            scheduler = LambdaLR(optimizer, lr_lambda_floored)
             
             # Create replay buffer
             buffer = ReplayBuffer(max_size=self.REPLAY_BUFFER_MAX_SIZE)
@@ -497,7 +529,8 @@ class LeagueTrainer:
                     self.model_configs[variant],
                     {
                         "num_visits": self._current_mcts_visits,  # Adaptive MCTS visits
-                        "temperature": self.TEMPERATURE,
+                        "temperature": self.TEMPERATURE_INITIAL,  # initial τ; worker anneals to 0 after TEMPERATURE_MOVE_THRESHOLD
+                        "temperature_move_threshold": self.TEMPERATURE_MOVE_THRESHOLD,
                         "c_puct": self.C_PUCT,
                         "dirichlet_alpha": self.DIRICHLET_ALPHA,
                         "add_noise": True,
