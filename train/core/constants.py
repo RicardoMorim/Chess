@@ -57,6 +57,19 @@ TRAINING_CONFIG = {
     # Batch training
     'epochs_per_batch': 5,
     'puzzle_batches_per_game_batch': 5,
+    
+    # Loss weighting
+    # Policy head has 4672 outputs, value head has 1. Equal weighting
+    # means value gradient is ~4672x smaller. Compensate with value_weight.
+    'policy_weight': 1.0,
+    'value_weight': 10.0,
+    
+    # Value head dropout (regularization)
+    'value_dropout': 0.2,
+    
+    # Focal loss
+    'use_focal_loss': False,  # Set True to use FocalPolicyLoss
+    'focal_gamma': 2.0,
 }
 
 # ============================================================================

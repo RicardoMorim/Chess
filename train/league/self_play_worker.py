@@ -1,7 +1,8 @@
-import sys, time, logging, numpy as np
+import sys, time, logging, threading
+import numpy as np
 import torch, chess
 from pathlib import Path
-from typing import Callable, Dict, Any, Optional
+from typing import Callable, Dict, Any, Optional, List, Tuple
 from multiprocessing import Queue
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -9,6 +10,71 @@ from core import board_to_tensor, get_move_index
 from core.constants import ACTION_SPACE_SIZE
 
 logger = logging.getLogger(__name__)
+
+
+class BatchedGPUEvaluator:
+    """Thread-safe evaluator that accumulates boards across MCTS threads.
+
+    Multiple MCTS threads call evaluate() concurrently.  Boards are accumulated
+    via the client's batched API and sent to the GPU server in a single
+    __BATCH__ message.
+
+    A background collector thread drains completed results and wakes waiting
+    callers via threading.Event.
+    """
+
+    def __init__(
+        self,
+        client,
+        batch_flush_size: int = 8,
+        timeout_sec: float = 30.0,
+    ):
+        self._client = client
+        self._timeout_sec = timeout_sec
+        self._lock = threading.Lock()
+        self._pending: Dict[str, threading.Event] = {}
+        self._results: Dict[str, Tuple[Optional[List[float]], float]] = {}
+        self._running = True
+
+        self._collector = threading.Thread(target=self._collect_loop, daemon=True)
+        self._collector.start()
+
+    def evaluate(
+        self,
+        features,
+        legal_indices: List[int],
+    ) -> Tuple[Optional[List[float]], float]:
+        rid = self._client.evaluate_features_batched(features, legal_indices)
+        event = threading.Event()
+        with self._lock:
+            self._pending[rid] = event
+        if not event.wait(timeout=self._timeout_sec):
+            with self._lock:
+                self._pending.pop(rid, None)
+            return None, 0.0
+        with self._lock:
+            logits, value = self._results.pop(rid, (None, 0.0))
+            return logits, value
+
+    def _collect_loop(self):
+        while self._running:
+            time.sleep(0.003)
+            with self._lock:
+                rids = list(self._pending.keys())
+            if not rids:
+                continue
+            self._client.flush()
+            results = self._client.collect_results(rids)
+            with self._lock:
+                for rid, (logits, value) in results.items():
+                    if rid in self._pending:
+                        self._results[rid] = (logits, value)
+                        self._pending[rid].set()
+                        del self._pending[rid]
+
+    def close(self):
+        self._running = False
+
 
 # --------------------------
 # GPU batch MCTS self-play
@@ -49,21 +115,30 @@ def self_play_worker(
 
             timeout_sec = float(gpu_eval.get("timeout_sec", 30.0))
             input_channels_remote = int(gpu_eval.get("input_channels", 22))
+            timeout_warning_budget = {"count": 0}
+
+            batch_flush_size = int(gpu_eval.get("batch_flush_size", 8))
+            batched_eval = BatchedGPUEvaluator(
+                client,
+                batch_flush_size=batch_flush_size,
+                timeout_sec=timeout_sec,
+            )
 
             def evaluate_fn(board: chess.Board):
                 legal_moves = list(board.legal_moves)
                 legal_indices = [get_move_index(m) for m in legal_moves]
                 features = board_to_tensor(board, board.fullmove_number, input_channels_remote)
-                logits, value = client.evaluate_features(
-                    features,
-                    legal_indices,
-                    timeout_sec=timeout_sec,
-                )
+                logits, value = batched_eval.evaluate(features, legal_indices)
                 if logits is None:
-                    logger.warning(f"Worker {worker_id}: GPU evaluation returned None (timeout or error)")
+                    timeout_warning_budget["count"] += 1
+                    if timeout_warning_budget["count"] <= 3 or timeout_warning_budget["count"] % 50 == 0:
+                        logger.warning(
+                            f"Worker {worker_id}: GPU evaluation returned None (timeout or error) "
+                            f"[count={timeout_warning_budget['count']}]"
+                        )
                 return logits, value
 
-            logger.info(f"Worker {worker_id}: Using GPU-batched evaluator (batch={gpu_eval.get('batch_size', 8)})")
+            logger.info(f"Worker {worker_id}: Using GPU-batched evaluator (batch={batch_flush_size})")
         else:
             # Load model locally on CPU (legacy path)
             model = model_constructor(**model_config)
@@ -110,7 +185,7 @@ def play_game_batch_mcts(mcts, device, model_config, worker_id, gpu_eval: Option
     CRITICAL: Must use mcts.search() to get MCTS-guided moves, NOT just policy sampling.
     """
     import chess
-    max_moves = 120
+    max_moves = 100
     game_data = []
     board = chess.Board()
     move_count = 0

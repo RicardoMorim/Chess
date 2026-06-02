@@ -6,10 +6,16 @@ Intended for fast verification (CI smoke) rather than full training.
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
+
+
+repo_root = Path(__file__).resolve().parents[1]
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
 
 from train.core.repro import set_seed
 

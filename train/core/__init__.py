@@ -42,7 +42,9 @@ from .mcts import (
 from .training import (
     TRAIN_CONFIG,
     PolicyLoss,
+    FocalPolicyLoss,
     ValueLoss,
+    EMA,
     create_optimizer,
     create_scheduler,
     train_on_self_play,
@@ -102,7 +104,9 @@ __all__ = [
     # Training
     "TRAIN_CONFIG",
     "PolicyLoss",
+    "FocalPolicyLoss",
     "ValueLoss",
+    "EMA",
     "create_optimizer",
     "create_scheduler",
     "train_on_self_play",

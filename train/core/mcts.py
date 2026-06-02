@@ -13,9 +13,9 @@ from .utils import clear_memory
 # Node
 # ------------------------
 class MCTSNode:
-    __slots__ = ['board', 'prior', 'parent', 'children', 'visit_count', 'value_sum', 'virtual_loss', 'lock']
+    __slots__ = ['fen', 'prior', 'parent', 'children', 'visit_count', 'value_sum', 'virtual_loss', 'lock']
     def __init__(self, board: chess.Board, prior: float, parent=None):
-        self.board = board.copy()
+        self.fen = board.fen()
         self.prior = prior
         self.parent = parent
         self.children = {}
@@ -23,6 +23,10 @@ class MCTSNode:
         self.value_sum = 0.0
         self.virtual_loss = 0
         self.lock = threading.Lock()
+
+    def get_board(self):
+        return chess.Board(self.fen)
+
     def value(self):
         return self.value_sum / self.visit_count if self.visit_count > 0 else 0.0
     def is_expanded(self):
@@ -35,11 +39,8 @@ def expand_nodes_batched(nodes: List[MCTSNode], model, device, add_noise=True):
     if not nodes: return []
 
     input_channels = getattr(model, "input_channels", 22)
-    boards = np.stack([board_to_tensor(n.board, n.board.fullmove_number, input_channels) for n in nodes])
+    boards = np.stack([board_to_tensor(n.get_board(), n.get_board().fullmove_number, input_channels) for n in nodes])
     boards_tensor = torch.tensor(boards, dtype=torch.float32).to(device)
-
-    if device.startswith("cuda"):
-        boards_tensor = boards_tensor.half()  # FP16 for throughput
 
     with torch.no_grad():
         policy_logits, values = model(boards_tensor)
@@ -47,7 +48,7 @@ def expand_nodes_batched(nodes: List[MCTSNode], model, device, add_noise=True):
         values = values.cpu().numpy().flatten()
 
     for idx, node in enumerate(nodes):
-        legal_moves = list(node.board.legal_moves)
+        legal_moves = list(node.get_board().legal_moves)
         if not legal_moves:
             continue
         priors = np.array([policy_probs[idx][get_move_index(m)] for m in legal_moves], dtype=np.float32)
@@ -57,7 +58,7 @@ def expand_nodes_batched(nodes: List[MCTSNode], model, device, add_noise=True):
             noise = np.random.dirichlet([0.3]*len(legal_moves))
             priors = 0.75*priors + 0.25*noise
         for move, prior in zip(legal_moves, priors):
-            child_board = node.board.copy()
+            child_board = node.get_board().copy()
             child_board.push(move)
             node.children[move] = MCTSNode(child_board, prior, parent=node)
     return values
@@ -74,11 +75,14 @@ def simulate_batched(root: MCTSNode, model, device, c_puct=2.5, virtual_loss=1.0
         best_score = -float("inf")
         best_child = None
         sqrt_parent_visits = np.sqrt(node.visit_count + 1)
-        for move, child in node.children.items():
+        for move, child in list(node.children.items()):
             with child.lock:
-                q = child.value()
-                u = c_puct * child.prior * sqrt_parent_visits / (1 + child.visit_count + child.virtual_loss)
-                score = q + u
+                q_val = child.value()
+                vis = child.visit_count
+                vl = child.virtual_loss
+                prior = child.prior
+            u = c_puct * prior * sqrt_parent_visits / (1 + vis + vl)
+            score = q_val + u
             if score > best_score:
                 best_score = score
                 best_child = child
@@ -89,10 +93,10 @@ def simulate_batched(root: MCTSNode, model, device, c_puct=2.5, virtual_loss=1.0
         node = best_child
 
     # Expansion + Evaluation
-    if not node.is_expanded() and not node.board.is_game_over():
+    if not node.is_expanded() and not node.get_board().is_game_over():
         value = expand_nodes_batched([node], model, device, add_noise=True)[0]
     else:
-        value = 0.0 if node.board.is_game_over() else node.value()
+        value = 0.0 if node.get_board().is_game_over() else node.value()
 
     # Backpropagate
     for n in [root]+path[::-1]:
@@ -155,12 +159,12 @@ def expand_node(
     Returns:
         The value estimate for this position
     """
-    legal_moves = list(node.board.legal_moves)
+    legal_moves = list(node.get_board().legal_moves)
 
     # External evaluation path (GPU-batched server)
     if evaluate_fn is not None:
         try:
-            legal_logits, value_pred = evaluate_fn(node.board)
+            legal_logits, value_pred = evaluate_fn(node.get_board())
         except Exception as eval_err:
             legal_logits, value_pred = None, 0.0
 
@@ -183,7 +187,7 @@ def expand_node(
 
         # Create child nodes
         for move, prior in zip(legal_moves, move_priors):
-            next_board = node.board.copy()
+            next_board = node.get_board().copy()
             next_board.push(move)
             node.children[move] = MCTSNode(next_board, prior=prior, parent=node)
 
@@ -194,7 +198,7 @@ def expand_node(
 
     # Generate board tensor (only 18/20/22 channels supported)
     board_tensor = torch.tensor(
-        board_to_tensor(node.board, node.board.fullmove_number, input_channels),
+        board_to_tensor(node.get_board(), node.get_board().fullmove_number, input_channels),
         dtype=torch.float32,
     ).unsqueeze(0).to(device)
 
@@ -231,7 +235,7 @@ def expand_node(
     
     # Create child nodes
     for move, prior in zip(legal_moves, move_priors):
-        next_board = node.board.copy()
+        next_board = node.get_board().copy()
         next_board.push(move)
         node.children[move] = MCTSNode(next_board, prior=prior, parent=node)
     
@@ -258,28 +262,23 @@ def select_child(node: MCTSNode, c_puct: float) -> Tuple[chess.Move, 'MCTSNode']
     best_child = None
     
     with node.lock:
-        # sqrt(N(s)) - parent visit count
         sqrt_parent_visits = np.sqrt(max(1, node.visit_count))
-        
-        for move, child in node.children.items():
-            with child.lock:
-                # Q(s,a) - action value (with virtual loss penalty)
-                if child.visit_count > 0:
-                    q_value = child.value_sum / (child.visit_count + child.virtual_loss)
-                else:
-                    q_value = 0.0
-                
-                # U(s,a) = c_puct * P(s,a) * sqrt(N(s)) / (1 + N(s,a))
-                exploration = c_puct * child.prior * sqrt_parent_visits / (1 + child.visit_count + child.virtual_loss)
-                
-                # UCB score
-                ucb = q_value + exploration
-                
-            if ucb > best_score:
-                best_score = ucb
-                best_move = move
-                best_child = child
-    
+        children_snapshot = list(node.children.items())
+
+    for move, child in children_snapshot:
+        with child.lock:
+            q_val = (child.value_sum / (child.visit_count + child.virtual_loss)
+                     if child.visit_count > 0 else 0.0)
+            vis = child.visit_count
+            vl = child.virtual_loss
+            prior = child.prior
+        u = c_puct * prior * sqrt_parent_visits / (1 + vis + vl)
+        score = q_val + u
+        if score > best_score:
+            best_score = score
+            best_move = move
+            best_child = child
+
     return best_move, best_child
 
 
@@ -304,8 +303,8 @@ def simulate(
         Value from the perspective of the node's player
     """
     # Terminal check
-    if node.board.is_game_over():
-        if node.board.is_checkmate():
+    if node.get_board().is_game_over():
+        if node.get_board().is_checkmate():
             # Checkmate: -1 for side to move (they lost)
             return -1.0
         else:
@@ -477,7 +476,7 @@ def select_move_with_mcts(board: chess.Board, model, device, num_simulations: in
         (selected_move, policy_distribution, updated_tree)
     """
     # Reuse tree if possible
-    if tree is not None and tree.board.fen() == board.fen():
+    if tree is not None and tree.fen == board.fen():
         root = tree
         # Re-expand if needed
         if not root.is_expanded():

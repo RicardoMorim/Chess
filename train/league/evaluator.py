@@ -17,12 +17,14 @@ import torch
 import chess
 import logging
 from pathlib import Path
-from typing import Dict, Tuple, Optional, Any
+from typing import Dict, Tuple, Optional, Any, List
 
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 logger = logging.getLogger(__name__)
+
+from league.fair_evaluation import build_fair_opening_fens, round_robin_pairs
 
 
 class Evaluator:
@@ -80,6 +82,7 @@ class Evaluator:
         current_variant: str,
         opponent_checkpoint: str,
         opponent_model: Any,
+        starting_fens: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Run evaluation games between current model and opponent.
@@ -102,12 +105,35 @@ class Evaluator:
             }
         """
         
-        from core.mcts import MCTS
-        from core.data import board_to_tensor
-        
         if opponent_checkpoint not in self.checkpoints:
             logger.warning(f"Opponent checkpoint not found: {opponent_checkpoint}")
             return None
+
+        result = self.evaluate_pair(
+            current_model=current_model,
+            current_variant=current_variant,
+            opponent_model=opponent_model,
+            opponent_variant=self.checkpoints[opponent_checkpoint]["variant"],
+            starting_fens=starting_fens,
+        )
+        result["opponent_checkpoint"] = opponent_checkpoint
+        return result
+
+    def evaluate_pair(
+        self,
+        current_model: Any,
+        current_variant: str,
+        opponent_model: Any,
+        opponent_variant: str,
+        starting_fens: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Evaluate two models with identical settings and shared openings."""
+
+        from core.mcts import MCTS
+
+        opening_fens = list(starting_fens or build_fair_opening_fens())
+        if not opening_fens:
+            opening_fens = [chess.Board().fen()]
         
         # Create MCTS for both models (deterministic evaluation)
         current_mcts = MCTS(
@@ -138,11 +164,13 @@ class Evaluator:
         # Play games: alternate colors to reduce bias
         for game_idx in range(self.eval_games_per_matchup):
             current_is_white = (game_idx % 2 == 0)
+            start_fen = opening_fens[game_idx % len(opening_fens)]
             
             game_result, length = self._play_eval_game(
                 current_mcts if current_is_white else opponent_mcts,
                 opponent_mcts if current_is_white else current_mcts,
                 is_current_white=current_is_white,
+                start_fen=start_fen,
             )
             
             results["game_lengths"].append(length)
@@ -172,14 +200,80 @@ class Evaluator:
             sum(results["game_lengths"]) / len(results["game_lengths"])
             if results["game_lengths"] else 0
         )
+        results["current_variant"] = current_variant
+        results["opponent_variant"] = opponent_variant
+        results["total_games"] = total_games
+        results["opening_suite_size"] = len(opening_fens)
         
         return results
+
+    def compare_all_variants(
+        self,
+        models_by_variant: Dict[str, Any],
+        starting_fens: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Run a fair round-robin comparison across all variants."""
+
+        variants = [variant for variant in models_by_variant.keys() if variant in models_by_variant]
+        suite = list(starting_fens or build_fair_opening_fens())
+        pairwise = {}
+        scoreboard = {
+            variant: {
+                "games": 0,
+                "score": 0.0,
+                "wins": 0,
+                "losses": 0,
+                "draws": 0,
+            }
+            for variant in variants
+        }
+
+        for current_variant, opponent_variant in round_robin_pairs(variants):
+            result = self.evaluate_pair(
+                current_model=models_by_variant[current_variant],
+                current_variant=current_variant,
+                opponent_model=models_by_variant[opponent_variant],
+                opponent_variant=opponent_variant,
+                starting_fens=suite,
+            )
+            pair_key = f"{current_variant}_vs_{opponent_variant}"
+            pairwise[pair_key] = result
+
+            total_games = int(result.get("total_games", self.eval_games_per_matchup))
+            current_score = float(result.get("current_score", 0.0))
+            opponent_score = float(result.get("opponent_score", 0.0))
+
+            scoreboard[current_variant]["games"] += total_games
+            scoreboard[current_variant]["score"] += current_score
+            scoreboard[current_variant]["wins"] += int(result.get("current_wins", 0))
+            scoreboard[current_variant]["losses"] += int(result.get("opponent_wins", 0))
+            scoreboard[current_variant]["draws"] += int(result.get("draws", 0))
+
+            scoreboard[opponent_variant]["games"] += total_games
+            scoreboard[opponent_variant]["score"] += opponent_score
+            scoreboard[opponent_variant]["wins"] += int(result.get("opponent_wins", 0))
+            scoreboard[opponent_variant]["losses"] += int(result.get("current_wins", 0))
+            scoreboard[opponent_variant]["draws"] += int(result.get("draws", 0))
+
+        for variant, stats in scoreboard.items():
+            games = max(1, int(stats["games"]))
+            stats["avg_score"] = stats["score"] / games
+            stats["win_rate"] = (stats["wins"] + 0.5 * stats["draws"]) / games
+            stats["estimated_elo_diff"] = self._estimate_elo_diff(stats["win_rate"])
+
+        return {
+            "opening_suite_size": len(suite),
+            "pairwise": pairwise,
+            "scoreboard": scoreboard,
+            "pairs": [f"{a}_vs_{b}" for a, b in round_robin_pairs(variants)],
+        }
     
     def _play_eval_game(
         self,
         white_mcts: Any,
         black_mcts: Any,
         is_current_white: bool,
+        start_fen: Optional[str] = None,
     ) -> Tuple[int, int]:
         """
         Play a single evaluation game.
@@ -194,39 +288,41 @@ class Evaluator:
             - result: 1 if current wins, -1 if opponent wins, 0 if draw
             - game_length: Number of half-moves
         """
-        board = chess.Board()
+        board = chess.Board(start_fen) if start_fen else chess.Board()
         move_count = 0
         max_moves = 512
         
         while not board.is_game_over() and move_count < max_moves:
-            mcts = white_mcts if board.turn == chess.WHITE else black_mcts
-            
-            try:
-                _, move = mcts.search(board)
-            except Exception as e:
-                logger.warning(f"MCTS search failed in evaluation: {e}")
-                move = None
-            
+            move = self._select_eval_move(board, white_mcts, black_mcts)
             if move is None:
-                legal_moves = list(board.legal_moves)
-                if not legal_moves:
-                    break
-                move = legal_moves[0]
-            
+                break
+
             board.push(move)
             move_count += 1
-        
-        # Determine outcome
-        outcome = board.result()
-        
+
+        return self._score_eval_game(board.result(), is_current_white), move_count
+
+    def _select_eval_move(self, board: chess.Board, white_mcts: Any, black_mcts: Any):
+        """Select the next move for an evaluation game."""
+        mcts = white_mcts if board.turn == chess.WHITE else black_mcts
+
+        try:
+            _, move = mcts.search(board)
+            if move is not None:
+                return move
+        except Exception as e:
+            logger.warning(f"MCTS search failed in evaluation: {e}")
+
+        legal_moves = list(board.legal_moves)
+        return legal_moves[0] if legal_moves else None
+
+    def _score_eval_game(self, outcome: str, is_current_white: bool) -> int:
+        """Convert a PGN outcome to a score from the current model's perspective."""
         if outcome == "1-0":
-            result = 1 if is_current_white else -1
-        elif outcome == "0-1":
-            result = -1 if is_current_white else 1
-        else:
-            result = 0
-        
-        return result, move_count
+            return 1 if is_current_white else -1
+        if outcome == "0-1":
+            return -1 if is_current_white else 1
+        return 0
     
     def _estimate_elo_diff(self, win_rate: float) -> float:
         """
@@ -245,7 +341,7 @@ class Evaluator:
         # Clip to avoid log(0)
         win_rate = max(0.01, min(0.99, win_rate))
         
-        if win_rate == 0.5:
+        if abs(win_rate - 0.5) < 1e-9:
             return 0.0
         
         elo_diff = 400 * math.log10(win_rate / (1 - win_rate))
@@ -281,8 +377,10 @@ class Evaluator:
             # This would need to track historical evaluation results
             # For now, return placeholder
             
+        is_regression = worst_elo_diff < -abs(threshold_elo_loss)
+
         return {
-            "is_regression": False,
+            "is_regression": is_regression,
             "worst_matchup": worst_matchup,
             "worst_elo_diff": worst_elo_diff,
         }

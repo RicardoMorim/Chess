@@ -9,11 +9,11 @@ to prevent catastrophic forgetting and maintain learning stability.
 Design principles:
 - Per-model FIFO buffers (separate data streams)
 - Capped size to prevent memory explosion
+- NumPy circular buffer: all operations O(1) or O(batch_size)
 - No mixing of data between buffer and opponents (decoupling)
 - Thread-safe operations for multi-process workers
 """
 
-from collections import deque
 import random
 import threading
 from typing import List, Tuple, Optional
@@ -22,119 +22,107 @@ import numpy as np
 
 class ReplayBuffer:
     """
-    A FIFO replay buffer that stores game trajectories.
-    
+    A FIFO replay buffer backed by a NumPy circular buffer.
+
     Thread-safe for concurrent adds and samples.
-    Automatically discards oldest entries when max capacity reached.
-    
+    Automatically overwrites oldest entries when max capacity is reached.
+
     Each entry: (position_tensor, policy_vector, value_scalar)
+
+    All operations are O(1) except sample() which is O(batch_size) and
+    get_stats() which is O(size).
     """
-    
+
     def __init__(self, max_size: int = 200_000):
-        """
-        Initialize the replay buffer.
-        
-        Args:
-            max_size: Maximum number of positions to store
-        """
-        self.positions = deque(maxlen=max_size)
-        self.policies = deque(maxlen=max_size)
-        self.values = deque(maxlen=max_size)
-        self.lock = threading.Lock()
         self.max_size = max_size
-    
+        self.lock = threading.Lock()
+        self._positions = np.empty(max_size, dtype=object)
+        self._policies = np.empty(max_size, dtype=object)
+        self._values = np.zeros(max_size, dtype=np.float32)
+        self._size = 0
+        self._head = 0
+
+    def _logical_to_physical(self, logical_idx: int) -> int:
+        """Convert a logical index (0 = oldest) to physical array index."""
+        if self._size < self.max_size:
+            return logical_idx
+        return (self._head + logical_idx) % self.max_size
+
     def add_game(self, game_trajectory: List[Tuple]) -> None:
-        """
-        Add a complete game trajectory to the buffer.
-        
-        Args:
-            game_trajectory: List of (position, policy, value) tuples
-                - position: numpy array, shape (channels, 8, 8)
-                - policy: numpy array, shape (4672,) or similar
-                - value: scalar float in [-1, 1]
-        """
         with self.lock:
             for position, policy, value in game_trajectory:
-                self.positions.append(np.array(position, dtype=np.float16))
-                self.policies.append(np.array(policy, dtype=np.float16))
-                self.values.append(np.float32(value))
-    
+                self._positions[self._head] = np.array(position, dtype=np.float16)
+                self._policies[self._head] = np.array(policy, dtype=np.float16)
+                self._values[self._head] = np.float32(value)
+                self._head = (self._head + 1) % self.max_size
+                if self._size < self.max_size:
+                    self._size += 1
+
     def sample(self, batch_size: int) -> Tuple[List, List, List]:
-        """
-        Sample a random batch from the buffer.
-        
-        Args:
-            batch_size: Number of positions to sample
-        
-        Returns:
-            (positions, policies, values) - lists of numpy arrays
-        
-        Raises:
-            ValueError: if batch_size > buffer size
-        """
         with self.lock:
-            if batch_size > len(self.positions):
+            if batch_size > self._size:
                 raise ValueError(
-                    f"Batch size {batch_size} exceeds buffer size {len(self.positions)}"
+                    f"Batch size {batch_size} exceeds buffer size {self._size}"
                 )
-            
-            # Sample indices uniformly from buffer
-            indices = random.sample(range(len(self.positions)), batch_size)
-            
-            # Upcast string arrays back to float32 for model consumption
-            positions = [np.array(self.positions[i], dtype=np.float32) for i in indices]
-            policies = [np.array(self.policies[i], dtype=np.float32) for i in indices]
-            values = [self.values[i] for i in indices]
-        
+
+            logical_indices = random.sample(range(self._size), batch_size)
+            physical = [self._logical_to_physical(i) for i in logical_indices]
+
+            positions = [np.array(self._positions[i], dtype=np.float32) for i in physical]
+            policies = [np.array(self._policies[i], dtype=np.float32) for i in physical]
+            values = [self._values[i] for i in physical]
+
         return positions, policies, values
-    
+
     def __len__(self) -> int:
-        """Return current number of positions in buffer."""
         with self.lock:
-            return len(self.positions)
-    
+            return self._size
+
     def is_ready(self, min_size: int = 256) -> bool:
-        """
-        Check if buffer has enough data for training.
-        
-        Args:
-            min_size: Minimum buffer size required
-        
-        Returns:
-            True if len(buffer) >= min_size
-        """
         return len(self) >= min_size
-    
+
     def clear(self) -> None:
-        """Clear all data from the buffer."""
         with self.lock:
-            self.positions.clear()
-            self.policies.clear()
-            self.values.clear()
+            self._size = 0
+            self._head = 0
 
     def set_max_size(self, new_max_size: int) -> None:
-        """Resize the buffer capacity, keeping the most recent entries."""
         if new_max_size <= 0:
             return
         with self.lock:
             if new_max_size == self.max_size:
                 return
-            self.positions = deque(list(self.positions)[-new_max_size:], maxlen=new_max_size)
-            self.policies = deque(list(self.policies)[-new_max_size:], maxlen=new_max_size)
-            self.values = deque(list(self.values)[-new_max_size:], maxlen=new_max_size)
+            # Extract current data in logical order
+            logical_data = self._get_all_unlocked()
+            n_keep = min(len(logical_data), new_max_size)
+            kept = logical_data[-n_keep:] if n_keep > 0 else []
+
             self.max_size = new_max_size
-    
+            self._positions = np.empty(new_max_size, dtype=object)
+            self._policies = np.empty(new_max_size, dtype=object)
+            self._values = np.zeros(new_max_size, dtype=np.float32)
+            self._size = n_keep
+            self._head = 0
+
+            for i, (pos, pol, val) in enumerate(kept):
+                self._positions[i] = pos
+                self._policies[i] = pol
+                self._values[i] = val
+            self._head = n_keep % max(1, new_max_size)
+
+    def _get_all_unlocked(self) -> List[Tuple]:
+        """Return all entries as a list in logical order (oldest first)."""
+        if self._size == 0:
+            return []
+        result = []
+        for i in range(self._size):
+            phys = self._logical_to_physical(i)
+            result.append((self._positions[phys], self._policies[phys], self._values[phys]))
+        return result
+
     def get_stats(self) -> dict:
-        """
-        Return buffer statistics for monitoring.
-        
-        Returns:
-            dict with keys: size, capacity, fill_ratio, value_mean, value_std
-        """
         with self.lock:
-            size = len(self.positions)
-            
-            if size == 0:
+            if self._size == 0:
                 return {
                     "size": 0,
                     "capacity": self.max_size,
@@ -142,30 +130,28 @@ class ReplayBuffer:
                     "value_mean": 0.0,
                     "value_std": 0.0,
                 }
-            
-            values_array = np.array(list(self.values))
-            
+
+            values_array = self._values[:self._size] if self._size < self.max_size else self._values
+
             return {
-                "size": size,
+                "size": self._size,
                 "capacity": self.max_size,
-                "fill_ratio": size / self.max_size,
+                "fill_ratio": self._size / self.max_size,
                 "value_mean": float(values_array.mean()),
                 "value_std": float(values_array.std()),
             }
 
     def save_to_npz(self, file_path: str) -> None:
-        """Persist the buffer to a compressed .npz file."""
         with self.lock:
-            size = len(self.positions)
-            if size == 0:
+            if self._size == 0:
                 return
-            positions = np.stack(list(self.positions))
-            policies = np.stack(list(self.policies))
-            values = np.array(list(self.values), dtype=np.float32)
+            data = self._get_all_unlocked()
+            positions = np.stack([d[0] for d in data])
+            policies = np.stack([d[1] for d in data])
+            values = np.array([d[2] for d in data], dtype=np.float32)
         np.savez_compressed(file_path, positions=positions, policies=policies, values=values)
 
     def load_from_npz(self, file_path: str) -> None:
-        """Load the buffer from a .npz file, keeping the most recent entries if oversized."""
         data = np.load(file_path)
         positions = data["positions"]
         policies = data["policies"]
@@ -174,13 +160,19 @@ class ReplayBuffer:
         if len(positions) == 0:
             return
 
-        # Keep the most recent samples if file exceeds max_size
         if len(positions) > self.max_size:
             positions = positions[-self.max_size:]
             policies = policies[-self.max_size:]
             values = values[-self.max_size:]
 
         with self.lock:
-            self.positions = deque(list(positions), maxlen=self.max_size)
-            self.policies = deque(list(policies), maxlen=self.max_size)
-            self.values = deque(list(values), maxlen=self.max_size)
+            self._size = len(positions)
+            self._head = 0
+            self._positions = np.empty(self.max_size, dtype=object)
+            self._policies = np.empty(self.max_size, dtype=object)
+            self._values = np.zeros(self.max_size, dtype=np.float32)
+            for i in range(self._size):
+                self._positions[i] = np.array(positions[i], dtype=np.float16)
+                self._policies[i] = np.array(policies[i], dtype=np.float16)
+                self._values[i] = np.float32(values[i])
+            self._head = self._size % self.max_size

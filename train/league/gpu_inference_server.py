@@ -253,6 +253,10 @@ class GPUInferenceServer:
             with self.response_lock:
                 self.response_queues.pop(request_id, None)
     
+    # NOTE: The thread-based _run() loop below is the LEGACY path.
+    # The production active path is gpu_inference_process.py which uses
+    # a dedicated process and handles __BATCH__ messages.
+    # See gpu_inference_server_main() in that module.
     def _run(self) -> None:
         """Main server loop: receive requests, batch and eval, send results."""
         logger.info("Server thread started")

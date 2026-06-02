@@ -11,9 +11,10 @@ import os
 import time
 import json
 import chess.pgn
+from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
 from concurrent.futures import ThreadPoolExecutor
 
@@ -24,6 +25,7 @@ from core.data import (
     ChessDataset,
     load_lichess_puzzles,
     load_training_examples_from_chess_pgns,
+    create_balanced_concat_dataloader,
 )
 from core.constants import (
     MODEL_CONFIG, CURRICULUM_CONFIG, TRAINING_CONFIG, HARDWARE_CONFIG
@@ -322,17 +324,30 @@ def phase2_transition(model, variant, checkpoint_dir, generate_games_fn=None):
     )
     
     datasets = [selfplay_dataset]
+    source_weights = [1.0]
+    print(f"  self-play: {len(selfplay_dataset)} samples")
+
     if supervised_dataset is not None:
         datasets.append(supervised_dataset)
-    datasets.append(puzzle_dataset)
+        source_weights.append(1.0)
+        print(f"  supervised: {len(supervised_dataset)} samples")
 
-    combined_dataset = ConcatDataset(datasets)
-    
-    dataloader = _create_dataloader(
-        combined_dataset,
+    if puzzle_dataset is not None:
+        datasets.append(puzzle_dataset)
+        source_weights.append(1.5)
+        print(f"  puzzles: {len(puzzle_dataset)} samples")
+
+    dataloader = create_balanced_concat_dataloader(
+        datasets,
         batch_size=CURRICULUM_CONFIG['phase1_batch_size'],
-        shuffle=True
+        source_weights=source_weights,
+        num_workers=HARDWARE_CONFIG.get('dataloader_workers', 4),
+        pin_memory=device.type == 'cuda',
+        persistent_workers=HARDWARE_CONFIG.get('dataloader_workers', 4) > 0,
+        prefetch_factor=HARDWARE_CONFIG.get('prefetch_factor', 2),
     )
+
+    print(f"  balanced mix: {len(dataloader.dataset)} samples total")
     
     optimizer = torch.optim.SGD(
         model.parameters(),

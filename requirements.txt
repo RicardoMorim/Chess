@@ -5,5 +5,6 @@ torch
 psutil
 optuna
 pytorch-lightning
+torchmetrics==1.2.1
 wandb
 Cython

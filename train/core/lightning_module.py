@@ -27,8 +27,9 @@ class ChessLightning(pl.LightningModule if pl is not None else object):
         variant: Model variant name passed to ``create_model`` (e.g. 'baseline').
         lr_epochs: Number of epochs used to construct the scheduler.
         config: Optional training config; falls back to TRAIN_CONFIG.
+        value_dropout: Dropout rate for value head (0.0 = no dropout).
     """
-    def __init__(self, variant: str = 'baseline', lr_epochs: int = 10, config: typing.Optional[dict] = None):
+    def __init__(self, variant: str = 'baseline', lr_epochs: int = 10, config: typing.Optional[dict] = None, value_dropout: float = 0.0):
         if pl is None:
             raise ImportError(
                 "pytorch_lightning is required to instantiate ChessLightning "
@@ -37,7 +38,7 @@ class ChessLightning(pl.LightningModule if pl is not None else object):
         super().__init__()
         self.save_hyperparameters()
         self.config = config or TRAIN_CONFIG
-        self.model = create_model(variant)
+        self.model = create_model(variant, value_dropout=value_dropout)
 
         # Loss helpers
         self.policy_loss = PolicyLoss()

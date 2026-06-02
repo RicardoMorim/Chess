@@ -72,7 +72,7 @@ def main():
         checkpoint_dir=str(checkpoint_dir),
         log_dir=str(log_dir),
         device=device,
-        use_gpu_batching=True
+        use_gpu_batching=True  # GPU-batched MCTS for maximum throughput
     )
     
     # Import model constructor

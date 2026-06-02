@@ -9,8 +9,9 @@ import hashlib
 import random
 import glob
 import time
+from functools import lru_cache
 from pathlib import Path
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, ConcatDataset, DataLoader, WeightedRandomSampler
 
 from .constants import promotion_moves
 
@@ -20,41 +21,17 @@ def get_move_index(move):
         return promotion_moves[(move.from_square, move.to_square, move.promotion)]
     return move.from_square * 64 + move.to_square
 
-def board_to_tensor(board, move_number=None, input_channels=22):
-    """Convert a chess board to a tensor representation.
-    
-    Channel layout for 22-channel (big) model:
-    - 0-5:   White pieces (P, N, B, R, Q, K)
-    - 6-11:  Black pieces (p, n, b, r, q, k)
-    - 12-15: Castling rights (WK, WQ, BK, BQ)
-    - 16:    En passant square
-    - 17:    Side to move (1 = white, 0 = black)
-    - 18:    Halfmove clock (for 50-move rule)
-    - 19:    Fullmove number
-    - 20:    White attack map (squares attacked by white)
-    - 21:    Black attack map (squares attacked by black)
-    
-    Channel layout for 18-channel (small) model:
-    - 0-5:   White pieces
-    - 6-11:  Black pieces
-    - 12-15: Castling rights
-    - 16:    En passant
-    - 17:    Side to move
 
-    Args:
-        board: The chess.Board object
-        move_number: The move number (only used for 20-channel model)
-        input_channels: Number of input channels (18, 20, or 22)
-    
-    Returns:
-        numpy array of shape (input_channels, 8, 8)
-    """
-    # Only 18, 20, or 22 channels supported (no 119-channel AlphaZero)
+@lru_cache(maxsize=4096)
+def _board_to_tensor_cached(fen: str, move_number: int, input_channels: int):
+    """Cached inner implementation: FEN + scalars -> tensor."""
+    board = chess.Board(fen)
+    # Only 18, 20, or 22 channels supported
     if input_channels not in [18, 20, 22]:
         raise ValueError(f"Unsupported input_channels: {input_channels}. Use 18, 20, or 22.")
 
     tensor = np.zeros((input_channels, 8, 8), dtype=np.float32)
-    
+
     # Piece positions (channels 0-11)
     for piece_type in chess.PIECE_TYPES:
         for color in chess.COLORS:
@@ -62,30 +39,30 @@ def board_to_tensor(board, move_number=None, input_channels=22):
                 row, col = divmod(square, 8)
                 channel = piece_type - 1 if color == chess.WHITE else piece_type + 5
                 tensor[channel, row, col] = 1.0
-    
+
     # Castling rights (channels 12-15)
     tensor[12, :, :] = float(board.has_kingside_castling_rights(chess.WHITE))
     tensor[13, :, :] = float(board.has_queenside_castling_rights(chess.WHITE))
     tensor[14, :, :] = float(board.has_kingside_castling_rights(chess.BLACK))
     tensor[15, :, :] = float(board.has_queenside_castling_rights(chess.BLACK))
-    
+
     # En passant square (channel 16)
     if board.ep_square is not None:
         row, col = divmod(board.ep_square, 8)
         tensor[16, row, col] = 1.0
-    
+
     # Side to move (channel 17)
     tensor[17, :, :] = 1.0 if board.turn == chess.WHITE else 0.0
-    
+
     # Extended features for larger models
     if input_channels >= 20:
         # Halfmove clock normalized (channel 18)
         tensor[18, :, :] = min(board.halfmove_clock / 50.0, 1.0)
-        
+
         # Move number normalized (channel 19)
         move_num = move_number if move_number is not None else board.fullmove_number
         tensor[19, :, :] = min(move_num / 200.0, 1.0)
-    
+
     # Attack maps for 22-channel model
     if input_channels >= 22:
         # White attacks (channel 20)
@@ -93,7 +70,7 @@ def board_to_tensor(board, move_number=None, input_channels=22):
             if board.is_attacked_by(chess.WHITE, square):
                 row, col = divmod(square, 8)
                 tensor[20, row, col] = 1.0
-        
+
         # Black attacks (channel 21)
         for square in chess.SQUARES:
             if board.is_attacked_by(chess.BLACK, square):
@@ -101,6 +78,13 @@ def board_to_tensor(board, move_number=None, input_channels=22):
                 tensor[21, row, col] = 1.0
 
     return tensor
+
+
+def board_to_tensor(board, move_number=None, input_channels=22):
+    """Convert a chess board to a tensor representation (LRU-cached by FEN)."""
+    if move_number is None:
+        move_number = board.fullmove_number
+    return _board_to_tensor_cached(board.fen(), move_number, input_channels)
 
 
 class ChessDataset(Dataset):
@@ -993,6 +977,93 @@ def load_training_examples_from_chess_pgns(root_dir=None, include_games=True, in
             max_files=max_puzzle_files,
         )
     return result
+
+
+def compute_source_sample_weights(datasets, source_weights=None):
+    """Compute per-sample weights for a concatenated dataset mix.
+
+    Each source dataset receives the relative weight specified in
+    ``source_weights`` and is normalized by its length so that shorter
+    sources are not drowned out by larger ones.
+
+    Args:
+        datasets: Sequence of datasets to concatenate.
+        source_weights: Optional per-source weights. Defaults to 1.0 each.
+
+    Returns:
+        List of per-sample weights aligned with ``ConcatDataset`` ordering.
+    """
+    datasets = list(datasets)
+    if source_weights is None:
+        source_weights = [1.0] * len(datasets)
+
+    if len(source_weights) != len(datasets):
+        raise ValueError(
+            f"source_weights length ({len(source_weights)}) must match datasets length ({len(datasets)})"
+        )
+
+    weights = []
+    for dataset, source_weight in zip(datasets, source_weights):
+        length = len(dataset)
+        if length <= 0:
+            continue
+
+        per_sample_weight = float(source_weight) / float(length)
+        weights.extend([per_sample_weight] * length)
+
+    if not weights:
+        raise ValueError("Cannot compute sample weights from an empty dataset mix")
+
+    return weights
+
+
+def create_balanced_concat_dataloader(
+    datasets,
+    batch_size,
+    source_weights=None,
+    num_workers=0,
+    pin_memory=False,
+    persistent_workers=False,
+    prefetch_factor=None,
+    replacement=True,
+):
+    """Create a balanced DataLoader over multiple datasets.
+
+    This keeps small but important sources like puzzle positions visible during
+    training instead of letting the largest dataset dominate every batch.
+    """
+    datasets = [dataset for dataset in datasets if len(dataset) > 0]
+    if not datasets:
+        raise ValueError("No non-empty datasets were provided")
+
+    if source_weights is None:
+        source_weights = [1.0] * len(datasets)
+
+    if len(source_weights) != len(datasets):
+        raise ValueError(
+            f"source_weights length ({len(source_weights)}) must match non-empty datasets length ({len(datasets)})"
+        )
+
+    weights = compute_source_sample_weights(datasets, source_weights)
+    sampler = WeightedRandomSampler(
+        weights=torch.as_tensor(weights, dtype=torch.double),
+        num_samples=len(weights),
+        replacement=replacement,
+    )
+
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "sampler": sampler,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "drop_last": False,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = persistent_workers
+        if prefetch_factor is not None:
+            loader_kwargs["prefetch_factor"] = prefetch_factor
+
+    return DataLoader(ConcatDataset(datasets), **loader_kwargs)
 
 
 def filter_and_prioritize_puzzles_cached(puzzles, cache_dir="./cache"):

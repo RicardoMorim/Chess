@@ -30,8 +30,10 @@ TRAIN_CONFIG = {
     'grad_clip': 1.0,             # Max gradient norm
     
     # Loss weights
+    # Policy head has 4672 outputs, value head has 1. Equal weighting
+    # means value gradient is ~4672x smaller. Compensate with value_weight.
     'policy_weight': 1.0,         # Policy loss weight
-    'value_weight': 1.0,          # Value loss weight
+    'value_weight': 10.0,          # Value loss weight (compensates for 4672:1 output ratio)
     'puzzle_policy_weight': 3.0,  # Higher weight for puzzles (was 2.0)
     'puzzle_value_weight': 2.5,   # Value weight for puzzles (was 2.0)
     
@@ -78,6 +80,44 @@ class PolicyLoss(nn.Module):
             return -(targets * log_probs).sum(dim=1).mean()
 
 
+class FocalPolicyLoss(nn.Module):
+    """Focal loss for policy learning - focuses on hard examples.
+    
+    Down-weights well-classified examples so the model concentrates on
+    hard-to-classify moves (critical for tactical sharpness).
+    
+    Args:
+        gamma: Focusing parameter (>=0). gamma=0 is standard CE, gamma=2 is typical.
+    """
+    def __init__(self, gamma=2.0):
+        super().__init__()
+        self.gamma = gamma
+        self.ce_loss = nn.CrossEntropyLoss(reduction='none')
+    
+    def forward(self, logits, targets, legal_mask: torch.Tensor = None):
+        if legal_mask is not None:
+            assert legal_mask.any(dim=1).all(), \
+                "No legal moves in mask - corrupted position detected"
+            logits = logits.masked_fill(~legal_mask, float('-inf'))
+            if targets.dim() == 1:
+                target_legal = legal_mask.gather(1, targets.unsqueeze(1)).squeeze(1)
+                assert target_legal.all(), \
+                    "Target move is illegal - data corruption detected"
+        
+        if targets.dim() == 1:
+            # Hard targets: apply focal weighting to cross-entropy
+            ce = self.ce_loss(logits, targets)  # (B,)
+            with torch.no_grad():
+                probs = F.softmax(logits, dim=1)
+                pt = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+                focal_weight = (1 - pt) ** self.gamma
+            return (focal_weight * ce).mean()
+        else:
+            # Soft targets: standard KL with focal-like temperature scaling
+            log_probs = F.log_softmax(logits, dim=1)
+            return -(targets * log_probs).sum(dim=1).mean()
+
+
 class ValueLoss(nn.Module):
     """Value loss with optional Huber loss for robustness."""
     def __init__(self, use_huber=False, delta=1.0):
@@ -90,6 +130,55 @@ class ValueLoss(nn.Module):
     
     def forward(self, pred, target):
         return self.loss_fn(pred.squeeze(), target)
+
+
+# ============================================================================
+# EXPONENTIAL MOVING AVERAGE
+# ============================================================================
+
+class EMA:
+    """Exponential Moving Average of model parameters for stable inference.
+    
+    Maintains a shadow copy of model weights updated via:
+        shadow = decay * shadow + (1 - decay) * model_weight
+    
+    Usage:
+        ema = EMA(model, decay=0.999)
+        # After each training step:
+        ema.update()
+        # For inference:
+        with ema.averaged():
+            ...  # model has EMA weights
+    
+    Args:
+        model: The model to track
+        decay: EMA decay rate (default 0.999)
+    """
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.model = model
+        self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        self.backup = {}
+    
+    def update(self):
+        with torch.no_grad():
+            for name, param in self.model.state_dict().items():
+                self.shadow[name] = self.decay * self.shadow[name] + (1 - self.decay) * param
+    
+    def apply_shadow(self):
+        self.backup = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
+        self.model.load_state_dict(self.shadow)
+    
+    def restore(self):
+        self.model.load_state_dict(self.backup)
+        self.backup = {}
+    
+    def __enter__(self):
+        self.apply_shadow()
+        return self.model
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.restore()
 
 
 # ============================================================================
@@ -175,33 +264,42 @@ def create_scheduler(optimizer, num_epochs, config=None, warmup_epochs=5):
 # MAIN TRAINING FUNCTION
 # ============================================================================
 def train_batch(model, game_dataloader, puzzle_dataloader, save_path, state_file, 
-                epochs=5, processed_games=0, device='cuda', use_sgd=True):
+                epochs=5, processed_games=0, device='cuda', use_sgd=True,
+                optimizer=None, use_focal=False):
     """Train the model on a batch of games and puzzles.
     
+    Args:
+        optimizer: Optional pre-created optimizer (prevents momentum resets
+                   across calls). If None, creates a fresh one.
+        use_focal: If True, use FocalPolicyLoss instead of PolicyLoss.
+    
     Improvements over original:
+    - Accepts external optimizer to preserve momentum across calls
+    - Optional focal loss for hard-example focus
     - Option to use SGD with momentum (AlphaZero-style)
     - Gradient clipping for stability
     - Better loss weighting
     - Support for soft policy targets
     """
-    # Create optimizer
-    if use_sgd:
-        optimizer = torch.optim.SGD(
-            model.parameters(), 
-            lr=TRAIN_CONFIG['sgd_lr'],  # Use config value
-            momentum=0.9, 
-            weight_decay=1e-4,
-            nesterov=True,
-            fused=True if torch.cuda.is_available() else False
-        )
-    else:
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4, fused=True if torch.cuda.is_available() else False)
+    # Create optimizer only if not provided externally
+    if optimizer is None:
+        if use_sgd:
+            optimizer = torch.optim.SGD(
+                model.parameters(), 
+                lr=TRAIN_CONFIG['sgd_lr'],
+                momentum=0.9, 
+                weight_decay=1e-4,
+                nesterov=True,
+                fused=True if torch.cuda.is_available() else False
+            )
+        else:
+            optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4, fused=True if torch.cuda.is_available() else False)
     
     # Use scheduler with warmup
     scheduler = create_scheduler(optimizer, epochs, TRAIN_CONFIG)
     
     # Loss functions
-    policy_loss_fn = PolicyLoss()
+    policy_loss_fn = FocalPolicyLoss() if use_focal else PolicyLoss()
     value_loss_fn = ValueLoss(use_huber=True)  # Huber loss is more robust
     
     # Gradient scaler for mixed precision

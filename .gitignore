@@ -14,4 +14,8 @@ cache*
 
 /train/checkpoints*
 /train/checkpoints_league/*
+lightning_logs/
+*.ckpt
+wandb/
+/train/logs/
 

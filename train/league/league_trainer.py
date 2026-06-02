@@ -17,10 +17,13 @@ Architecture:
 - Checkpointing: Periodic snapshots for replay and regression detection
 """
 
+import math
 import torch
 import torch.multiprocessing as mp
 import torch.optim as optim
+from torch.optim.lr_scheduler import LambdaLR
 from concurrent.futures import ThreadPoolExecutor
+import json
 import os
 import sys
 import logging
@@ -36,6 +39,7 @@ from league.replay_buffer import ReplayBuffer
 from league.self_play_worker import self_play_worker
 from league.monitoring import MetricsCollector
 from league.evaluator import Evaluator
+from league.evolution_logger import EvolutionLogger
 from league.gpu_inference_process import gpu_inference_server_main
 
 logger = logging.getLogger(__name__)
@@ -70,6 +74,16 @@ class LeagueTrainer:
     METRICS_EVERY_N_ROUNDS = 5
     BUFFER_SAVE_EVERY_N_ROUNDS = 5
 
+    # Loss weighting
+    # Policy head has 4672 outputs, value head has 1 — equal weighting
+    # means value gradient is ~4672x smaller. These multipliers compensate.
+    POLICY_LOSS_WEIGHT = 1.0
+    VALUE_LOSS_WEIGHT = 10.0  # Boost value head gradient
+
+    # LR schedule (CosineAnnealing over training steps)
+    LR_SCHEDULE_STEPS = 1000  # Total steps for cosine decay
+    LR_WARMUP_STEPS = 50  # Linear warmup before decay
+
     # Devices / concurrency
     SELF_PLAY_DEVICE = "cpu"  # Safer: avoids many CUDA contexts across worker processes
     SELF_PLAY_VARIANT_PARALLELISM = 3  # How many variants generate self-play concurrently
@@ -80,9 +94,9 @@ class LeagueTrainer:
     
     # MCTS hyperparameters (INTERMEDIATE - correct dual-budget approach)
     # Self-play: BALANCED generation of training data (GPU utilized 100%, VRAM 80%)
-    MCTS_VISITS_SELFPLAY = 12  # Throughput-optimized; lower for speed
+    MCTS_VISITS_SELFPLAY = 80  # Quality/speed sweet spot: better signal than 12, still fast
     # Evaluation: SLOWER, higher quality comparisons between models
-    MCTS_VISITS_EVAL = 64  # Meaningful search for model assessment
+    MCTS_VISITS_EVAL = 400  # Generous search for model strength assessment
     C_PUCT = 4.0
     TEMPERATURE = 1.0
     DIRICHLET_ALPHA = 0.3
@@ -110,8 +124,13 @@ class LeagueTrainer:
 
     # GPU-batched inference (self-play) tuning
     GPU_INFER_BATCH_SIZE = 64
-    GPU_INFER_POST_WAIT_MS = 3
-    GPU_MCTS_PARALLEL_WORKERS = 8
+    GPU_INFER_POST_WAIT_MS = 15
+    GPU_MCTS_PARALLEL_WORKERS = 2
+    GPU_EVAL_TIMEOUT_SEC = 90.0
+
+    # Result collection and stall monitoring
+    RESULT_QUEUE_POLL_SEC = 10.0
+    RESULT_STALL_WARN_SEC = 180.0
     
     def __init__(
         self,
@@ -138,9 +157,10 @@ class LeagueTrainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         
-        # Initialize models, optimizers, buffers
+        # Initialize models, optimizers, schedulers, buffers
         self.models = {}
         self.optimizers = {}
+        self.schedulers = {}
         self.buffers = {}
         self.model_configs = {}
         
@@ -149,7 +169,8 @@ class LeagueTrainer:
         
         # Metrics and evaluation
         self.metrics = MetricsCollector(str(self.log_dir))
-        self.evaluator = Evaluator(device=str(self.device))
+        self.evaluator = Evaluator(device=str(self.device), mcts_visits=self.MCTS_VISITS_EVAL)
+        self.evolution_logger = EvolutionLogger(str(self.log_dir))
         
         # Optional W&B tracking via environment configuration
         self.metrics.enable_wandb(
@@ -277,8 +298,8 @@ class LeagueTrainer:
             config = model_configs.get(variant, {})
             config = {"variant": variant, **config}
             
-            # Create model
-            model = model_constructor(**config)
+            # Create model (with value dropout for regularization)
+            model = model_constructor(**config, value_dropout=0.2)
             model.to(self.device)
             
             # Create optimizer
@@ -289,12 +310,21 @@ class LeagueTrainer:
                 weight_decay=1e-4,
             )
             
+            # Cosine decay scheduler with linear warmup
+            def lr_lambda(step):
+                if step < self.LR_WARMUP_STEPS:
+                    return step / self.LR_WARMUP_STEPS
+                progress = (step - self.LR_WARMUP_STEPS) / max(1, self.LR_SCHEDULE_STEPS - self.LR_WARMUP_STEPS)
+                return max(0.01, 0.5 * (1 + math.cos(math.pi * progress)))
+            scheduler = LambdaLR(optimizer, lr_lambda)
+            
             # Create replay buffer
             buffer = ReplayBuffer(max_size=self.REPLAY_BUFFER_MAX_SIZE)
             
             # Store
             self.models[variant] = model
             self.optimizers[variant] = optimizer
+            self.schedulers[variant] = scheduler
             self.buffers[variant] = buffer
             self.model_configs[variant] = config
             
@@ -340,11 +370,13 @@ class LeagueTrainer:
                 if isinstance(checkpoint, dict):
                     state_dict = checkpoint.get("state_dict") or checkpoint.get("model_state_dict") or checkpoint
                     opt_state = checkpoint.get("optimizer_state_dict")
+                    sched_state = checkpoint.get("scheduler_state_dict")
                     self.total_games = int(checkpoint.get("total_games", self.total_games))
                     self.total_training_steps = int(checkpoint.get("total_training_steps", self.total_training_steps))
                 else:
                     state_dict = checkpoint
                     opt_state = None
+                    sched_state = None
 
                 # Load model weights (non-strict for compatibility)
                 self.models[variant].load_state_dict(state_dict, strict=False)
@@ -355,6 +387,13 @@ class LeagueTrainer:
                         self.optimizers[variant].load_state_dict(opt_state)
                     except Exception as e:
                         logger.warning(f"{variant}: could not load optimizer state: {e}")
+
+                # Load scheduler state if present
+                if sched_state is not None and variant in self.schedulers:
+                    try:
+                        self.schedulers[variant].load_state_dict(sched_state)
+                    except Exception as e:
+                        logger.warning(f"{variant}: could not load scheduler state: {e}")
 
                 logger.info(f"Resumed {variant} from checkpoint: {path.name}")
                 max_step_loaded = max(max_step_loaded, int(step))
@@ -427,6 +466,7 @@ class LeagueTrainer:
                     self.GPU_INFER_BATCH_SIZE,
                     self.GPU_INFER_POST_WAIT_MS,
                     variant,
+                    str(self.log_dir / f"gpu_stats_{variant}.json"),
                 ),
                 name=f"{variant}_gpu_inference",
             )
@@ -442,7 +482,7 @@ class LeagueTrainer:
                 gpu_eval_payload = {
                     "request_queue": gpu_request_queue,
                     "response_queue": gpu_response_queues[worker_id],
-                    "timeout_sec": 30.0,
+                    "timeout_sec": self.GPU_EVAL_TIMEOUT_SEC,
                     "input_channels": input_channels,
                 }
 
@@ -479,28 +519,34 @@ class LeagueTrainer:
         sp_start = time.time()
         
         logger.info(f"{variant}: Waiting for {num_games_expected} games from {self._num_self_play_workers} workers...")
+        processed_reports = 0
+        last_progress_ts = time.time()
         
-        for _ in range(num_games_expected):
+        while processed_reports < num_games_expected:
             try:
-                # Timeout after 120 seconds to detect hung workers
-                result = queue.get(timeout=120.0)
-            except Exception as queue_timeout:
-                logger.error(f"{variant}: Timeout waiting for game result (worker may be hung). Games so far: {games_collected}/{num_games_expected}")
-                # Check which workers are still alive
+                result = queue.get(timeout=self.RESULT_QUEUE_POLL_SEC)
+            except Exception:
                 alive_count = sum(1 for p in processes if p.is_alive())
-                logger.error(f"{variant}: {alive_count}/{len(processes)} workers still alive")
-                
-                # Check if GPU server is alive
-                if gpu_server_proc is not None:
-                    if gpu_server_proc.is_alive():
-                        logger.error(f"{variant}: GPU inference process is ALIVE (may be stuck or not responding)")
-                    else:
-                        logger.error(f"{variant}: GPU inference process is DEAD (likely cause of worker failure)")
-                
+
+                now = time.time()
+                if now - last_progress_ts >= self.RESULT_STALL_WARN_SEC:
+                    gpu_status = "N/A"
+                    if gpu_server_proc is not None:
+                        gpu_status = "ALIVE" if gpu_server_proc.is_alive() else "DEAD"
+                    logger.warning(
+                        f"{variant}: No new game report for {self.RESULT_STALL_WARN_SEC:.0f}s. "
+                        f"Progress {processed_reports}/{num_games_expected} (games={games_collected}, errors={errors}), "
+                        f"workers_alive={alive_count}/{len(processes)}, gpu_proc={gpu_status}"
+                    )
+                    last_progress_ts = now
+
                 if alive_count == 0:
-                    logger.error(f"{variant}: All workers dead; aborting self-play phase")
+                    logger.error(f"{variant}: All workers stopped before collecting all reports; aborting self-play phase")
                     break
                 continue
+
+            processed_reports += 1
+            last_progress_ts = time.time()
             
             if "error" in result:
                 logger.error(f"Worker {result.get('worker_id', '?')} error: {result['error']}")
@@ -584,92 +630,105 @@ class LeagueTrainer:
         
         return games_collected
     
-    def train_model(self, variant: str) -> float:
+    def _train_one_step(self, variant: str) -> Optional[float]:
+        """Perform a single training step for a variant.
+
+        Returns the loss value, or None if the buffer is not ready.
         """
-        Train a model on its replay buffer.
-        
-        Args:
-            variant: Model variant to train
-        
-        Returns:
-            Average loss over training steps
-        """
-        
         buffer = self.buffers[variant]
         model = self.models[variant]
         optimizer = self.optimizers[variant]
-        
+
         if not buffer.is_ready(min_size=self.BATCH_SIZE):
-            logger.info(f"{variant}: Buffer not ready ({len(buffer)} < {self.BATCH_SIZE})")
             return None
-        
-        model.train()
-        total_loss = 0.0
-        
-        for step in range(self.TRAINING_STEPS_PER_ROUND):
-            try:
-                positions, policies, values = buffer.sample(self.BATCH_SIZE)
-                
-                # Convert to tensors
-                pos_tensor = torch.stack([torch.from_numpy(p).to(self.device) for p in positions])
-                policy_tensor = torch.stack([torch.from_numpy(p).to(self.device) for p in policies])
-                value_tensor = torch.tensor(values, dtype=torch.float32, device=self.device)
-                
-                # Forward pass
-                policy_logits, value_pred = model(pos_tensor)
-                
-                # Compute losses
-                policy_loss = torch.nn.functional.cross_entropy(policy_logits, policy_tensor)
-                value_loss = torch.nn.functional.mse_loss(value_pred.squeeze(), value_tensor)
-                
-                # Combine losses
-                loss = policy_loss + value_loss
-                
-                # Backward pass
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                
-                total_loss += loss.item()
-                self.total_training_steps += 1
-                
-                # Record metrics
-                self.metrics.record_training_step(
-                    variant,
-                    loss.item(),
-                    policy_loss.item(),
-                    value_loss.item(),
-                    optimizer.param_groups[0]["lr"],
-                )
-            
-            except Exception as e:
-                logger.error(f"{variant} training step {step} failed: {e}", exc_info=True)
-        
-        avg_loss = total_loss / self.TRAINING_STEPS_PER_ROUND
-        model.eval()
-        
+
+        try:
+            positions, policies, values = buffer.sample(self.BATCH_SIZE)
+
+            pos_tensor = torch.stack([torch.from_numpy(p).to(self.device) for p in positions])
+            policy_tensor = torch.stack([torch.from_numpy(p).to(self.device) for p in policies])
+            value_tensor = torch.tensor(values, dtype=torch.float32, device=self.device)
+
+            model.train()
+            policy_logits, value_pred = model(pos_tensor)
+
+            policy_loss = torch.nn.functional.cross_entropy(policy_logits, policy_tensor)
+            value_loss = torch.nn.functional.mse_loss(value_pred.squeeze(), value_tensor)
+            loss = self.POLICY_LOSS_WEIGHT * policy_loss + self.VALUE_LOSS_WEIGHT * value_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            # Step LR scheduler
+            if variant in self.schedulers:
+                self.schedulers[variant].step()
+
+            self.total_training_steps += 1
+
+            self.metrics.record_training_step(
+                variant,
+                loss.item(),
+                policy_loss.item(),
+                value_loss.item(),
+                optimizer.param_groups[0]["lr"],
+            )
+            return loss.item()
+        except Exception as e:
+            logger.error(f"{variant} step failed: {e}", exc_info=True)
+            return None
+
+    def train_model(self, variant: str) -> float:
+        """
+        Train a model on its replay buffer.
+
+        Args:
+            variant: Model variant to train
+
+        Returns:
+            Average loss over training steps
+        """
+        losses = []
+        for _ in range(self.TRAINING_STEPS_PER_ROUND):
+            loss = self._train_one_step(variant)
+            if loss is not None:
+                losses.append(loss)
+        if not losses:
+            return None
+        avg_loss = sum(losses) / len(losses)
         logger.info(f"{variant}: Training round complete, avg_loss={avg_loss:.4f}")
         return avg_loss
-    
+
     def train_all_models_parallel(self):
         """
-        Train all model variants in parallel using ThreadPoolExecutor.
-        Reduces wall-clock time by ~2.5x (GPU utilization: ~40% → ~85%).
-        
-        Each thread trains one variant on GPU (non-blocking). PyTorch handles
-        the GPU scheduling across threads safely.
+        Train all model variants.
+
+        On CUDA: interleave training steps across variants to keep the GPU
+        pipeline constantly fed (vs sequential per-variant which leaves the
+        GPU idle ~60% of the time).
+
+        On CPU: use ThreadPoolExecutor for parallelism.
         """
-        # On a single GPU, parallel training threads can increase VRAM fragmentation and reduce stability.
-        # Keep it sequential on CUDA; allow parallelism on CPU.
         if self.device.type == "cuda":
-            results = {}
+            # Interleaved: A1 B1 C1 A2 B2 C2 ... keeps GPU constantly busy
+            results = {v: [] for v in self.VARIANTS}
+            for step in range(self.TRAINING_STEPS_PER_ROUND):
+                for variant in self.VARIANTS:
+                    loss = self._train_one_step(variant)
+                    if loss is not None:
+                        results[variant].append(loss)
+
+            avg_results = {}
             for variant in self.VARIANTS:
-                loss = self.train_model(variant)
-                results[variant] = loss
-                if loss is not None:
-                    logger.info(f"✓ {variant}: training complete (loss={loss:.4f})")
-            return results
+                losses = results[variant]
+                if losses:
+                    avg = sum(losses) / len(losses)
+                    avg_results[variant] = avg
+                    logger.info(f"✓ {variant}: training complete (loss={avg:.4f})")
+                else:
+                    avg_results[variant] = None
+            return avg_results
 
         with ThreadPoolExecutor(max_workers=min(3, len(self.VARIANTS))) as executor:
             futures = {variant: executor.submit(self.train_model, variant) for variant in self.VARIANTS}
@@ -698,6 +757,7 @@ class LeagueTrainer:
         torch.save({
             "state_dict": model.state_dict(),
             "optimizer_state_dict": self.optimizers[variant].state_dict() if variant in self.optimizers else None,
+            "scheduler_state_dict": self.schedulers[variant].state_dict() if variant in self.schedulers else None,
             "config": self.model_configs[variant],
             "step": step,
             "variant": variant,
@@ -845,6 +905,16 @@ class LeagueTrainer:
             logger.info(f"{'='*60}\n")
             self.metrics.log_summary(f"Round {round_num} complete ({round_time:.1f}s)")
             self.metrics.log_wandb_summary(summary, step=round_num)
+            self._merge_gpu_stats_into_summary(summary)
+            self.evolution_logger.append_round(
+                round_num=round_num,
+                summary=summary,
+                round_time_seconds=round_time,
+                note=(
+                    f"games={self.total_games}, steps={self.total_training_steps}, "
+                    f"mcts={self._current_mcts_visits}"
+                ),
+            )
             if (round_num + 1) % self.METRICS_EVERY_N_ROUNDS == 0:
                 self.metrics.save_checkpoint(f"round_{round_num}")
             
@@ -1039,28 +1109,86 @@ class LeagueTrainer:
     
     def _run_evaluation_round(self, round_num: int) -> None:
         """
-        Run low-frequency evaluation against baseline.
+        Run a fair round-robin evaluation across the three variants.
         
         Args:
             round_num: Current round number
         """
         
         try:
-            # Check if we have a baseline checkpoint to test against
-            baseline_ckpts = list(self.checkpoint_dir.glob("baseline_step_*.pt"))
-            
-            if not baseline_ckpts:
-                logger.warning("No baseline checkpoints found for evaluation")
-                return
-            
-            # Use most recent baseline checkpoint
-            latest_baseline = sorted(baseline_ckpts)[-1]
-            logger.info(f"Evaluating against baseline: {latest_baseline}")
-            
-            # Load and evaluate (would need to implement full evaluation logic)
+            from league.fair_evaluation import build_fair_opening_fens
+
+            opening_suite = build_fair_opening_fens()
+            logger.info(
+                f"Running fair round-robin evaluation on {len(opening_suite)} shared opening positions"
+            )
+
+            results = self.evaluator.compare_all_variants(
+                models_by_variant=self.models,
+                starting_fens=opening_suite,
+            )
+
+            scoreboard = results.get("scoreboard", {})
+            for variant, stats in scoreboard.items():
+                avg_score = float(stats.get("avg_score", 0.0))
+                win_rate = float(stats.get("win_rate", 0.0))
+                elo = float(stats.get("estimated_elo_diff", 0.0))
+
+                self.metrics.set_gauge(f"{variant}_fair_score", avg_score, variant)
+                self.metrics.set_gauge(f"{variant}_fair_win_rate", win_rate, variant)
+                self.metrics.set_gauge(f"{variant}_fair_elo", elo, variant)
+
+                logger.info(
+                    f"FAIR EVAL {variant}: score={avg_score:.3f}, win_rate={win_rate:.1%}, elo≈{elo:.1f}"
+                )
+
+            self.evolution_logger.append_note(
+                f"Fair evaluation round {round_num}: "
+                + ", ".join(
+                    f"{variant}={scoreboard[variant].get('estimated_elo_diff', 0.0):.1f} ELO"
+                    for variant in self.VARIANTS
+                    if variant in scoreboard
+                )
+            )
+
+            for matchup, data in results.get("pairwise", {}).items():
+                current_variant = data.get("current_variant", matchup.split("_vs_")[0])
+                self.metrics.record_metric(
+                    f"fair_eval/{matchup}/win_rate",
+                    float(data.get("current_win_rate", 0.0)),
+                    variant=current_variant,
+                )
+                self.metrics.record_metric(
+                    f"fair_eval/{matchup}/elo",
+                    float(data.get("estimated_elo_diff", 0.0)),
+                    variant=current_variant,
+                )
+
+            self.metrics.save_checkpoint(f"fair_round_{round_num}")
             
         except Exception as e:
             logger.error(f"Evaluation round failed: {e}", exc_info=True)
+
+    def _merge_gpu_stats_into_summary(self, summary: Dict[str, Any]) -> None:
+        """Attach the latest GPU batching stats to the metrics summary for reporting."""
+        variants = summary.setdefault("variants", {})
+
+        for variant in self.VARIANTS:
+            stats_path = self.log_dir / f"gpu_stats_{variant}.json"
+            if not stats_path.exists():
+                continue
+
+            try:
+                stats = json.loads(stats_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+
+            v_summary = variants.setdefault(variant, {})
+            v_summary["gpu_avg_batch"] = float(stats.get("avg_batch_size", 0.0))
+            v_summary["gpu_flush_size"] = int(stats.get("flush_by_size", 0))
+            v_summary["gpu_flush_wait"] = int(stats.get("flush_by_wait", 0))
+            v_summary["gpu_processed_evals"] = int(stats.get("processed_evals", 0))
+            v_summary["gpu_total_batches"] = int(stats.get("total_batches", 0))
     
     def _model_constructor(self, **config):
         """

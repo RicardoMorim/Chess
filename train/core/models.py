@@ -70,6 +70,7 @@ class ChessNet(nn.Module):
         input_channels,
         num_blocks=15,
         channels=256,
+        value_dropout=0.0,
     ):
         super().__init__()
         self.input_channels = input_channels
@@ -88,6 +89,7 @@ class ChessNet(nn.Module):
         # Value head
         self.value_conv = nn.Conv2d(channels, 32, 1, bias=False)
         self.value_bn = nn.BatchNorm2d(32)
+        self.value_drop = nn.Dropout2d(p=value_dropout) if value_dropout > 0 else nn.Identity()
         self.value_fc1 = nn.Linear(32, 128)
         self.value_fc2 = nn.Linear(128, 1)
 
@@ -103,6 +105,7 @@ class ChessNet(nn.Module):
 
         # Value
         value = F.relu(self.value_bn(self.value_conv(x)))
+        value = self.value_drop(value)
         value = value.mean(dim=[2, 3])
         value = F.relu(self.value_fc1(value))
         value = torch.tanh(self.value_fc2(value))
@@ -128,6 +131,7 @@ class ESTNet(nn.Module):
         shared_blocks=5,
         policy_blocks=5,
         value_blocks=5,
+        value_dropout=0.0,
     ):
         super().__init__()
         self.input_channels = input_channels
@@ -161,6 +165,7 @@ class ESTNet(nn.Module):
         # Value head
         self.value_conv = nn.Conv2d(channels, 32, 1, bias=False)
         self.value_bn = nn.BatchNorm2d(32)
+        self.value_drop = nn.Dropout2d(p=value_dropout) if value_dropout > 0 else nn.Identity()
         self.value_fc1 = nn.Linear(32, 128)
         self.value_fc2 = nn.Linear(128, 1)
 
@@ -187,6 +192,7 @@ class ESTNet(nn.Module):
 
         # Value
         value = F.relu(self.value_bn(self.value_conv(value_x)))
+        value = self.value_drop(value)
         value = value.mean(dim=[2, 3])
         value = F.relu(self.value_fc1(value))
         value = torch.tanh(self.value_fc2(value))
@@ -198,7 +204,7 @@ class ESTNet(nn.Module):
 # FACTORY FUNCTIONS
 # =============================================================================
 
-def create_model(variant: str, **kwargs) -> nn.Module:
+def create_model(variant: str, value_dropout: float = 0.0, **kwargs) -> nn.Module:
     """
     Create a chess model.
     
@@ -207,15 +213,16 @@ def create_model(variant: str, **kwargs) -> nn.Module:
             - "baseline": ChessNet with 18 input channels
             - "attack": ChessNet with 22 input channels (attack maps)
             - "est": ESTNet with 18 input channels (early split trunk)
+        value_dropout: Dropout rate for value head (0.0 = no dropout)
         **kwargs: Additional arguments passed to the model constructor
     
     Returns:
         Configured model instance
     """
     factories = {
-        "baseline": lambda: ChessNet(input_channels=18, **kwargs),
-        "attack": lambda: ChessNet(input_channels=22, **kwargs),
-        "est": lambda: ESTNet(input_channels=18, **kwargs),
+        "baseline": lambda: ChessNet(input_channels=18, value_dropout=value_dropout, **kwargs),
+        "attack": lambda: ChessNet(input_channels=22, value_dropout=value_dropout, **kwargs),
+        "est": lambda: ESTNet(input_channels=18, value_dropout=value_dropout, **kwargs),
     }
     
     if variant not in factories:
