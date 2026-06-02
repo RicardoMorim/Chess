@@ -492,6 +492,60 @@ class CurriculumPuzzleDataset(Dataset):
                     "error")
 
 
+class ProGameDataset(Dataset):
+    """Dataset wrapping positions from labelled pro PGNs.
+
+    Stores compact (fen, move_uci, value_target) tuples; mirrors the board
+    horizontally for augmentation the same way ChessDataset does.
+    """
+
+    def __init__(self, samples, augment=True, model_type="big"):
+        # samples: list of (fen, move_uci, value_target)
+        self.augment = augment
+        self.model_type = model_type
+        model_lower = model_type.lower()
+        if model_lower in ["small", "limited"]:
+            self.input_channels = 18
+        elif model_lower == "medium":
+            self.input_channels = 20
+        else:
+            self.input_channels = 22
+        self.positions = []
+        for sample in samples:
+            fen, move_uci, value_target = sample[:3]
+            try:
+                move = chess.Move.from_uci(move_uci)
+                policy_target = get_move_index(move)
+            except Exception:
+                continue
+            self.positions.append((fen, policy_target, float(value_target)))
+            if self.augment:
+                try:
+                    mirrored_board = chess.Board(fen).mirror()
+                    mirrored_move = chess.Move(
+                        chess.square_mirror(move.from_square),
+                        chess.square_mirror(move.to_square),
+                        move.promotion,
+                    )
+                    mirrored_policy = get_move_index(mirrored_move)
+                    self.positions.append((mirrored_board.fen(), mirrored_policy, float(value_target)))
+                except Exception:
+                    pass
+
+    def __len__(self):
+        return len(self.positions)
+
+    def __getitem__(self, idx):
+        fen, policy_target, value_target = self.positions[idx]
+        board = chess.Board(fen)
+        input_tensor = board_to_tensor(board, 0, self.input_channels)
+        return (
+            torch.tensor(input_tensor, dtype=torch.float32),
+            torch.tensor(policy_target, dtype=torch.long),
+            torch.tensor(value_target, dtype=torch.float32),
+        )
+
+
 class SelfPlayDataset(Dataset):
     """Dataset for self-play reinforcement learning samples with model type support"""
     def __init__(self, samples, model_type="big"):

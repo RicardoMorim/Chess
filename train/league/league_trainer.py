@@ -21,6 +21,7 @@ import math
 import torch
 import torch.multiprocessing as mp
 import torch.optim as optim
+import chess
 from torch.optim.lr_scheduler import LambdaLR
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -41,6 +42,7 @@ from league.monitoring import MetricsCollector
 from league.evaluator import Evaluator
 from league.evolution_logger import EvolutionLogger
 from league.gpu_inference_process import gpu_inference_server_main
+from league.datasets import AuxDataConfig, AuxDataLoader
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -146,6 +148,23 @@ class LeagueTrainer:
     # Result collection and stall monitoring
     RESULT_QUEUE_POLL_SEC = 10.0
     RESULT_STALL_WARN_SEC = 180.0
+
+    # ------------------------------------------------------------------
+    # Auxiliary data injection (puzzles, pro PGNs, Stockfish eval)
+    # Each source has its own on/off toggle. Disable any source by
+    # setting the matching *_BATCHES_PER_GAME_BATCH constant to 0 OR
+    # flipping the corresponding USE_* flag.
+    # ------------------------------------------------------------------
+    USE_PUZZLE_INJECTION = True
+    USE_PRO_GAMES = True
+    USE_STOCKFISH_EVAL = True  # only used for pro-PGN labelling and benchmarking
+    PUZZLE_BATCHES_PER_GAME_BATCH = 1  # puzzle batches interleaved per self-play step
+    PROGAME_BATCHES_PER_GAME_BATCH = 1  # progame batches interleaved per self-play step
+    STOCKFISH_DEPTH_LABEL = 12   # depth when labelling pro PGN positions
+    STOCKFISH_DEPTH_BENCH = 15   # depth when benchmarking vs Stockfish
+    STOCKFISH_BENCH_NUM_GAMES = 20
+    STOCKFISH_BENCH_EVERY_N_ROUNDS = 25
+    STOCKFISH_BENCH_TIME_LIMIT_MS = 200
     
     def __init__(
         self,
@@ -218,6 +237,33 @@ class LeagueTrainer:
         # Adaptive MCTS visitation tracking
         self._current_mcts_visits = self.MCTS_VISITS_SELFPLAY
         self._throughput_history = {variant: [] for variant in self.VARIANTS}  # Rolling window of games/min
+
+        # Auxiliary data (puzzles, pro PGNs) — only built if a toggle is on
+        self.aux_config = AuxDataConfig(
+            use_puzzle_injection=self.USE_PUZZLE_INJECTION,
+            use_pro_games=self.USE_PRO_GAMES,
+            use_stockfish_eval=self.USE_STOCKFISH_EVAL,
+            stockfish_depth=self.STOCKFISH_DEPTH_LABEL,
+        )
+        self.aux_loader = AuxDataLoader(self.aux_config)
+        if self.USE_PUZZLE_INJECTION or self.USE_PRO_GAMES:
+            try:
+                self.aux_loader.initialize()
+                if self.aux_loader.is_ready():
+                    logger.info(
+                        f"Aux data: puzzles={'on' if self.aux_loader._puzzle_ready() else 'off'} "
+                        f"({len(self.aux_loader.puzzle_dataset) if self.aux_loader.puzzle_dataset is not None else 0}), "
+                        f"progames={'on' if self.aux_loader._progame_ready() else 'off'} "
+                        f"({len(self.aux_loader.progame_dataset) if self.aux_loader.progame_dataset is not None else 0})"
+                    )
+                else:
+                    logger.warning("Aux data toggles enabled but no datasets loaded; injection will be skipped")
+            except Exception as e:
+                logger.error(f"Aux data initialization failed: {e}", exc_info=True)
+                self.aux_loader = AuxDataLoader(self.aux_config)  # fall back to a clean no-op loader
+
+        # Stockfish benchmark helper (lazy; subprocess opened on first use)
+        self._stockfish_benchmark = None
         
         if self.use_gpu_batching:
             logger.info("GPU-batched inference enabled (EXPERIMENTAL)")
@@ -667,6 +713,11 @@ class LeagueTrainer:
         """Perform a single training step for a variant.
 
         Returns the loss value, or None if the buffer is not ready.
+
+        Interleaves puzzle + progame batches after the self-play batch when
+        the corresponding toggles + counts are > 0. All batches share the
+        same optimizer step (single forward+backward cycle per source per
+        ``_train_one_step`` call).
         """
         buffer = self.buffers[variant]
         model = self.models[variant]
@@ -692,6 +743,51 @@ class LeagueTrainer:
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            # Auxiliary puzzle batches (interleaved, same optimizer state)
+            puzzle_total_loss = 0.0
+            puzzle_batches_done = 0
+            if self.PUZZLE_BATCHES_PER_GAME_BATCH > 0:
+                for _ in range(self.PUZZLE_BATCHES_PER_GAME_BATCH):
+                    pz = self.aux_loader.sample_puzzle_batch(self.BATCH_SIZE)
+                    if pz is None:
+                        break
+                    pz_pos, pz_pol, pz_val = pz
+                    pz_pos = pz_pos.to(self.device)
+                    pz_pol = pz_pol.to(self.device)
+                    pz_val = pz_val.to(self.device)
+                    pz_logits, pz_vpred = model(pz_pos)
+                    pz_policy_loss = torch.nn.functional.cross_entropy(pz_logits, pz_pol)
+                    pz_value_loss = torch.nn.functional.mse_loss(pz_vpred.squeeze(), pz_val)
+                    # Puzzle weighting: same POLICY_WEIGHT, lighter VALUE_WEIGHT
+                    # (mated positions dominate value, so downweight)
+                    pz_loss = self.POLICY_LOSS_WEIGHT * pz_policy_loss + 2.5 * pz_value_loss
+                    pz_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    puzzle_total_loss += pz_loss.item()
+                    puzzle_batches_done += 1
+
+            # Auxiliary progame batches (interleaved, same optimizer state)
+            pro_total_loss = 0.0
+            pro_batches_done = 0
+            if self.PROGAME_BATCHES_PER_GAME_BATCH > 0:
+                for _ in range(self.PROGAME_BATCHES_PER_GAME_BATCH):
+                    pg = self.aux_loader.sample_progame_batch(self.BATCH_SIZE)
+                    if pg is None:
+                        break
+                    pg_pos, pg_pol, pg_val = pg
+                    pg_pos = pg_pos.to(self.device)
+                    pg_pol = pg_pol.to(self.device)
+                    pg_val = pg_val.to(self.device)
+                    pg_logits, pg_vpred = model(pg_pos)
+                    pg_policy_loss = torch.nn.functional.cross_entropy(pg_logits, pg_pol)
+                    pg_value_loss = torch.nn.functional.mse_loss(pg_vpred.squeeze(), pg_val)
+                    pg_loss = self.POLICY_LOSS_WEIGHT * pg_policy_loss + self.VALUE_LOSS_WEIGHT * pg_value_loss
+                    pg_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    pro_total_loss += pg_loss.item()
+                    pro_batches_done += 1
+
             optimizer.step()
 
             # Step LR scheduler
@@ -707,6 +803,18 @@ class LeagueTrainer:
                 value_loss.item(),
                 optimizer.param_groups[0]["lr"],
             )
+            if puzzle_batches_done > 0:
+                self.metrics.record_metric(
+                    f"{variant}_puzzle_loss",
+                    puzzle_total_loss / puzzle_batches_done,
+                    variant=variant,
+                )
+            if pro_batches_done > 0:
+                self.metrics.record_metric(
+                    f"{variant}_progame_loss",
+                    pro_total_loss / pro_batches_done,
+                    variant=variant,
+                )
             return loss.item()
         except Exception as e:
             logger.error(f"{variant} step failed: {e}", exc_info=True)
@@ -909,6 +1017,18 @@ class LeagueTrainer:
             if (round_num + 1) % self.EVAL_EVERY_N_ROUNDS == 0:
                 logger.info("Phase 5: Evaluation...")
                 self._run_evaluation_round(round_num)
+
+            # Stockfish benchmark (configurable cadence; only if toggle is on)
+            if (
+                self.USE_STOCKFISH_EVAL
+                and self.STOCKFISH_BENCH_EVERY_N_ROUNDS > 0
+                and (round_num + 1) % self.STOCKFISH_BENCH_EVERY_N_ROUNDS == 0
+            ):
+                logger.info("Phase 6: Stockfish benchmark...")
+                try:
+                    self._run_stockfish_benchmark(round_num)
+                except Exception as e:
+                    logger.warning(f"Stockfish benchmark failed (non-fatal): {e}")
             
             # Metrics summary
             round_time = time.time() - round_start
@@ -1139,6 +1259,57 @@ class LeagueTrainer:
                 self._current_mcts_visits = new_visits
         except Exception as e:
             logger.debug(f"Adaptive tuning failed (non-critical): {e}")
+
+    def _run_stockfish_benchmark(self, round_num: int) -> None:
+        """Play short model-vs-Stockfish games and log a score / ELO estimate.
+
+        Uses the baseline variant's current policy head with a one-argmax move
+        selection (no MCTS) for speed. This is an approximation of true
+        playing strength but is good enough to track progress over time.
+        """
+        from league.aux_phases import StockfishBenchmark
+
+        if self._stockfish_benchmark is None:
+            self._stockfish_benchmark = StockfishBenchmark(
+                depth=self.STOCKFISH_DEPTH_BENCH,
+                num_games=self.STOCKFISH_BENCH_NUM_GAMES,
+                time_limit_ms=self.STOCKFISH_BENCH_TIME_LIMIT_MS,
+            )
+
+        baseline = self.models.get("baseline")
+        if baseline is None:
+            logger.warning("Stockfish benchmark skipped: no 'baseline' variant loaded")
+            return
+
+        baseline.eval()
+        device = self.device
+
+        def model_move_fn(board: chess.Board):
+            import torch.nn.functional as F
+            with torch.no_grad():
+                from core.data import board_to_tensor
+                tensor = board_to_tensor(board, 0, 22)
+                inp = torch.tensor(tensor, dtype=torch.float32, device=device).unsqueeze(0)
+                logits, _ = baseline(inp)
+                # Mask illegal moves
+                mask = torch.full_like(logits, float("-inf"))
+                for m in board.legal_moves:
+                    mask[0, m.from_square * 64 + m.to_square] = 0.0
+                masked = logits + mask
+                idx = int(masked.argmax(dim=-1).item())
+                from_sq = idx // 64
+                to_sq = idx % 64
+                promo = None
+                return chess.Move(from_sq, to_sq, promo)
+
+        results = self._stockfish_benchmark.play_random_games(model_move_fn)
+        self.metrics.set_gauge("stockfish_bench/score", results["score"], variant="baseline")
+        self.metrics.set_gauge("stockfish_bench/elo_diff", results["elo_diff_estimate"], variant="baseline")
+        self.evolution_logger.append_note(
+            f"Stockfish bench round {round_num}: "
+            f"{results['wins']}W-{results['draws']}D-{results['losses']}L "
+            f"(score={results['score']:.2%}, elo_diff={results['elo_diff_estimate']:+.0f})"
+        )
     
     def _run_evaluation_round(self, round_num: int) -> None:
         """
