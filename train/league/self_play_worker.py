@@ -234,22 +234,10 @@ def play_game_batch_mcts(mcts, device, model_config, worker_id, gpu_eval: Option
         board.push(selected_move)
         move_count += 1
 
-    def _material_balance(b):
-        values = {
-            chess.PAWN: 1.0,
-            chess.KNIGHT: 3.0,
-            chess.BISHOP: 3.0,
-            chess.ROOK: 5.0,
-            chess.QUEEN: 9.0,
-        }
-        white = 0.0
-        black = 0.0
-        for piece_type, val in values.items():
-            white += val * len(b.pieces(piece_type, chess.WHITE))
-            black += val * len(b.pieces(piece_type, chess.BLACK))
-        return white - black
-
-    # Determine outcome and backfill values
+    # Determine outcome and backfill values.
+    # NOTE: A game that hits max_moves MUST be recorded as a draw, regardless
+    # of any heuristic material evaluation. Labelling it as a win/loss
+    # would corrupt the value targets (z) used for training.
     if resigned:
         # Side to move resigned; opponent wins.
         if board.turn == chess.WHITE:
@@ -270,16 +258,9 @@ def play_game_batch_mcts(mcts, device, model_config, worker_id, gpu_eval: Option
             white_result = 0.0
             end_reason = "draw"
         else:
-            # Adjudicate if game hit move cap (board.result() == "*")
-            score = _material_balance(board)
-            score_norm = max(-1.0, min(1.0, score / 39.0))
-            if score_norm > 0.2:
-                outcome = "1-0"
-            elif score_norm < -0.2:
-                outcome = "0-1"
-            else:
-                outcome = "1/2-1/2"
-            white_result = score_norm
+            # Game hit max_moves without a real result. Force a draw.
+            outcome = "1/2-1/2"
+            white_result = 0.0
             end_reason = "max_moves"
     
     # Backfill values (alternate signs for alternating colors)

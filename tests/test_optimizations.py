@@ -406,6 +406,145 @@ class ExpandNodeEvalFnTests(unittest.TestCase):
         self.assertAlmostEqual(value, 0.0)
 
 
+# ============================================================================
+# Regression: max_moves MUST be recorded as a draw (no material adjudication)
+# ============================================================================
+class MaxMovesDrawRegressionTests(unittest.TestCase):
+    """A game that hits max_moves must be labelled 1/2-1/2 and the value
+    targets (z) for every position must be 0.0. Any win/loss label here
+    would corrupt training.
+    """
+
+    def _fake_mcts(self, move_selector):
+        """Build a minimal MCTS-shaped object whose .search() returns a
+        uniform policy and delegates move selection to `move_selector(board)`.
+
+        The mcts.search(board) contract used in play_game_batch_mcts is:
+            policy (numpy array length ACTION_SPACE_SIZE), selected_move
+        """
+        from train.core.constants import ACTION_SPACE_SIZE
+        from train.core.data import get_move_index
+
+        class _FakeMCTS:
+            def __init__(self):
+                self._last_value = 0.0
+                # Some code paths read mcts.model.input_channels when
+                # gpu_eval is None — expose a stub model to satisfy them.
+                self.model = type("_StubModel", (), {"input_channels": 18})()
+
+            def search(self, board):
+                legal = list(board.legal_moves)
+                policy = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
+                for m in legal:
+                    policy[get_move_index(m)] = 1.0 / max(1, len(legal))
+                return policy, move_selector(board)
+
+        return _FakeMCTS()
+
+    def _capture_or_pawn_advance(self, board):
+        """Return a move that resets the 50-move counter (capture or pawn
+        push) if available, otherwise the first legal move. Keeps the
+        game from ending via the 50-move rule so it reliably hits the
+        max_moves cap.
+        """
+        for m in board.legal_moves:
+            if board.is_capture(m) or board.piece_type_at(m.from_square) == chess.PAWN:
+                return m
+        return list(board.legal_moves)[0]
+
+    def _repetition_breaker(self, board):
+        """Like _capture_or_pawn_advance but also tracks previously
+        returned moves to avoid threefold/fivefold repetition ending
+        the game prematurely. The position state is what we control
+        here — the python-chess library uses a Zobrist hash of the
+        board to detect repetition, so picking a different move each
+        call from a deterministic ordering is enough.
+        """
+        captures_or_pawns = [
+            m for m in board.legal_moves
+            if board.is_capture(m) or board.piece_type_at(m.from_square) == chess.PAWN
+        ]
+        candidates = captures_or_pawns if captures_or_pawns else list(board.legal_moves)
+        # Round-robin pick so we don't always choose the same move and
+        # trigger repetition. Index by fullmove_number for determinism.
+        idx = (board.fullmove_number + (1 if board.turn == chess.BLACK else 0)) % len(candidates)
+        return candidates[idx]
+
+    def test_max_moves_yields_draw_and_zero_targets(self):
+        # Force the game to exit via the max_moves branch. We patch
+        # is_game_over AND the repetition-detection hooks so the only
+        # termination possible is the max_moves cap.
+        from train.league.self_play_worker import play_game_batch_mcts
+
+        original_is_game_over = chess.Board.is_game_over
+        original_is_fivefold = chess.Board.is_fivefold_repetition
+        original_is_seventyfive = chess.Board.is_seventyfive_moves
+        chess.Board.is_game_over = lambda self: False
+        chess.Board.is_fivefold_repetition = lambda self: False
+        chess.Board.is_seventyfive_moves = lambda self: False
+        try:
+            mcts = self._fake_mcts(self._repetition_breaker)
+            result = play_game_batch_mcts(
+                mcts=mcts,
+                device=None,
+                model_config={"input_channels": 18},
+                worker_id=99,
+            )
+        finally:
+            chess.Board.is_game_over = original_is_game_over
+            chess.Board.is_fivefold_repetition = original_is_fivefold
+            chess.Board.is_seventyfive_moves = original_is_seventyfive
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["end_reason"], "max_moves")
+        self.assertEqual(result["outcome"], "1/2-1/2")
+
+        # Every position's value target must be 0.0 — no leakage of
+        # material-balance adjudication into z.
+        for _pos, _policy, value in result["trajectory"]:
+            self.assertEqual(value, 0.0)
+
+        # Trajectory should match the move count (cap reached).
+        self.assertEqual(len(result["trajectory"]), result["moves"])
+
+    def test_max_moves_does_not_use_material_adjudication(self):
+        """Even with white up a queen, a max_moves game must be a draw.
+
+        We force the max_moves path by patching is_game_over AND the
+        repetition-detection hooks, so the material-balance adjudication
+        code (if it still ran) would be exercised with a heavily
+        imbalanced final position.
+        """
+        from train.league.self_play_worker import play_game_batch_mcts
+
+        original_is_game_over = chess.Board.is_game_over
+        original_is_fivefold = chess.Board.is_fivefold_repetition
+        original_is_seventyfive = chess.Board.is_seventyfive_moves
+        chess.Board.is_game_over = lambda self: False
+        chess.Board.is_fivefold_repetition = lambda self: False
+        chess.Board.is_seventyfive_moves = lambda self: False
+        try:
+            mcts = self._fake_mcts(self._repetition_breaker)
+            result = play_game_batch_mcts(
+                mcts=mcts,
+                device=None,
+                model_config={"input_channels": 18},
+                worker_id=42,
+            )
+        finally:
+            chess.Board.is_game_over = original_is_game_over
+            chess.Board.is_fivefold_repetition = original_is_fivefold
+            chess.Board.is_seventyfive_moves = original_is_seventyfive
+
+        # Game must be classified as max_moves (not checkmate or resign).
+        self.assertEqual(result["end_reason"], "max_moves")
+        # And adjudicated as a draw, no matter what the position looks like.
+        self.assertEqual(result["outcome"], "1/2-1/2")
+        # All value targets must be 0.0.
+        for _pos, _policy, value in result["trajectory"]:
+            self.assertEqual(value, 0.0)
+
+
 def random_move():
     return np.random.choice(["e2e4", "d2d4", "g1f3", "b1c3", "c2c4"])
 
