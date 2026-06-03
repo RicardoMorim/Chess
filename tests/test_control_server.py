@@ -311,6 +311,65 @@ class ControlServerTests(unittest.TestCase):
         body = r.read()
         self.assertIn(b"<html>", body.lower())
 
+
+class ControlServerDashboardTests(unittest.TestCase):
+    """The dashboard (index.html, css, js) is served if the dir is configured."""
+
+    @classmethod
+    def setUpClass(cls):
+        import tempfile
+        cls.tmp = tempfile.mkdtemp()
+        cls.trainer = _make_trainer(cls.tmp)
+        from train.league.control_server import ControlServer
+        from pathlib import Path
+        cls.dashboard_dir = Path("train/league/dashboard")
+        cls.server = ControlServer(cls.trainer, host="127.0.0.1", port=0,
+                                  dashboard_dir=cls.dashboard_dir)
+        cls.server.start()
+        _wait_for_server(cls.server)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.stop(timeout=2.0)
+
+    def test_dashboard_files_served(self):
+        c = _conn(self.server)
+        for path, contains in [
+            ("/", b"Chess Trainer"),
+            ("/style.css", b"--bg"),
+            ("/dashboard.js", b"pollStatus"),
+        ]:
+            c.request("GET", path)
+            r = c.getresponse()
+            self.assertEqual(r.status, 200, f"{path} returned {r.status}")
+            body = r.read()
+            self.assertIn(contains, body, f"{path} missing {contains!r}")
+
+    def test_dashboard_has_spectate_modal(self):
+        c = _conn(self.server)
+        c.request("GET", "/")
+        r = c.getresponse()
+        body = r.read()
+        self.assertIn(b'spectate-modal', body)
+        self.assertIn(b'spectate-board', body)
+
+    def test_dashboard_has_mode_buttons(self):
+        c = _conn(self.server)
+        c.request("GET", "/")
+        r = c.getresponse()
+        body = r.read()
+        self.assertIn(b'data-mode="eco"', body)
+        self.assertIn(b'data-mode="balanced"', body)
+        self.assertIn(b'data-mode="boost"', body)
+
+    def test_path_escape_blocked(self):
+        """Dashboard dir traversal attempts are rejected."""
+        c = _conn(self.server)
+        c.request("GET", "/../league_trainer.py")
+        r = c.getresponse()
+        # Either 400 (path escape) or 404 — must NOT be 200 with file content
+        self.assertIn(r.status, (400, 404))
+
     def test_404_for_unknown_path(self):
         c = _conn(self.server)
         c.request("GET", "/api/nope")

@@ -44,6 +44,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
+
+class _SafeEncoder(json.JSONEncoder):
+    """JSON encoder that silently coerces non-serializable objects to strings.
+
+    This is a defense-in-depth measure: the snapshot helpers should already
+    produce JSON-safe values, but a stray MagicMock or torch.Tensor should
+    not crash the HTTP server. It gets stringified instead.
+    """
+
+    def default(self, o):
+        try:
+            return str(o)
+        except Exception:
+            return f"<unserializable {type(o).__name__}>"
+
 if TYPE_CHECKING:
     from .league_trainer import LeagueTrainer
 
@@ -125,13 +140,26 @@ def _resource_snapshot() -> Dict[str, Any]:
     return snap
 
 
+def _safe_float(v: Any) -> Optional[float]:
+    """Coerce a value to a JSON-safe float, returning None for anything weird."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f:  # NaN
+        return None
+    return f
+
+
 def _trainer_snapshot(trainer: "LeagueTrainer") -> Dict[str, Any]:
     """Status snapshot used by /api/status and the dashboard."""
     snap: Dict[str, Any] = {
-        "round": getattr(trainer, "round", 0),
-        "total_games": getattr(trainer, "total_games", 0),
-        "total_training_steps": getattr(trainer, "total_training_steps", 0),
-        "performance_mode": getattr(trainer, "performance_mode", "balanced"),
+        "round": int(getattr(trainer, "round", 0) or 0),
+        "total_games": int(getattr(trainer, "total_games", 0) or 0),
+        "total_training_steps": int(getattr(trainer, "total_training_steps", 0) or 0),
+        "performance_mode": str(getattr(trainer, "performance_mode", "balanced")),
         "auto_mode": bool(getattr(trainer, "_auto_mode", None) and trainer._auto_mode.config.enabled),
         "training_paused": bool(getattr(trainer, "_training_pause_event", None)
                                 and trainer._training_pause_event.is_set()),
@@ -146,20 +174,20 @@ def _trainer_snapshot(trainer: "LeagueTrainer") -> Dict[str, Any]:
     for variant in getattr(trainer, "VARIANTS", []):
         # Loss
         if metrics is not None and hasattr(metrics, "get_recent_loss"):
-            loss = metrics.get_recent_loss(variant)
-            snap["losses"][variant] = loss
+            snap["losses"][variant] = _safe_float(metrics.get_recent_loss(variant))
         # Throughput
         if metrics is not None and hasattr(metrics, "get_variant_throughput"):
-            tput = metrics.get_variant_throughput(variant)
-            snap["throughput_gpm"][variant] = tput
+            snap["throughput_gpm"][variant] = _safe_float(metrics.get_variant_throughput(variant))
         # Buffer fill
         buf = getattr(trainer, "buffers", {}).get(variant)
         if buf is not None and hasattr(buf, "get_stats"):
             stats = buf.get_stats()
+            size = int(stats.get("size", 0) or 0)
+            cap = int(stats.get("capacity", 0) or 0)
             snap["buffers"][variant] = {
-                "size": stats.get("size", 0),
-                "capacity": stats.get("capacity", 0),
-                "fill_pct": round(100.0 * stats.get("size", 0) / max(1, stats.get("capacity", 1)), 1),
+                "size": size,
+                "capacity": cap,
+                "fill_pct": round(100.0 * size / max(1, cap), 1),
             }
     return snap
 
@@ -297,7 +325,7 @@ class ControlServer(threading.Thread):
                 self.end_headers()
 
             def _send_json(self, payload: Any, code: int = 200) -> None:
-                body = json.dumps(payload).encode("utf-8")
+                body = json.dumps(payload, cls=_SafeEncoder).encode("utf-8")
                 self._set_json_headers(code)
                 self.wfile.write(body)
 

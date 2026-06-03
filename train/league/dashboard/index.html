@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Chess Trainer Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" defer></script>
+<script src="dashboard.js" defer></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">♞</span>
+    <span class="title">Chess Trainer</span>
+    <span id="round-pill" class="pill">round --</span>
+  </div>
+  <div class="mode-buttons" id="mode-buttons">
+    <button data-mode="eco" class="mode-btn">ECO</button>
+    <button data-mode="balanced" class="mode-btn active">BALANCED</button>
+    <button data-mode="boost" class="mode-btn">BOOST</button>
+  </div>
+  <div class="controls">
+    <label class="toggle">
+      <input type="checkbox" id="auto-mode-toggle">
+      <span>Auto</span>
+    </label>
+    <button id="pause-btn" class="ctrl">⏸ Pause</button>
+  </div>
+</header>
+
+<main>
+  <section class="card-grid">
+    <div class="metric-card">
+      <div class="label">Total games</div>
+      <div id="total-games" class="value">--</div>
+    </div>
+    <div class="metric-card">
+      <div class="label">Train steps</div>
+      <div id="total-steps" class="value">--</div>
+    </div>
+    <div class="metric-card">
+      <div class="label">Mode</div>
+      <div id="mode-value" class="value">--</div>
+    </div>
+    <div class="metric-card">
+      <div class="label">Paused</div>
+      <div id="paused-value" class="value">no</div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>System resources</h2>
+    <div class="bar-group">
+      <div class="bar-row">
+        <div class="bar-label">VRAM</div>
+        <div class="bar"><div id="bar-vram" class="bar-fill vram"></div></div>
+        <div class="bar-text" id="text-vram">--</div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-label">CPU</div>
+        <div class="bar"><div id="bar-cpu" class="bar-fill cpu"></div></div>
+        <div class="bar-text" id="text-cpu">--</div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-label">RAM</div>
+        <div class="bar"><div id="bar-ram" class="bar-fill ram"></div></div>
+        <div class="bar-text" id="text-ram">--</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Loss per variant</h2>
+    <div class="loss-charts">
+      <div class="loss-chart-wrap">
+        <canvas id="chart-baseline"></canvas>
+        <div class="loss-current" id="loss-baseline">--</div>
+      </div>
+      <div class="loss-chart-wrap">
+        <canvas id="chart-attack"></canvas>
+        <div class="loss-current" id="loss-attack">--</div>
+      </div>
+      <div class="loss-chart-wrap">
+        <canvas id="chart-est"></canvas>
+        <div class="loss-current" id="loss-est">--</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Throughput (games/min)</h2>
+    <div class="throughput-grid">
+      <div class="tput-cell">
+        <div class="tput-label">baseline</div>
+        <div class="tput-value" id="tput-baseline">--</div>
+      </div>
+      <div class="tput-cell">
+        <div class="tput-label">attack</div>
+        <div class="tput-value" id="tput-attack">--</div>
+      </div>
+      <div class="tput-cell">
+        <div class="tput-label">est</div>
+        <div class="tput-value" id="tput-est">--</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Replay buffers</h2>
+    <div class="buffer-grid" id="buffer-grid"></div>
+  </section>
+
+  <section class="card">
+    <h2>Checkpoints <span class="muted">(click to spectate)</span></h2>
+    <table class="ckpt-table">
+      <thead>
+        <tr>
+          <th>Variant</th><th>Step</th><th>Size</th><th>Age</th><th></th>
+        </tr>
+      </thead>
+      <tbody id="ckpt-tbody">
+        <tr><td colspan="5" class="muted">Loading...</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>Spectate</h2>
+    <p class="muted">Queue a match between two checkpoints (or try a puzzle drill).</p>
+    <form id="match-form" class="match-form">
+      <label>Type
+        <select id="match-type">
+          <option value="model">Model vs model</option>
+          <option value="puzzle">Puzzle drill</option>
+        </select>
+      </label>
+      <label>White <input id="match-white" value="baseline" placeholder="variant or 'baseline_step_35'"></label>
+      <label>Black <input id="match-black" value="attack" placeholder="variant or 'attack_step_35'"></label>
+      <label>Puzzle ID <input id="match-puzzle-id" placeholder="optional puzzle id"></label>
+      <label>Visits <input id="match-visits" type="number" value="100" min="10" max="1600"></label>
+      <button type="submit" class="primary">▶ Start match</button>
+    </form>
+    <div id="match-status" class="muted"></div>
+  </section>
+</main>
+
+<div id="spectate-modal" class="modal hidden">
+  <div class="modal-content">
+    <div class="modal-header">
+      <span id="spectate-title">Live match</span>
+      <button id="spectate-close" class="ctrl">✕</button>
+    </div>
+    <div class="spectate-body">
+      <div class="board-wrap">
+        <canvas id="spectate-board" width="384" height="384"></canvas>
+      </div>
+      <div class="eval-wrap">
+        <div class="eval-label">Position eval</div>
+        <div class="eval-bar"><div id="eval-bar-white" class="eval-bar-white"></div></div>
+        <div class="eval-value" id="eval-value">0.00</div>
+        <div class="moves-label">Moves</div>
+        <ol id="spectate-moves" class="moves-list"></ol>
+        <div class="spectate-status muted" id="spectate-status">starting...</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<footer class="footer">
+  <span id="last-update" class="muted">--</span>
+  <span class="muted">·</span>
+  <a href="/api/status" target="_blank">raw status</a>
+</footer>
+
+</body>
+</html>
