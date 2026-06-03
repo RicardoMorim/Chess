@@ -47,7 +47,7 @@ class AuxDataConfig:
         progames_dir: Optional[str] = None,
         progame_sample_cap: int = 50_000,
         progame_pgn_file_limit: int = 0,
-        cache_dir: str = "train/cache",
+        cache_dir: str = "",
         stockfish_depth: int = 12,
         stockfish_threads: int = 4,
         stockfish_hash_mb: int = 512,
@@ -63,7 +63,11 @@ class AuxDataConfig:
         self.progames_dir = progames_dir
         self.progame_sample_cap = progame_sample_cap
         self.progame_pgn_file_limit = progame_pgn_file_limit
-        self.cache_dir = cache_dir
+        # Default cache_dir to an absolute path (independent of CWD).
+        if cache_dir:
+            self.cache_dir = cache_dir
+        else:
+            self.cache_dir = str(Path(__file__).resolve().parent.parent / "cache")
         self.stockfish_depth = stockfish_depth
         self.stockfish_threads = stockfish_threads
         self.stockfish_hash_mb = stockfish_hash_mb

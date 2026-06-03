@@ -73,7 +73,7 @@ class ProgameLabeller:
         depth: int = 12,
         threads: int = 4,
         hash_mb: int = 512,
-        cache_dir: str = "train/cache/labelled_pgns",
+        cache_dir: str = "",
         positions_per_game_cap: int = 40,
         per_position_time_limit_sec: float = 600.0,
         num_workers: int = 0,
@@ -82,7 +82,17 @@ class ProgameLabeller:
         self.depth = depth
         self.threads = threads
         self.hash_mb = hash_mb
-        self.cache_dir = Path(cache_dir)
+        # Resolve cache_dir to an ABSOLUTE path so the cache location is
+        # independent of the current working directory. The default
+        # "<repo>/train/cache/labelled_pgns" is computed from this file's
+        # location; if the user passes a relative path it is resolved
+        # against the current working directory instead.
+        if cache_dir:
+            self.cache_dir = Path(cache_dir)
+            if not self.cache_dir.is_absolute():
+                self.cache_dir = Path(os.getcwd()) / cache_dir
+        else:
+            self.cache_dir = Path(__file__).resolve().parent.parent / "cache" / "labelled_pgns"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.positions_per_game_cap = positions_per_game_cap
         self.per_position_time_limit_sec = per_position_time_limit_sec
@@ -124,7 +134,11 @@ class ProgameLabeller:
                 h.update(str(int(st.st_mtime)).encode())
             except OSError:
                 continue
-        h.update(f"d{self.depth}t{self.threads}c{self.positions_per_game_cap}".encode())
+        # Only include settings that actually affect the OUTPUT.
+        # threads / hash_mb do NOT change centipawn values, so they must NOT
+        # invalidate the cache (changing parallelism between runs would
+        # otherwise force a full re-label).
+        h.update(f"d{self.depth}c{self.positions_per_game_cap}".encode())
         return h.hexdigest()[:16]
 
     def label_pgns(self, pgn_files: List[str]) -> List[Tuple[str, str, float]]:
