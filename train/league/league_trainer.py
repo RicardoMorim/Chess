@@ -54,6 +54,7 @@ from league.performance import (
     list_preset_names,
 )
 from league.control_server import ControlServer
+from league.spectate import SpectateWorker, SpectateSession, SpectateConfig, PuzzleDrill, PuzzleSample
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -324,6 +325,18 @@ class LeagueTrainer:
             except Exception as e:
                 logger.error(f"ControlServer failed to start: {e}")
                 self._control_server = None
+
+        # Spectate worker (Fase 4) - drains _spectate_queue and publishes events
+        self._spectate_worker: Optional[SpectateWorker] = None
+        if self._control_server is not None:
+            try:
+                self._spectate_worker = SpectateWorker(
+                    self, self._control_server.match_bus
+                )
+                self._spectate_worker.start()
+            except Exception as e:
+                logger.error(f"SpectateWorker failed to start: {e}")
+                self._spectate_worker = None
 
         logger.info(f"LeagueTrainer initialized: device={self.device}, checkpoints={self.checkpoint_dir}")
 

@@ -265,5 +265,78 @@ class EndToEndToggleIntegrationTests(unittest.TestCase):
         self.assertIn("STOCKFISH_BENCH_EVERY_N_ROUNDS", source)
 
 
+class ChannelConversionTests(unittest.TestCase):
+    """Regression tests for the 22-vs-18 channel mismatch.
+
+    Bug: PuzzleDataset/ProGameDataset always produce 22-channel tensors, but
+    ``baseline``/``est`` models expect 18 channels. Fix: sample_*_batch accepts
+    an ``input_channels`` kwarg and trims/pads the position tensor on the fly.
+    """
+
+    def test_convert_trims_22_to_18(self):
+        import torch
+        from train.league.datasets import AuxDataLoader
+        pos = torch.randn(4, 22, 8, 8)
+        out = AuxDataLoader._convert_channels(pos, 18)
+        self.assertEqual(out.shape, (4, 18, 8, 8))
+        # Trimmed content is preserved
+        self.assertTrue(torch.equal(out, pos[:, :18, :, :]))
+
+    def test_convert_pads_18_to_22(self):
+        import torch
+        from train.league.datasets import AuxDataLoader
+        pos = torch.randn(4, 18, 8, 8)
+        out = AuxDataLoader._convert_channels(pos, 22)
+        self.assertEqual(out.shape, (4, 22, 8, 8))
+        # Original content preserved
+        self.assertTrue(torch.equal(out[:, :18, :, :], pos))
+        # Padded region is zero
+        self.assertTrue(torch.all(out[:, 18:, :, :] == 0))
+
+    def test_convert_passthrough_when_already_correct(self):
+        import torch
+        from train.league.datasets import AuxDataLoader
+        pos = torch.randn(2, 20, 8, 8)
+        out = AuxDataLoader._convert_channels(pos, 20)
+        self.assertIs(out, pos)
+
+    def test_sample_puzzle_batch_respects_input_channels(self):
+        """In-memory PuzzleDataset is 22ch; sampling for 18ch model must trim."""
+        from train.league.datasets import AuxDataLoader
+        import torch
+
+        class FakePuzzle:
+            def __init__(self, n=5):
+                self._n = n
+            def __len__(self):
+                return self._n
+            def __getitem__(self, i):
+                pos = torch.randn(22, 8, 8)
+                pol = torch.zeros(4672)
+                pol[i % 4672] = 1.0
+                val = torch.tensor(0.5)
+                return pos, pol, val
+
+        loader = AuxDataLoader.__new__(AuxDataLoader)
+        loader.puzzle_dataset = FakePuzzle()
+        loader.progame_dataset = None
+        loader._rng = __import__("random").Random(0)
+
+        pos_18, _, _ = loader.sample_puzzle_batch(2, input_channels=18)
+        self.assertEqual(pos_18.shape, (2, 18, 8, 8))
+
+        pos_22, _, _ = loader.sample_puzzle_batch(2, input_channels=22)
+        self.assertEqual(pos_22.shape, (2, 22, 8, 8))
+
+    def test_train_one_step_derives_input_channels_from_model(self):
+        """Bug fix: must read model.conv_in.shape, not hard-code 22."""
+        import inspect
+        from train.league.league_trainer import LeagueTrainer
+        source = inspect.getsource(LeagueTrainer._train_one_step)
+        self.assertIn("conv_in.weight.shape[1]", source)
+        # Confirm the new arg is forwarded
+        self.assertIn("input_channels=model_in_channels", source)
+
+
 if __name__ == "__main__":
     unittest.main()
