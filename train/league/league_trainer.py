@@ -44,6 +44,15 @@ from league.evaluator import Evaluator
 from league.evolution_logger import EvolutionLogger
 from league.gpu_inference_process import gpu_inference_server_main
 from league.datasets import AuxDataConfig, AuxDataLoader
+from league.performance import (
+    PRESETS,
+    PRESET_KNOBS,
+    AutoModeConfig,
+    AutoModeController,
+    PerformancePreset,
+    get_preset,
+    list_preset_names,
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -282,7 +291,13 @@ class LeagueTrainer:
             self._num_self_play_workers = self.GPU_SELF_PLAY_WORKERS
         else:
             logger.info("Using CPU-only MCTS for self-play (GPU-batched disabled)")
-        
+
+        # Performance mode (Fase 1)
+        self.performance_mode: str = "balanced"
+        self._auto_mode: Optional[AutoModeController] = AutoModeController(
+            self, AutoModeConfig(enabled=False)
+        )
+
         logger.info(f"LeagueTrainer initialized: device={self.device}, checkpoints={self.checkpoint_dir}")
 
     def _parse_checkpoint_step(self, path: Path, variant: str) -> Optional[int]:
@@ -889,6 +904,7 @@ class LeagueTrainer:
         "SELF_PLAY_VARIANT_PARALLELISM",
         "NUM_SELF_PLAY_WORKERS",
         "REPLAY_BUFFER_MAX_SIZE",
+        "GPU_INFER_BATCH_SIZE",
         "CHECKPOINT_EVERY_N_ROUNDS",
         "EVAL_EVERY_N_ROUNDS",
         "BUFFER_SAVE_EVERY_N_ROUNDS",
@@ -982,6 +998,73 @@ class LeagueTrainer:
         """Snapshot of current values for all hot-swappable knobs."""
         with self._state_lock:
             return {k: getattr(self, k) for k in sorted(self._HOT_KNOBS)}
+
+    # =========================================================================
+    # PERFORMANCE MODES (Fase 1)
+    # =========================================================================
+
+    def set_mode(self, mode: str) -> bool:
+        """Switch to a named performance preset.
+
+        ``mode`` must be one of ``"eco"``, ``"balanced"``, ``"boost"``.
+
+        Equivalent to issuing a batched ``set_knob`` call for all knobs the
+        preset controls. Deferred knobs are applied at the next round boundary.
+        """
+        try:
+            preset = get_preset(mode)
+        except KeyError as e:
+            logger.warning(str(e))
+            return False
+
+        with self._state_lock:
+            knob_dict = preset.as_knob_dict()
+            self.performance_mode = mode
+            # Queue via set_knob so the immediate/deferred routing is correct.
+            for k, v in knob_dict.items():
+                self.set_knob(k, v)
+            logger.info(
+                f"Performance mode -> '{mode}': {preset.description}"
+            )
+            return True
+
+    def get_mode(self) -> str:
+        """Current performance mode name."""
+        with self._state_lock:
+            return self.performance_mode
+
+    def set_auto_mode(self, enabled: bool) -> None:
+        """Enable or disable the auto-mode watchdog.
+
+        When enabled, the watchdog polls CPU usage every ``poll_interval_sec``
+        and promotes/demotes the preset (eco <-> balanced <-> boost) to match
+        observed PC usage. Default: disabled.
+        """
+        with self._state_lock:
+            if self._auto_mode is None:
+                self._auto_mode = AutoModeController(self, AutoModeConfig(enabled=enabled))
+                self._auto_mode.start()
+            else:
+                self._auto_mode.set_enabled(enabled)
+        logger.info(f"Auto-mode set to {enabled}")
+
+    def get_auto_mode(self) -> bool:
+        """True if auto-mode watchdog is currently active."""
+        if self._auto_mode is None:
+            return False
+        return self._auto_mode.config.enabled
+
+    def list_available_modes(self) -> list:
+        """List of all preset names (eco, balanced, boost)."""
+        return list_preset_names()
+
+    def describe_mode(self, mode: str) -> dict:
+        """Return knob values for a given preset name (no side effects)."""
+        try:
+            preset = get_preset(mode)
+        except KeyError:
+            return {}
+        return preset.as_knob_dict()
 
     def train_all_models_parallel(self):
         """
