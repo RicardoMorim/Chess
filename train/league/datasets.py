@@ -225,10 +225,33 @@ class AuxDataLoader:
     def _progame_ready(self) -> bool:
         return self.progame_dataset is not None and len(self.progame_dataset) > 0
 
-    def sample_puzzle_batch(self, batch_size: int):
+    @staticmethod
+    def _convert_channels(pos_t: torch.Tensor, target_channels: int) -> torch.Tensor:
+        """Convert a position tensor to the target channel count.
+
+        Mirrors the conversion logic in ``SelfPlayDataset``:
+          * If the source has more channels than needed, trim (drop the "history
+            rep"/repetition planes that small/limited models don't consume).
+          * If the source has fewer channels, zero-pad to the target count
+            (extra planes remain zero, so the network sees them as empty).
+        """
+        cur = pos_t.shape[1]
+        if cur == target_channels:
+            return pos_t
+        if cur > target_channels:
+            return pos_t[:, :target_channels, :, :]
+        pad = torch.zeros(
+            (pos_t.shape[0], target_channels - cur, pos_t.shape[2], pos_t.shape[3]),
+            dtype=pos_t.dtype,
+        )
+        return torch.cat([pos_t, pad], dim=1)
+
+    def sample_puzzle_batch(self, batch_size: int, input_channels: int = 22):
         """Return a (positions, policies, values) tuple as torch tensors on CPU.
 
-        Returns None if puzzle injection is disabled or the dataset is empty.
+        ``input_channels`` is the model's expected input channel count; the puzzle
+        tensor is converted on the fly so it can feed 18/20/22-channel models
+        alike. Returns None if puzzle injection is disabled or the dataset is empty.
         """
         if not self._puzzle_ready():
             return None
@@ -242,6 +265,31 @@ class AuxDataLoader:
             policies.append(pol)
             values.append(val)
         pos_t = torch.stack(positions)
+        pos_t = self._convert_channels(pos_t, input_channels)
+        pol_t = torch.stack(policies)
+        val_t = torch.stack(values)
+        return pos_t, pol_t, val_t
+
+    def sample_progame_batch(self, batch_size: int, input_channels: int = 22):
+        """Return a (positions, policies, values) tuple as torch tensors on CPU.
+
+        ``input_channels`` is the model's expected input channel count; the
+        progame tensor is converted on the fly. Returns None if progame
+        injection is disabled or the dataset is empty.
+        """
+        if not self._progame_ready():
+            return None
+        n = len(self.progame_dataset)
+        idxs = [self._rng.randrange(n) for _ in range(batch_size)]
+        positions, policies, values = [], [], []
+        for i in idxs:
+            item = self.progame_dataset[i]
+            pos, pol, val = item[0], item[1], item[2]
+            positions.append(pos)
+            policies.append(pol)
+            values.append(val)
+        pos_t = torch.stack(positions)
+        pos_t = self._convert_channels(pos_t, input_channels)
         pol_t = torch.stack(policies)
         val_t = torch.stack(values)
         return pos_t, pol_t, val_t

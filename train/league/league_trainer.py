@@ -727,6 +727,11 @@ class LeagueTrainer:
         model = self.models[variant]
         optimizer = self.optimizers[variant]
 
+        # Derive model input channels once (used to convert aux batches on the
+        # fly). Puzzles/PGNs are stored as 22-channel "big" tensors; smaller
+        # variants (baseline/est, 18ch) need channel-trimmed samples.
+        model_in_channels = int(model.conv_in.weight.shape[1])
+
         if not buffer.is_ready(min_size=self.BATCH_SIZE):
             return None
 
@@ -753,7 +758,9 @@ class LeagueTrainer:
             puzzle_batches_done = 0
             if self.PUZZLE_BATCHES_PER_GAME_BATCH > 0:
                 for _ in range(self.PUZZLE_BATCHES_PER_GAME_BATCH):
-                    pz = self.aux_loader.sample_puzzle_batch(self.BATCH_SIZE)
+                    pz = self.aux_loader.sample_puzzle_batch(
+                        self.BATCH_SIZE, input_channels=model_in_channels
+                    )
                     if pz is None:
                         break
                     pz_pos, pz_pol, pz_val = pz
@@ -776,7 +783,9 @@ class LeagueTrainer:
             pro_batches_done = 0
             if self.PROGAME_BATCHES_PER_GAME_BATCH > 0:
                 for _ in range(self.PROGAME_BATCHES_PER_GAME_BATCH):
-                    pg = self.aux_loader.sample_progame_batch(self.BATCH_SIZE)
+                    pg = self.aux_loader.sample_progame_batch(
+                        self.BATCH_SIZE, input_channels=model_in_channels
+                    )
                     if pg is None:
                         break
                     pg_pos, pg_pol, pg_val = pg
