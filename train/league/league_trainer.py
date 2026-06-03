@@ -18,6 +18,7 @@ Architecture:
 """
 
 import math
+import threading
 import torch
 import torch.multiprocessing as mp
 import torch.optim as optim
@@ -188,7 +189,12 @@ class LeagueTrainer:
         self.checkpoint_dir = Path(checkpoint_dir)
         self.log_dir = Path(log_dir)
         self.use_gpu_batching = use_gpu_batching
-        
+
+        # Hot-swap infrastructure (must be set before any other init that
+        # might want to call set_knob/apply_pending_changes).
+        self._state_lock = threading.RLock()
+        self._pending_changes: Dict[str, Any] = {}
+
         # Create directories
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -854,6 +860,129 @@ class LeagueTrainer:
         logger.info(f"{variant}: Training round complete, avg_loss={avg_loss:.4f}")
         return avg_loss
 
+    # =========================================================================
+    # HOT-SWAP KNOBS (Fase 0)
+    # =========================================================================
+    # These knobs are designed to be safe to change at runtime via
+    # ``set_knob``/``set_knobs``. The change is queued and applied at the
+    # start of the next round (or, where safe, immediately). Knobs that
+    # require a process restart (LR schedule, data loaders, optimizer state)
+    # are explicitly NOT in this set.
+
+    # Knobs whose change is applied IMMEDIATELY (read on the next
+    # forward/backward pass, no round boundary needed).
+    _HOT_KNOBS_IMMEDIATE = {
+        "BATCH_SIZE",
+        "TRAINING_STEPS_PER_ROUND",
+        "GAMES_PER_WORKER_PER_ROUND",
+        "PUZZLE_BATCHES_PER_GAME_BATCH",
+        "PROGAME_BATCHES_PER_GAME_BATCH",
+        "POLICY_LOSS_WEIGHT",
+        "VALUE_LOSS_WEIGHT",
+    }
+
+    # Knobs whose change is applied at the start of the next round
+    # (we don't want to disturb an in-flight self-play or training phase).
+    _HOT_KNOBS_DEFERRED = {
+        "MCTS_VISITS_SELFPLAY",
+        "MCTS_VISITS_EVAL",
+        "SELF_PLAY_VARIANT_PARALLELISM",
+        "NUM_SELF_PLAY_WORKERS",
+        "REPLAY_BUFFER_MAX_SIZE",
+        "CHECKPOINT_EVERY_N_ROUNDS",
+        "EVAL_EVERY_N_ROUNDS",
+        "BUFFER_SAVE_EVERY_N_ROUNDS",
+        "METRICS_EVERY_N_ROUNDS",
+        "DISK_USAGE_CHECK_EVERY_N_ROUNDS",
+        "MAX_BUFFER_FILES_PER_VARIANT",
+        "TARGET_GAMES_PER_MINUTE",
+        "VISITS_ADJUSTMENT_FACTOR",
+        "STOCKFISH_BENCH_EVERY_N_ROUNDS",
+        "STOCKFISH_BENCH_NUM_GAMES",
+        "STOCKFISH_BENCH_TIME_LIMIT_MS",
+    }
+
+    _HOT_KNOBS = _HOT_KNOBS_IMMEDIATE | _HOT_KNOBS_DEFERRED
+
+    def set_knob(self, name: str, value: Any) -> bool:
+        """Queue a hot-swap change. Returns True on success.
+
+        The change is applied:
+          * immediately (on next training step) for knobs in
+            ``_HOT_KNOBS_IMMEDIATE``;
+          * at the start of the next round for knobs in
+            ``_HOT_KNOBS_DEFERRED``.
+
+        Unrecognised knob names return False (and are NOT applied). This
+        guards against typos silently no-op'ing a config change.
+        """
+        with self._state_lock:
+            if name not in self._HOT_KNOBS:
+                logger.warning(f"set_knob: '{name}' is not a hot-swappable knob (ignored)")
+                return False
+            old = getattr(self, name, None)
+            self._pending_changes[name] = value
+            logger.info(
+                f"set_knob queued: {name}={old!r} -> {value!r} "
+                f"({'immediate' if name in self._HOT_KNOBS_IMMEDIATE else 'deferred'})"
+            )
+            if name in self._HOT_KNOBS_IMMEDIATE:
+                # Apply now (no in-flight training to disturb for these).
+                self._apply_single_knob(name, value)
+                del self._pending_changes[name]
+            return True
+
+    def set_knobs(self, updates: Dict[str, Any]) -> Dict[str, bool]:
+        """Batch-update knobs. Returns a {name: ok} report."""
+        report: Dict[str, bool] = {}
+        for k, v in updates.items():
+            report[k] = self.set_knob(k, v)
+        return report
+
+    def _apply_single_knob(self, name: str, value: Any) -> None:
+        """Apply a single knob change. Caller must hold ``_state_lock``."""
+        # The class-level constant is overridden by setting the instance attr.
+        setattr(self, name, value)
+
+        # Propagate to derived state / collaborators.
+        if name == "NUM_SELF_PLAY_WORKERS":
+            target = self.GPU_SELF_PLAY_WORKERS if self.use_gpu_batching else self.NUM_SELF_PLAY_WORKERS
+            self._num_self_play_workers = max(1, int(target))
+        elif name == "SELF_PLAY_VARIANT_PARALLELISM":
+            self._variant_parallelism = max(1, int(self.SELF_PLAY_VARIANT_PARALLELISM))
+        elif name == "REPLAY_BUFFER_MAX_SIZE":
+            self._buffer_target_size = int(self.REPLAY_BUFFER_MAX_SIZE)
+            for variant in self.VARIANTS:
+                buf = self.buffers.get(variant)
+                if buf is not None:
+                    buf.set_max_size(self._buffer_target_size)
+            self._last_buffer_target_size = self._buffer_target_size
+        elif name == "MCTS_VISITS_SELFPLAY":
+            self._current_mcts_visits = int(self.MCTS_VISITS_SELFPLAY)
+        elif name == "MCTS_VISITS_EVAL":
+            if self.evaluator is not None:
+                self.evaluator.mcts_visits = int(self.MCTS_VISITS_EVAL)
+        # The other knobs are read directly from ``self.X`` in their hot paths
+        # and need no derived state update.
+
+    def _apply_pending_changes(self) -> None:
+        """Apply any queued deferred changes. Call at start of each round."""
+        with self._state_lock:
+            if not self._pending_changes:
+                return
+            for name, value in list(self._pending_changes.items()):
+                # Immediate knobs were already applied in set_knob, so any
+                # remaining entries are deferred.
+                if name in self._HOT_KNOBS_DEFERRED:
+                    self._apply_single_knob(name, value)
+                    logger.info(f"Applied deferred knob: {name}={value!r}")
+            self._pending_changes.clear()
+
+    def list_hot_knobs(self) -> Dict[str, Any]:
+        """Snapshot of current values for all hot-swappable knobs."""
+        with self._state_lock:
+            return {k: getattr(self, k) for k in sorted(self._HOT_KNOBS)}
+
     def train_all_models_parallel(self):
         """
         Train all model variants.
@@ -949,12 +1078,15 @@ class LeagueTrainer:
         """
         
         logger.info("Starting league training loop...")
-        
+
         round_num = int(getattr(self, "start_round", 0))
         while max_rounds is None or round_num < max_rounds:
             self.round = round_num
             round_start = time.time()
-            
+
+            # Apply any queued hot-swap changes before this round starts.
+            self._apply_pending_changes()
+
             logger.info(f"\n{'='*60}")
             logger.info(f"ROUND {round_num}")
             logger.info(f"{'='*60}")
