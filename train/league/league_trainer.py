@@ -53,6 +53,7 @@ from league.performance import (
     get_preset,
     list_preset_names,
 )
+from league.control_server import ControlServer
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -184,6 +185,10 @@ class LeagueTrainer:
         log_dir: str = "logs",
         device: str = "cuda",
         use_gpu_batching: bool = False,
+        control_port: int = 7860,
+        control_host: str = "127.0.0.1",
+        enable_control_server: bool = True,
+        dashboard_dir: Optional[str] = None,
     ):
         """
         Initialize league trainer.
@@ -203,6 +208,13 @@ class LeagueTrainer:
         # might want to call set_knob/apply_pending_changes).
         self._state_lock = threading.RLock()
         self._pending_changes: Dict[str, Any] = {}
+        # Training pause event (set by /api/pause). Training loop should check
+        # this at safe points (e.g., start of round) and wait.
+        self._training_pause_event: Optional[threading.Event] = None
+        # Spectate match queue (filled by /api/matches, drained by a worker)
+        # Import only when needed to keep this module cheap to import for tests.
+        import queue as _queue
+        self._spectate_queue: "_queue.Queue" = _queue.Queue()
 
         # Create directories
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -297,6 +309,21 @@ class LeagueTrainer:
         self._auto_mode: Optional[AutoModeController] = AutoModeController(
             self, AutoModeConfig(enabled=False)
         )
+
+        # Control plane (Fase 2)
+        self._control_server: Optional[ControlServer] = None
+        if enable_control_server:
+            self._control_server = ControlServer(
+                self,
+                host=control_host,
+                port=control_port,
+                dashboard_dir=Path(dashboard_dir) if dashboard_dir else None,
+            )
+            try:
+                self._control_server.start()
+            except Exception as e:
+                logger.error(f"ControlServer failed to start: {e}")
+                self._control_server = None
 
         logger.info(f"LeagueTrainer initialized: device={self.device}, checkpoints={self.checkpoint_dir}")
 
@@ -1169,6 +1196,17 @@ class LeagueTrainer:
 
             # Apply any queued hot-swap changes before this round starts.
             self._apply_pending_changes()
+
+            # Honour pause request (set via /api/pause). We sleep in 1s
+            # increments so a subsequent unpause takes effect immediately.
+            pause_evt = getattr(self, "_training_pause_event", None)
+            if pause_evt is not None and pause_evt.is_set():
+                logger.info("Training paused (via /api/pause). Waiting...")
+                while pause_evt.is_set() and (max_rounds is None or round_num < max_rounds):
+                    time.sleep(1.0)
+                logger.info("Training resumed.")
+                if max_rounds is not None and round_num >= max_rounds:
+                    break
 
             logger.info(f"\n{'='*60}")
             logger.info(f"ROUND {round_num}")
