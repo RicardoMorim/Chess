@@ -1053,7 +1053,8 @@ class LeagueTrainer:
     def set_mode(self, mode: str) -> bool:
         """Switch to a named performance preset.
 
-        ``mode`` must be one of ``"eco"``, ``"balanced"``, ``"boost"``.
+        ``mode`` must be one of ``"low_memory"``, ``"eco"``, ``"balanced"``,
+        ``"boost"``.
 
         Equivalent to issuing a batched ``set_knob`` call for all knobs the
         preset controls. Deferred knobs are applied at the next round boundary.
@@ -1084,8 +1085,8 @@ class LeagueTrainer:
         """Enable or disable the auto-mode watchdog.
 
         When enabled, the watchdog polls CPU usage every ``poll_interval_sec``
-        and promotes/demotes the preset (eco <-> balanced <-> boost) to match
-        observed PC usage. Default: disabled.
+        and promotes/demotes the preset (low_memory <-> eco <-> balanced <-> boost)
+        to match observed PC usage. Default: disabled.
         """
         with self._state_lock:
             if self._auto_mode is None:
@@ -1102,7 +1103,7 @@ class LeagueTrainer:
         return self._auto_mode.config.enabled
 
     def list_available_modes(self) -> list:
-        """List of all preset names (eco, balanced, boost)."""
+        """List of all preset names (low_memory, eco, balanced, boost)."""
         return list_preset_names()
 
     def describe_mode(self, mode: str) -> dict:

@@ -64,10 +64,10 @@ def _make_trainer(tmpdir: str):
 class PresetDefinitionTests(unittest.TestCase):
     """The preset table itself."""
 
-    def test_three_presets_exist(self):
+    def test_four_presets_exist(self):
         from train.league.performance import PRESETS, list_preset_names
         names = list_preset_names()
-        self.assertEqual(set(names), {"eco", "balanced", "boost"})
+        self.assertEqual(set(names), {"low_memory", "eco", "balanced", "boost"})
 
     def test_balanced_matches_class_defaults(self):
         from train.league.performance import PRESETS
@@ -79,17 +79,25 @@ class PresetDefinitionTests(unittest.TestCase):
         self.assertEqual(bal.games_per_worker_per_round, 5)
 
     def test_preset_ordering_for_safety(self):
-        """eco <= balanced <= boost (in resource usage)."""
+        """low_memory <= eco <= balanced <= boost (in resource usage)."""
         from train.league.performance import PRESETS
+        low_mem = PRESETS["low_memory"]
         eco = PRESETS["eco"]
         bal = PRESETS["balanced"]
         boost = PRESETS["boost"]
+        self.assertLess(low_mem.batch_size, eco.batch_size)
         self.assertLess(eco.batch_size, bal.batch_size)
         self.assertLess(bal.batch_size, boost.batch_size)
+        self.assertLess(low_mem.mcts_visits_selfplay, eco.mcts_visits_selfplay)
         self.assertLess(eco.mcts_visits_selfplay, bal.mcts_visits_selfplay)
         self.assertLess(bal.mcts_visits_selfplay, boost.mcts_visits_selfplay)
+        self.assertLessEqual(low_mem.num_self_play_workers, eco.num_self_play_workers)
         self.assertLessEqual(eco.num_self_play_workers, bal.num_self_play_workers)
         self.assertLessEqual(bal.num_self_play_workers, boost.num_self_play_workers)
+        # Memory budget: buffer size strictly increases
+        self.assertLess(low_mem.replay_buffer_max_size, eco.replay_buffer_max_size)
+        self.assertLess(eco.replay_buffer_max_size, bal.replay_buffer_max_size)
+        self.assertLess(bal.replay_buffer_max_size, boost.replay_buffer_max_size)
 
     def test_preset_as_knob_dict_has_all_preset_knobs(self):
         from train.league.performance import PRESETS, PRESET_KNOBS
@@ -271,14 +279,14 @@ class AutoModeTests(unittest.TestCase):
         self.assertEqual(self.trainer.get_mode(), "boost")
 
     def test_auto_mode_at_bottom_boundary_does_not_demote(self):
-        """At bottom of order (eco), demote should be a no-op."""
-        self.trainer.set_mode("eco")
+        """At bottom of order (low_memory), demote should be a no-op."""
+        self.trainer.set_mode("low_memory")
         self.trainer._auto_mode.config.promote_cpu_pct = 10.0
         self.trainer._auto_mode.config.demote_cpu_pct = 50.0
         with patch("psutil.cpu_percent", return_value=99.0):
             self.trainer._auto_mode._tick(psutil)
-        # No order to go lower (eco is the lowest)
-        self.assertEqual(self.trainer.get_mode(), "eco")
+        # No order to go lower (low_memory is the lowest)
+        self.assertEqual(self.trainer.get_mode(), "low_memory")
 
 
 if __name__ == "__main__":

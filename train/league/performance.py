@@ -1,9 +1,15 @@
 """
 Performance presets for LeagueTrainer (Fase 1).
 
-Defines 3 named presets (``eco``, ``balanced``, ``boost``) that map to a
-coherent set of knob values. Switching presets is equivalent to issuing a
-batch ``set_knob`` call.
+Defines 4 named presets (``low_memory``, ``eco``, ``balanced``, ``boost``)
+that map to a coherent set of knob values. Switching presets is equivalent
+to issuing a batch ``set_knob`` call.
+
+Memory budget (3 variants, fp16 positions+policy, fp32 values):
+  low_memory:  20K entries x 3 =  60K slots  ~ 0.6 GB replay buffer
+  eco:         50K entries x 3 = 150K slots  ~ 1.5 GB replay buffer
+  balanced:   100K entries x 3 = 300K slots  ~ 3.3 GB replay buffer
+  boost:      300K entries x 3 = 900K slots ~ 10.0 GB replay buffer
 
 Why presets and not individual knobs?
   - Atomicity: you can't half-apply a mode change mid-round. A preset is
@@ -79,6 +85,24 @@ class PerformancePreset:
 
 
 PRESETS: Dict[str, PerformancePreset] = {
+    "low_memory": PerformancePreset(
+        name="low_memory",
+        description=(
+            "Constrained RAM (laptops <32GB). Tiny buffer, 2 workers, very "
+            "short MCTS. Trades training quality for low memory footprint "
+            "(~600MB replay buffer across 3 variants)."
+        ),
+        batch_size=64,
+        training_steps_per_round=20,
+        games_per_worker_per_round=2,
+        mcts_visits_selfplay=50,
+        num_self_play_workers=2,
+        replay_buffer_max_size=20_000,
+        gpu_infer_batch_size=16,
+        stockfish_bench_every_n_rounds=200,
+        puzzle_batches_per_game_batch=0,
+        self_play_variant_parallelism=2,
+    ),
     "eco": PerformancePreset(
         name="eco",
         description=(
@@ -90,7 +114,7 @@ PRESETS: Dict[str, PerformancePreset] = {
         games_per_worker_per_round=2,
         mcts_visits_selfplay=80,
         num_self_play_workers=3,
-        replay_buffer_max_size=50_000,
+        replay_buffer_max_size=30_000,
         gpu_infer_batch_size=32,
         stockfish_bench_every_n_rounds=100,
         puzzle_batches_per_game_batch=0,
@@ -159,7 +183,7 @@ class AutoModeConfig:
     sample_interval_sec: float = 5.0  # how long psutil samples for
 
 
-_PROMOTE_ORDER = ("eco", "balanced", "boost")
+_PROMOTE_ORDER = ("low_memory", "eco", "balanced", "boost")
 _DEMOTE_ORDER = tuple(reversed(_PROMOTE_ORDER))
 
 

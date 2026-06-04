@@ -160,7 +160,7 @@ CRITICAL_DISK_THRESHOLD_PCT = 5
 
 
 # ============================================================================
-# PERFORMANCE PRESETS (eco / balanced / boost) — Fase 1
+# PERFORMANCE PRESETS (low_memory / eco / balanced / boost) — Fase 1
 # ============================================================================
 
 # File: train/league/performance.py
@@ -170,6 +170,7 @@ Switch modes at runtime (no restart):
 
   trainer.set_mode("boost")          # applies on next round
   trainer.set_mode("eco")
+  trainer.set_mode("low_memory")     # for laptops <32GB RAM
   trainer.set_auto_mode(True)        # trainer picks based on CPU usage
 
 Or via the HTTP control server:
@@ -178,11 +179,19 @@ Or via the HTTP control server:
   curl -X POST http://127.0.0.1:7860/api/auto_mode -d '{"enabled":true}'
 """
 
+# Memory budget (3 variants x 22-channel fp16 position+policy, fp32 value):
 PRESETS = {
-    "eco":      {"BATCH_SIZE": 128,  "NUM_SELF_PLAY_WORKERS": 3,  "MCTS_VISITS_SELFPLAY":  80, "REPLAY_BUFFER_MAX_SIZE":  50_000, "STOCKFISH_BENCH_EVERY_N_ROUNDS": 100, "PUZZLE_BATCHES_PER_GAME_BATCH": 0},
-    "balanced": {"BATCH_SIZE": 256,  "NUM_SELF_PLAY_WORKERS": 6,  "MCTS_VISITS_SELFPLAY": 200, "REPLAY_BUFFER_MAX_SIZE": 100_000, "STOCKFISH_BENCH_EVERY_N_ROUNDS":  25, "PUZZLE_BATCHES_PER_GAME_BATCH": 1},
-    "boost":    {"BATCH_SIZE": 1024, "NUM_SELF_PLAY_WORKERS": 12, "MCTS_VISITS_SELFPLAY": 400, "REPLAY_BUFFER_MAX_SIZE": 300_000, "STOCKFISH_BENCH_EVERY_N_ROUNDS":  10, "PUZZLE_BATCHES_PER_GAME_BATCH": 2},
+    "low_memory": {"BATCH_SIZE":   64, "NUM_SELF_PLAY_WORKERS":  2, "MCTS_VISITS_SELFPLAY":  50, "REPLAY_BUFFER_MAX_SIZE":  20_000, "STOCKFISH_BENCH_EVERY_N_ROUNDS": 200, "PUZZLE_BATCHES_PER_GAME_BATCH": 0, "buffer_gb": 0.6},
+    "eco":        {"BATCH_SIZE":  128, "NUM_SELF_PLAY_WORKERS":  3, "MCTS_VISITS_SELFPLAY":  80, "REPLAY_BUFFER_MAX_SIZE":  30_000, "STOCKFISH_BENCH_EVERY_N_ROUNDS": 100, "PUZZLE_BATCHES_PER_GAME_BATCH": 0, "buffer_gb": 1.0},
+    "balanced":   {"BATCH_SIZE":  256, "NUM_SELF_PLAY_WORKERS":  6, "MCTS_VISITS_SELFPLAY": 200, "REPLAY_BUFFER_MAX_SIZE": 100_000, "STOCKFISH_BENCH_EVERY_N_ROUNDS":  25, "PUZZLE_BATCHES_PER_GAME_BATCH": 1, "buffer_gb": 3.3},
+    "boost":      {"BATCH_SIZE": 1024, "NUM_SELF_PLAY_WORKERS": 12, "MCTS_VISITS_SELFPLAY": 400, "REPLAY_BUFFER_MAX_SIZE": 300_000, "STOCKFISH_BENCH_EVERY_N_ROUNDS":  10, "PUZZLE_BATCHES_PER_GAME_BATCH": 2, "buffer_gb": 10.0},
 }
+
+# Selecting a mode live (deferred to next round boundary via set_max_size):
+#   trainer.set_knob("REPLAY_BUFFER_MAX_SIZE", 20_000)
+# ReplayBuffer is backed by pre-allocated flat numpy arrays (no per-element
+# Python objects), so a live shrink via set_max_size() preserves the most
+# recent N entries and reuses the same storage.
 
 
 # ============================================================================
