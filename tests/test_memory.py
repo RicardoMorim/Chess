@@ -33,7 +33,7 @@ def _rand_pos(channels: int = 22) -> np.ndarray:
     return np.random.randn(channels, 8, 8).astype(np.float32)
 
 
-def _rand_policy(size: int = 4096) -> np.ndarray:
+def _rand_policy(size: int = 4672) -> np.ndarray:
     return np.random.rand(size).astype(np.float32)
 
 
@@ -41,10 +41,10 @@ class ReplayBufferMemoryFootprintTests(unittest.TestCase):
     """The compact buffer should be much smaller than the legacy object dtype."""
 
     def test_compact_buffer_uses_fixed_flat_arrays(self):
-        buf = ReplayBuffer(max_size=1000, pos_channels=22, policy_size=4096)
+        buf = ReplayBuffer(max_size=1000, pos_channels=22, policy_size=4672)
         # Sanity: pre-allocated storage exists with the expected dtype.
         self.assertEqual(buf._positions.shape, (1000, 22, 8, 8))
-        self.assertEqual(buf._policies.shape, (1000, 4096))
+        self.assertEqual(buf._policies.shape, (1000, 4672))
         self.assertEqual(buf._values.shape, (1000,))
         self.assertEqual(buf._positions.dtype, np.float16)
         self.assertEqual(buf._policies.dtype, np.float16)
@@ -54,11 +54,11 @@ class ReplayBufferMemoryFootprintTests(unittest.TestCase):
         total_bytes = (
             buf._positions.nbytes + buf._policies.nbytes + buf._values.nbytes
         )
-        # 100K x (22x8x8x2 + 4096x2 + 4) bytes = ~3.1 GB
-        # Per-entry budget: ~10.5 KB
+        # 100K x (22x8x8x2 + 4672x2 + 4) bytes = ~3.5 GB
+        # Per-entry budget: ~11.9 KB
         per_entry_kb = total_bytes / 1000 / 1024
-        self.assertLess(per_entry_kb, 11.0, f"per-entry {per_entry_kb:.2f}KB too large")
-        self.assertGreater(per_entry_kb, 9.0, f"per-entry {per_entry_kb:.2f}KB suspiciously small")
+        self.assertLess(per_entry_kb, 12.5, f"per-entry {per_entry_kb:.2f}KB too large")
+        self.assertGreater(per_entry_kb, 11.0, f"per-entry {per_entry_kb:.2f}KB suspiciously small")
 
     def test_no_object_dtype_storage(self):
         """Regression: must not regress to the legacy np.empty(dtype=object)."""
@@ -71,7 +71,7 @@ class ReplayBufferChannelPaddingTests(unittest.TestCase):
     """18-channel baseline data must fit into a 22-channel buffer without crashing."""
 
     def test_smaller_channel_position_is_padded(self):
-        buf = ReplayBuffer(max_size=10, pos_channels=22, policy_size=4096)
+        buf = ReplayBuffer(max_size=10, pos_channels=22, policy_size=4672)
         small_pos = _rand_pos(channels=18)
         buf.add_game([(small_pos, _rand_policy(), 0.5)])
         self.assertEqual(len(buf), 1)
@@ -89,14 +89,14 @@ class ReplayBufferChannelPaddingTests(unittest.TestCase):
         )
 
     def test_larger_channel_position_is_truncated(self):
-        buf = ReplayBuffer(max_size=10, pos_channels=18, policy_size=4096)
+        buf = ReplayBuffer(max_size=10, pos_channels=18, policy_size=4672)
         big_pos = _rand_pos(channels=22)
         buf.add_game([(big_pos, _rand_policy(), 0.5)])
         self.assertEqual(len(buf), 1)
         self.assertEqual(buf._positions[0].shape, (18, 8, 8))
 
     def test_smaller_policy_is_padded(self):
-        buf = ReplayBuffer(max_size=10, pos_channels=22, policy_size=4096)
+        buf = ReplayBuffer(max_size=10, pos_channels=22, policy_size=4672)
         small_policy = _rand_policy(size=1024)
         buf.add_game([(_rand_pos(22), small_policy, 0.0)])
         # Stored policy is full size; first 1024 entries match the input
@@ -106,21 +106,21 @@ class ReplayBufferChannelPaddingTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(
             buf._policies[0][1024:].astype(np.float32),
-            np.zeros(4096 - 1024, dtype=np.float32),
+            np.zeros(4672 - 1024, dtype=np.float32),
         )
 
     def test_larger_policy_is_truncated(self):
-        buf = ReplayBuffer(max_size=10, pos_channels=22, policy_size=4096)
+        buf = ReplayBuffer(max_size=10, pos_channels=22, policy_size=4672)
         big_policy = _rand_policy(size=8192)
         buf.add_game([(_rand_pos(22), big_policy, 0.0)])
-        self.assertEqual(buf._policies[0].shape, (4096,))
+        self.assertEqual(buf._policies[0].shape, (4672,))
 
 
 class ReplayBufferSampleTests(unittest.TestCase):
     """Both legacy list-of-arrays and fast-path batched array APIs work."""
 
     def setUp(self):
-        self.buf = ReplayBuffer(max_size=100, pos_channels=22, policy_size=4096)
+        self.buf = ReplayBuffer(max_size=100, pos_channels=22, policy_size=4672)
         game = [(_rand_pos(22), _rand_policy(), float(i) * 0.01) for i in range(20)]
         self.buf.add_game(game)
 
@@ -133,7 +133,7 @@ class ReplayBufferSampleTests(unittest.TestCase):
             self.assertEqual(p.shape, (22, 8, 8))
             self.assertEqual(p.dtype, np.float32)
         for p in policies:
-            self.assertEqual(p.shape, (4096,))
+            self.assertEqual(p.shape, (4672,))
             self.assertEqual(p.dtype, np.float32)
         for v in values:
             self.assertIsInstance(v, float)
@@ -141,7 +141,7 @@ class ReplayBufferSampleTests(unittest.TestCase):
     def test_fast_path_batched_arrays(self):
         positions, policies, values = self.buf.sample(5, return_numpy=True)
         self.assertEqual(positions.shape, (5, 22, 8, 8))
-        self.assertEqual(policies.shape, (5, 4096))
+        self.assertEqual(policies.shape, (5, 4672))
         self.assertEqual(values.shape, (5,))
         self.assertEqual(positions.dtype, np.float32)
         self.assertEqual(values.dtype, np.float32)
@@ -195,7 +195,7 @@ class ReplayBufferSetMaxSizeTests(unittest.TestCase):
     """Live shrink/grow preserves data in chronological order."""
 
     def setUp(self):
-        self.buf = ReplayBuffer(max_size=100, pos_channels=22, policy_size=4096)
+        self.buf = ReplayBuffer(max_size=100, pos_channels=22, policy_size=4672)
         for i in range(50):
             self.buf.add_game([(_rand_pos(22), _rand_policy(), float(i) * 0.1)])
 
@@ -312,15 +312,15 @@ class LowMemoryPresetTests(unittest.TestCase):
         self.assertEqual(low.puzzle_batches_per_game_batch, 0)
 
     def test_low_memory_estimated_memory_below_1gb(self):
-        """Three variants x 20K x ~10.5KB ~= 0.6 GB. Must stay under 1 GB."""
+        """Three variants x 20K x ~10.7KB ~= 0.7 GB. Must stay under 1 GB."""
         low = PRESETS["low_memory"]
-        per_entry_bytes = 22 * 8 * 8 * 2 + 4096 * 2 + 4  # fp16 pos+pol, fp32 val
+        per_entry_bytes = 22 * 8 * 8 * 2 + 4672 * 2 + 4  # fp16 pos+pol, fp32 val
         total_gb = (low.replay_buffer_max_size * 3 * per_entry_bytes) / (1024 ** 3)
         self.assertLess(total_gb, 1.0, f"low_memory uses {total_gb:.2f} GB, expected <1")
 
     def test_eco_estimated_memory_below_2gb(self):
         eco = PRESETS["eco"]
-        per_entry_bytes = 22 * 8 * 8 * 2 + 4096 * 2 + 4
+        per_entry_bytes = 22 * 8 * 8 * 2 + 4672 * 2 + 4
         total_gb = (eco.replay_buffer_max_size * 3 * per_entry_bytes) / (1024 ** 3)
         self.assertLess(total_gb, 2.0, f"eco uses {total_gb:.2f} GB, expected <2")
 

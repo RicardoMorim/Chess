@@ -39,7 +39,10 @@ logger = logging.getLogger(__name__)
 # "attack" / "est" variants; "baseline" uses 18. We use 22 to avoid
 # channel-mismatch errors when variants share buffers.
 DEFAULT_POS_CHANNELS = 22
-DEFAULT_POLICY_SIZE = 4096  # 64 from_sq * 64 to_sq
+# 73 planes x 64 squares = 4672 (AlphaZero move encoding used by the
+# model + MCTS). Was 4096 (64 from * 64 to) which silently truncated
+# MCTS policies and broke training.
+DEFAULT_POLICY_SIZE = 4672
 
 
 class ReplayBuffer:

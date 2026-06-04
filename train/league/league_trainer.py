@@ -57,6 +57,46 @@ from league.control_server import ControlServer
 from league.spectate import SpectateWorker, SpectateSession, SpectateConfig, PuzzleDrill, PuzzleSample
 
 logger = logging.getLogger(__name__)
+
+
+def _convert_pos_channels(
+    pos_t: torch.Tensor, target_channels: int
+) -> torch.Tensor:
+    """Convert a position tensor to the target channel count.
+
+    Mirrors :py:meth:`league.datasets.AuxDataLoader._convert_channels` so the
+    main self-play batch is treated the same as puzzle/progame aux batches:
+
+      * If the source has more channels than needed (e.g. 22-channel attack
+        into an 18-channel baseline/est model), trim the trailing channels.
+      * If the source has fewer channels, zero-pad along the channel axis.
+    """
+    cur = pos_t.shape[1]
+    if cur == target_channels:
+        return pos_t
+    if cur > target_channels:
+        return pos_t[:, :target_channels, :, :]
+    pad = torch.zeros(
+        (pos_t.shape[0], target_channels - cur, pos_t.shape[2], pos_t.shape[3]),
+        dtype=pos_t.dtype,
+        device=pos_t.device,
+    )
+    return torch.cat([pos_t, pad], dim=1)
+
+
+def _soft_cross_entropy(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Cross-entropy with a *soft* (probability) target distribution.
+
+    Standard ``F.cross_entropy`` only accepts 1D class-index targets. MCTS
+    policies are visit-count distributions over ``ACTION_SPACE_SIZE = 4672``
+    moves, so we compute ``-sum(target * log_softmax(logits))`` directly. The
+    mean across the batch keeps the loss scale comparable to the hard-target
+    version.
+    """
+    log_probs = torch.nn.functional.log_softmax(logits, dim=1)
+    return -(target * log_probs).sum(dim=1).mean()
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -811,13 +851,14 @@ class LeagueTrainer:
             positions, policies, values = buffer.sample(self.BATCH_SIZE)
 
             pos_tensor = torch.stack([torch.from_numpy(p).to(self.device) for p in positions])
+            pos_tensor = _convert_pos_channels(pos_tensor, model_in_channels)
             policy_tensor = torch.stack([torch.from_numpy(p).to(self.device) for p in policies])
             value_tensor = torch.tensor(values, dtype=torch.float32, device=self.device)
 
             model.train()
             policy_logits, value_pred = model(pos_tensor)
 
-            policy_loss = torch.nn.functional.cross_entropy(policy_logits, policy_tensor)
+            policy_loss = _soft_cross_entropy(policy_logits, policy_tensor)
             value_loss = torch.nn.functional.mse_loss(value_pred.squeeze(), value_tensor)
             loss = self.POLICY_LOSS_WEIGHT * policy_loss + self.VALUE_LOSS_WEIGHT * value_loss
 
@@ -840,7 +881,7 @@ class LeagueTrainer:
                     pz_pol = pz_pol.to(self.device)
                     pz_val = pz_val.to(self.device)
                     pz_logits, pz_vpred = model(pz_pos)
-                    pz_policy_loss = torch.nn.functional.cross_entropy(pz_logits, pz_pol)
+                    pz_policy_loss = _soft_cross_entropy(pz_logits, pz_pol)
                     pz_value_loss = torch.nn.functional.mse_loss(pz_vpred.squeeze(), pz_val)
                     # Puzzle weighting: same POLICY_WEIGHT, lighter VALUE_WEIGHT
                     # (mated positions dominate value, so downweight)
@@ -865,7 +906,7 @@ class LeagueTrainer:
                     pg_pol = pg_pol.to(self.device)
                     pg_val = pg_val.to(self.device)
                     pg_logits, pg_vpred = model(pg_pos)
-                    pg_policy_loss = torch.nn.functional.cross_entropy(pg_logits, pg_pol)
+                    pg_policy_loss = _soft_cross_entropy(pg_logits, pg_pol)
                     pg_value_loss = torch.nn.functional.mse_loss(pg_vpred.squeeze(), pg_val)
                     pg_loss = self.POLICY_LOSS_WEIGHT * pg_policy_loss + self.VALUE_LOSS_WEIGHT * pg_value_loss
                     pg_loss.backward()
