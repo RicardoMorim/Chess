@@ -13,6 +13,8 @@ let lastCheckpoints = [];
 let spectateSource = null;
 let lossBuffers = { baseline: [], attack: [], est: [] };
 let lossCharts = {};
+// Cached variants from /api/variants
+let trainerVariants = [...VARIANTS];
 
 document.addEventListener("DOMContentLoaded", () => {
   setupModeButtons();
@@ -21,9 +23,11 @@ document.addEventListener("DOMContentLoaded", () => {
   setupMatchForm();
   setupSpectateModal();
   initLossCharts();
+  populateVariantDropdowns();
   pollStatus();
   pollCheckpoints();
   pollEvery(2000, () => { pollStatus(); pollCheckpoints(); });
+  pollEvery(15000, populateVariantDropdowns);  // refresh variants occasionally
 });
 
 function setupModeButtons() {
@@ -73,25 +77,110 @@ function setupPauseButton() {
   });
 }
 
+// ---- Spectate form ------------------------------------------------------
+
+async function populateVariantDropdowns() {
+  // Live variant dropdowns (per side)
+  for (const side of ["white", "black"]) {
+    const sel = document.querySelector(`.side-model[data-side="${side}"]`);
+    if (!sel) continue;
+    const current = sel.value;
+    sel.innerHTML = "";
+    let variants = [...VARIANTS];
+    try {
+      const v = await fetchJson("/api/variants");
+      if (Array.isArray(v) && v.length) {
+        variants = v.map(x => (typeof x === "string" ? x : x.name)).filter(Boolean);
+      }
+    } catch (e) { /* fall back to defaults */ }
+    trainerVariants = variants;
+    for (const v of variants) {
+      const o = document.createElement("option");
+      o.value = v;
+      o.textContent = v;
+      sel.appendChild(o);
+    }
+    if (current && variants.includes(current)) sel.value = current;
+    // Refresh checkpoint dropdown for this side
+    populateCheckpointDropdown(side, variants[0]);
+  }
+  // Update checkpoint dropdowns when the model dropdown changes
+  document.querySelectorAll(".side-model").forEach(sel => {
+    sel.addEventListener("change", () => {
+      populateCheckpointDropdown(sel.dataset.side, sel.value);
+    });
+  });
+  // Show/hide model-only vs stockfish-only fields when engine changes
+  document.querySelectorAll(".side-engine").forEach(sel => {
+    sel.addEventListener("change", () => onEngineChange(sel));
+  });
+  onEngineChange(document.querySelector('.side-engine[data-side="white"]'));
+  onEngineChange(document.querySelector('.side-engine[data-side="black"]'));
+}
+
+function onEngineChange(sel) {
+  const side = sel.dataset.side;
+  const engine = sel.value;
+  const fs = document.getElementById(`side-${side}`);
+  fs.querySelectorAll(".model-only").forEach(el => {
+    el.style.display = engine === "model" ? "" : "none";
+  });
+  fs.querySelectorAll(".stockfish-only").forEach(el => {
+    el.style.display = engine === "stockfish" ? "" : "none";
+  });
+}
+
+async function populateCheckpointDropdown(side, variant) {
+  const sel = document.querySelector(`.side-checkpoint[data-side="${side}"]`);
+  if (!sel) return;
+  sel.innerHTML = '<option value="">— live variant —</option>';
+  if (!variant) return;
+  try {
+    const list = await fetchJson(`/api/checkpoints?variant=${encodeURIComponent(variant)}`);
+    list.sort((a, b) => b.step - a.step);
+    for (const c of list.slice(0, 12)) {
+      const o = document.createElement("option");
+      o.value = `${c.variant}_step_${c.step}`;
+      o.textContent = `step ${c.step} (${c.size_mb}MB)`;
+      sel.appendChild(o);
+    }
+  } catch (e) {
+    // ignore
+  }
+}
+
 function setupMatchForm() {
+  // Re-show the puzzle-id row only when match type is puzzle
+  const typeSel = document.getElementById("match-type");
+  typeSel.addEventListener("change", () => {
+    document.getElementById("puzzle-id-row").style.display =
+      typeSel.value === "puzzle" ? "" : "none";
+  });
+  // Default hide the puzzle row
+  document.getElementById("puzzle-id-row").style.display = "none";
+
   document.getElementById("match-form").addEventListener("submit", async (ev) => {
     ev.preventDefault();
-    const type = document.getElementById("match-type").value;
-    const body = {
-      type,
-      white: document.getElementById("match-white").value,
-      black: document.getElementById("match-black").value,
-      visits: parseInt(document.getElementById("match-visits").value, 10),
-    };
+    const type = typeSel.value;
+    const visits = parseInt(document.getElementById("match-visits").value, 10);
+    let body;
     if (type === "puzzle") {
+      body = { type: "puzzle", visits };
       const pid = document.getElementById("match-puzzle-id").value;
       if (pid) body.puzzle_id = pid;
+    } else {
+      body = {
+        type: "model",
+        white: buildPlayerDescriptor("white"),
+        black: buildPlayerDescriptor("black"),
+        visits,
+      };
     }
     try {
       const r = await postJson("/api/matches", body);
       if (r.ok) {
         document.getElementById("match-status").textContent = `Match queued (#${r.match.id})`;
-        openSpectate(r.match);
+        openSpectate(r.match, body);
       } else {
         document.getElementById("match-status").textContent = `Failed: ${r.error || "unknown"}`;
       }
@@ -101,13 +190,30 @@ function setupMatchForm() {
   });
 }
 
+function buildPlayerDescriptor(side) {
+  const engine = document.querySelector(`.side-engine[data-side="${side}"]`).value;
+  if (engine === "stockfish") {
+    const depth = parseInt(document.querySelector(`.side-depth[data-side="${side}"]`).value, 10);
+    const timeRaw = document.querySelector(`.side-time[data-side="${side}"]`).value;
+    const label = document.querySelector(`.side-label[data-side="${side}"]`).value;
+    const d = { type: "stockfish", depth };
+    if (timeRaw) d.time_limit_ms = parseInt(timeRaw, 10);
+    if (label) d.label = label;
+    return d;
+  }
+  // Model: combine variant + optional checkpoint
+  const variant = document.querySelector(`.side-model[data-side="${side}"]`).value;
+  const ckpt = document.querySelector(`.side-checkpoint[data-side="${side}"]`).value;
+  const name = ckpt || variant;
+  return { type: "model", name };
+}
+
 function setupSpectateModal() {
   document.getElementById("spectate-close").addEventListener("click", closeSpectate);
 }
 
 function initLossCharts() {
   if (typeof Chart === "undefined") {
-    // Chart.js not loaded (offline or CDN blocked). Just show numbers.
     return;
   }
   Chart.defaults.color = "#8b949e";
@@ -200,7 +306,6 @@ function updateLosses(losses) {
       continue;
     }
     el.textContent = v_loss.toFixed(3);
-    // Append to chart buffer
     if (lossCharts[v]) {
       lossBuffers[v].push(v_loss);
       if (lossBuffers[v].length > 80) lossBuffers[v].shift();
@@ -271,25 +376,65 @@ function updateCheckpoints(list) {
       <td><button class="play-btn">▶ Watch</button></td>
     `;
     row.addEventListener("click", () => {
-      const otherVariant = c.variant === "baseline" ? "attack" : "baseline";
-      document.getElementById("match-white").value = `${c.variant}_step_${c.step}`;
-      document.getElementById("match-black").value = otherVariant;
-      document.getElementById("match-type").value = "model";
-      document.getElementById("match-form").requestSubmit();
+      // Quick-spectate: set the clicked checkpoint as the white side
+      // and pre-fill the form (don't auto-submit).
+      const whiteModel = document.querySelector('.side-model[data-side="white"]');
+      const whiteCkpt = document.querySelector('.side-checkpoint[data-side="white"]');
+      const blackModel = document.querySelector('.side-model[data-side="black"]');
+      if (whiteModel) {
+        whiteModel.value = c.variant;
+        populateCheckpointDropdown("white", c.variant).then(() => {
+          if (whiteCkpt) whiteCkpt.value = `${c.variant}_step_${c.step}`;
+        });
+      }
+      // Pick a different variant for black
+      const other = trainerVariants.find(v => v !== c.variant) || "baseline";
+      if (blackModel) {
+        blackModel.value = other;
+        populateCheckpointDropdown("black", other);
+      }
+      typeSelChangeTo("model");
+      window.scrollTo({ top: document.getElementById("match-form").offsetTop, behavior: "smooth" });
     });
     tbody.appendChild(row);
   }
 }
 
+function typeSelChangeTo(val) {
+  const sel = document.getElementById("match-type");
+  sel.value = val;
+  sel.dispatchEvent(new Event("change"));
+}
+
 // Spectate ------------------------------------------------------------------
 
-function openSpectate(match) {
+function openSpectate(match, body) {
   document.getElementById("spectate-modal").classList.remove("hidden");
   document.getElementById("spectate-title").textContent = `Match #${match.id} (${match.type})`;
   document.getElementById("spectate-moves").innerHTML = "";
   document.getElementById("spectate-status").textContent = "starting...";
+  // Pre-fill player names from the body if available
+  if (body && body.type === "model") {
+    document.getElementById("player-white-name").textContent = describePlayer(body.white);
+    document.getElementById("player-black-name").textContent = describePlayer(body.black);
+  } else {
+    document.getElementById("player-white-name").textContent = "—";
+    document.getElementById("player-black-name").textContent = "—";
+  }
   drawBoard("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
   connectSpectateStream();
+}
+
+function describePlayer(desc) {
+  if (typeof desc === "string") return desc;
+  if (!desc || typeof desc !== "object") return "?";
+  if (desc.type === "stockfish") {
+    if (desc.label) return desc.label;
+    if (desc.time_limit_ms) return `Stockfish t${desc.time_limit_ms}ms`;
+    return `Stockfish d${desc.depth}`;
+  }
+  if (desc.type === "model") return desc.name || "model";
+  return "?";
 }
 
 function closeSpectate() {
@@ -302,7 +447,6 @@ function closeSpectate() {
 
 function connectSpectateStream() {
   if (spectateSource) spectateSource.close();
-  // SSE — modern browsers (and EventSource polyfills) work.
   try {
     spectateSource = new EventSource("/api/matches/stream");
     spectateSource.onmessage = (e) => {
@@ -320,18 +464,35 @@ function connectSpectateStream() {
 }
 
 function handleSpectateEvent(evt) {
+  if (evt.type === "start") {
+    if (evt.white) document.getElementById("player-white-name").textContent = evt.white;
+    if (evt.black) document.getElementById("player-black-name").textContent = evt.black;
+    return;
+  }
   if (evt.type === "move" || evt.type === "drill_move") {
     if (evt.fen) drawBoard(evt.fen);
     if (evt.san) {
+      const ply = evt.ply ?? "?";
+      const isBlack = evt.side === "black";
+      // Format as "12. e4" for white or "12... Nf6" for black
+      const text = isBlack
+        ? `${ply}... ${evt.san}`
+        : `${ply}. ${evt.san}`;
       const li = document.createElement("li");
-      li.textContent = `${evt.ply ?? "?"}. ${evt.san}`;
+      li.textContent = text;
+      li.className = `move-${evt.side || "white"}`;
       document.getElementById("spectate-moves").appendChild(li);
       document.getElementById("spectate-moves").scrollTop = 1e9;
     }
     if (evt.eval != null) updateEvalBar(evt.eval);
     if (evt.type === "drill_move") {
       const st = document.getElementById("spectate-status");
-      st.textContent = evt.correct ? "✓ correct" : `✗ expected ${evt.expected_san || "(?)"}`;
+      st.textContent = evt.correct
+        ? `✓ correct (${evt.by || ""})`
+        : `✗ expected ${evt.expected_san || "(?)"} (played ${evt.san})`;
+    } else if (evt.by) {
+      document.getElementById("spectate-status").textContent =
+        `Last move: ${evt.san} by ${evt.by}`;
     }
   } else if (evt.type === "done" || evt.type === "result") {
     document.getElementById("spectate-status").textContent = `Result: ${evt.result || "?"}`;
@@ -386,7 +547,6 @@ function parseFenBoard(fen) {
 }
 
 function updateEvalBar(value) {
-  // value in [-1, 1]; 0 = equal, 1 = white winning
   const clamped = Math.max(-1, Math.min(1, value));
   const whitePct = 50 + clamped * 50;
   document.getElementById("eval-bar-white").style.width = `${whitePct}%`;

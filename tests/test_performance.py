@@ -46,7 +46,7 @@ def _make_trainer(tmpdir: str):
     trainer._last_buffer_target_size = 100_000
     trainer._current_mcts_visits = 200
     trainer.VARIANTS = ["baseline", "attack", "est"]
-    trainer.buffers = {v: ReplayBuffer(max_size=100_000) for v in trainer.VARIANTS}
+    trainer.buffers = {v: ReplayBuffer(max_size=1_000) for v in trainer.VARIANTS}
     trainer.evaluator = MagicMock()
     trainer.evaluator.mcts_visits = 400
     trainer.models = {}

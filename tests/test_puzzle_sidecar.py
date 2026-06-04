@@ -55,7 +55,7 @@ def _make_trainer(tmpdir: str):
     trainer._last_buffer_target_size = 100_000
     trainer._current_mcts_visits = 200
     trainer.VARIANTS = ["baseline"]
-    trainer.buffers = {"baseline": ReplayBuffer(max_size=100_000)}
+    trainer.buffers = {"baseline": ReplayBuffer(max_size=1_000)}
     trainer.evaluator = type("E", (), {"mcts_visits": 400})()
     trainer.models = {}
     trainer.optimizers = {}

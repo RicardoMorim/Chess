@@ -15,6 +15,7 @@ Why stdlib?
 Endpoints (JSON unless noted):
   GET  /api/status              -> snapshot of trainer state + resources
   GET  /api/checkpoints         -> list of saved checkpoints
+                                   Optional ?variant=<name> filter
   GET  /api/variants            -> list of model variants
   GET  /api/modes               -> available performance modes
   GET  /api/knobs               -> current values of hot-swappable knobs
@@ -23,6 +24,10 @@ Endpoints (JSON unless noted):
   POST /api/auto_mode           -> {"enabled": bool}
   POST /api/pause               -> {"paused": bool}
   POST /api/matches             -> {"type": "model"|"puzzle", ...}
+                                   Model matches: white/black are flexible —
+                                     string ("baseline", "stockfish") or
+                                     {"type":"model", "name":"baseline_step_35"}
+                                     or {"type":"stockfish", "depth":12, "time_limit_ms":5000}
   GET  /api/matches             -> list of recent matches
   GET  /api/matches/stream      -> SSE: live match events
   GET  /                        -> dashboard/index.html (served if available)
@@ -210,8 +215,14 @@ def _trainer_snapshot(trainer: "LeagueTrainer") -> Dict[str, Any]:
     return snap
 
 
-def _checkpoints_snapshot(trainer: "LeagueTrainer") -> List[Dict[str, Any]]:
-    """List of saved checkpoints with metadata."""
+def _checkpoints_snapshot(trainer: "LeagueTrainer", variant: Optional[str] = None) -> List[Dict[str, Any]]:
+    """List of saved checkpoints with metadata.
+
+    Args:
+        trainer: The LeagueTrainer instance.
+        variant: If provided, only return checkpoints for this variant.
+            Otherwise return all variants.
+    """
     out: List[Dict[str, Any]] = []
     ckpt_dir: Optional[Path] = getattr(trainer, "checkpoint_dir", None)
     if ckpt_dir is None or not ckpt_dir.exists():
@@ -219,12 +230,14 @@ def _checkpoints_snapshot(trainer: "LeagueTrainer") -> List[Dict[str, Any]]:
     for p in sorted(ckpt_dir.glob("*_step_*.pt")):
         name = p.stem  # e.g. baseline_step_35
         try:
-            variant, _, step_str = name.partition("_step_")
+            v, _, step_str = name.partition("_step_")
             step = int(step_str)
         except ValueError:
             continue
+        if variant is not None and v != variant:
+            continue
         out.append({
-            "variant": variant,
+            "variant": v,
             "step": step,
             "path": str(p),
             "mtime": p.stat().st_mtime,
@@ -362,7 +375,13 @@ class ControlServer(threading.Thread):
                 if path == "/api/status":
                     return self._send_json(_trainer_snapshot(server.trainer))
                 if path == "/api/checkpoints":
-                    return self._send_json(_checkpoints_snapshot(server.trainer))
+                    # Optional ?variant=baseline filter for the spectate UI
+                    from urllib.parse import parse_qs, urlparse
+                    qs = parse_qs(urlparse(self.path).query)
+                    variant = (qs.get("variant") or [None])[0]
+                    return self._send_json(
+                        _checkpoints_snapshot(server.trainer, variant=variant)
+                    )
                 if path == "/api/variants":
                     return self._send_json(_variants_snapshot(server.trainer))
                 if path == "/api/modes":
@@ -536,10 +555,64 @@ class ControlServer(threading.Thread):
             trainer._training_pause_event.clear()
 
     def _enqueue_match(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Queue a spectate match. Returns the queued match descriptor."""
+        """Queue a spectate match. Returns the queued match descriptor.
+
+        Validates the new flexible player schema:
+          white / black can each be a string (e.g. "baseline" / "stockfish")
+          or a dict like {"type": "stockfish", "depth": 12, "label": "..."}
+        """
         mtype = payload.get("type", "model")
         if mtype not in ("model", "puzzle"):
             return {"ok": False, "error": f"unknown match type '{mtype}'"}
+
+        # Validate model-type matches: visits must be sane, white/black must
+        # be string or dict, stockfish dicts must have type=="stockfish".
+        if mtype == "model":
+            visits = payload.get("visits", 100)
+            try:
+                visits = int(visits)
+            except (TypeError, ValueError):
+                return {"ok": False, "error": f"visits must be int (got {visits!r})"}
+            if visits < 1 or visits > 5000:
+                return {"ok": False, "error": f"visits out of range [1, 5000] (got {visits})"}
+            payload["visits"] = visits
+
+            for side in ("white", "black"):
+                desc = payload.get(side)
+                if desc is None:
+                    continue
+                if isinstance(desc, str):
+                    continue
+                if not isinstance(desc, dict):
+                    return {"ok": False, "error": f"{side} must be string or dict (got {type(desc).__name__})"}
+                t = desc.get("type")
+                if t not in ("model", "stockfish"):
+                    return {"ok": False, "error": f"{side}.type must be 'model' or 'stockfish' (got {t!r})"}
+                if t == "stockfish":
+                    depth = desc.get("depth", 12)
+                    try:
+                        depth = int(depth)
+                    except (TypeError, ValueError):
+                        return {"ok": False, "error": f"{side}.depth must be int"}
+                    if depth < 1 or depth > 30:
+                        return {"ok": False, "error": f"{side}.depth out of range [1, 30]"}
+                    desc["depth"] = depth
+                    if "time_limit_ms" in desc and desc["time_limit_ms"] is not None:
+                        try:
+                            desc["time_limit_ms"] = int(desc["time_limit_ms"])
+                        except (TypeError, ValueError):
+                            return {"ok": False, "error": f"{side}.time_limit_ms must be int"}
+                elif t == "model":
+                    if not desc.get("name"):
+                        return {"ok": False, "error": f"{side}.name is required for model player"}
+        elif mtype == "puzzle":
+            visits = payload.get("visits", 100)
+            try:
+                visits = int(visits)
+            except (TypeError, ValueError):
+                return {"ok": False, "error": f"visits must be int (got {visits!r})"}
+            payload["visits"] = visits
+
         match = {
             "id": int(time.time() * 1000),
             "type": mtype,

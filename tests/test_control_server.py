@@ -49,7 +49,7 @@ def _make_trainer(tmpdir: str):
     trainer._last_buffer_target_size = 100_000
     trainer._current_mcts_visits = 200
     trainer.VARIANTS = ["baseline", "attack", "est"]
-    trainer.buffers = {v: ReplayBuffer(max_size=100_000) for v in trainer.VARIANTS}
+    trainer.buffers = {v: ReplayBuffer(max_size=1_000) for v in trainer.VARIANTS}
     trainer.evaluator = type("E", (), {"mcts_visits": 400})()
     trainer.models = {}
     trainer.optimizers = {}
@@ -167,6 +167,29 @@ class ControlServerTests(unittest.TestCase):
         self.assertGreaterEqual(len(body), 2)
         names = {item["variant"] for item in body}
         self.assertIn("baseline", names)
+
+    def test_get_checkpoints_filter_by_variant(self):
+        """?variant=baseline returns only baseline checkpoints."""
+        for v in ("baseline", "attack", "est"):
+            (self.trainer.checkpoint_dir / f"{v}_step_5.pt").write_bytes(b"x" * 100)
+            (self.trainer.checkpoint_dir / f"{v}_step_10.pt").write_bytes(b"x" * 100)
+        c = _conn(self.server)
+        c.request("GET", "/api/checkpoints?variant=baseline")
+        r = c.getresponse()
+        body = json.loads(r.read().decode())
+        self.assertEqual(len(body), 2)
+        for item in body:
+            self.assertEqual(item["variant"], "baseline")
+        # And attack
+        c.request("GET", "/api/checkpoints?variant=attack")
+        body = json.loads(c.getresponse().read().decode())
+        self.assertEqual(len(body), 2)
+        for item in body:
+            self.assertEqual(item["variant"], "attack")
+        # And unknown variant -> empty
+        c.request("GET", "/api/checkpoints?variant=ghost")
+        body = json.loads(c.getresponse().read().decode())
+        self.assertEqual(len(body), 0)
 
     def test_post_mode_eco(self):
         c = _conn(self.server)
@@ -302,6 +325,91 @@ class ControlServerTests(unittest.TestCase):
         types = [m["type"] for m in body["history"]]
         self.assertIn("puzzle", types)
 
+    def test_post_match_with_stockfish_dict(self):
+        """Stockfish side via dict descriptor must validate and queue."""
+        while not self.trainer._spectate_queue.empty():
+            self.trainer._spectate_queue.get_nowait()
+        c = _conn(self.server)
+        body = json.dumps({
+            "type": "model",
+            "white": {"type": "model", "name": "baseline"},
+            "black": {"type": "stockfish", "depth": 15, "label": "MySF"},
+            "visits": 100,
+        }).encode()
+        c.request("POST", "/api/matches", body, {"Content-Type": "application/json"})
+        r = c.getresponse()
+        resp = json.loads(r.read().decode())
+        self.assertTrue(resp["ok"], resp)
+        queued = self.trainer._spectate_queue.get_nowait()
+        self.assertEqual(queued["params"]["black"]["type"], "stockfish")
+        self.assertEqual(queued["params"]["black"]["depth"], 15)
+
+    def test_post_match_stockfish_shorthand(self):
+        """'stockfish' as a string is treated as a Stockfish side with defaults."""
+        while not self.trainer._spectate_queue.empty():
+            self.trainer._spectate_queue.get_nowait()
+        c = _conn(self.server)
+        body = json.dumps({
+            "type": "model",
+            "white": "baseline",
+            "black": "stockfish",
+        }).encode()
+        c.request("POST", "/api/matches", body, {"Content-Type": "application/json"})
+        r = c.getresponse()
+        resp = json.loads(r.read().decode())
+        self.assertTrue(resp["ok"], resp)
+
+    def test_post_match_invalid_visits(self):
+        c = _conn(self.server)
+        body = json.dumps({
+            "type": "model", "white": "a", "black": "b", "visits": 99999,
+        }).encode()
+        c.request("POST", "/api/matches", body, {"Content-Type": "application/json"})
+        resp = json.loads(c.getresponse().read().decode())
+        self.assertFalse(resp["ok"])
+        self.assertIn("visits", resp["error"])
+
+    def test_post_match_invalid_stockfish_type(self):
+        c = _conn(self.server)
+        body = json.dumps({
+            "type": "model",
+            "white": {"type": "stockfish", "depth": 999},
+            "black": "baseline",
+        }).encode()
+        c.request("POST", "/api/matches", body, {"Content-Type": "application/json"})
+        resp = json.loads(c.getresponse().read().decode())
+        self.assertFalse(resp["ok"])
+        self.assertIn("depth", resp["error"])
+
+    def test_post_match_model_missing_name(self):
+        c = _conn(self.server)
+        body = json.dumps({
+            "type": "model",
+            "white": {"type": "model"},
+            "black": "baseline",
+        }).encode()
+        c.request("POST", "/api/matches", body, {"Content-Type": "application/json"})
+        resp = json.loads(c.getresponse().read().decode())
+        self.assertFalse(resp["ok"])
+        self.assertIn("name", resp["error"])
+
+    def test_post_match_with_time_limit(self):
+        """time_limit_ms takes precedence over depth in the dict."""
+        while not self.trainer._spectate_queue.empty():
+            self.trainer._spectate_queue.get_nowait()
+        c = _conn(self.server)
+        body = json.dumps({
+            "type": "model",
+            "white": "baseline",
+            "black": {"type": "stockfish", "time_limit_ms": 5000},
+        }).encode()
+        c.request("POST", "/api/matches", body, {"Content-Type": "application/json"})
+        r = c.getresponse()
+        resp = json.loads(r.read().decode())
+        self.assertTrue(resp["ok"], resp)
+        queued = self.trainer._spectate_queue.get_nowait()
+        self.assertEqual(queued["params"]["black"]["time_limit_ms"], 5000)
+
     def test_get_root_serves_html_fallback(self):
         c = _conn(self.server)
         c.request("GET", "/")
@@ -361,6 +469,47 @@ class ControlServerDashboardTests(unittest.TestCase):
         self.assertIn(b'data-mode="eco"', body)
         self.assertIn(b'data-mode="balanced"', body)
         self.assertIn(b'data-mode="boost"', body)
+
+    def test_dashboard_has_spectate_player_selectors(self):
+        """Each side (white/black) must have its own model+engine selector."""
+        c = _conn(self.server)
+        c.request("GET", "/")
+        r = c.getresponse()
+        body = r.read()
+        # Two sides, each with engine and model selectors
+        self.assertIn(b'side-engine', body)
+        self.assertIn(b'side-model', body)
+        self.assertIn(b'side-checkpoint', body)
+        self.assertIn(b'side-white', body)
+        self.assertIn(b'side-black', body)
+        # Player names in the modal
+        self.assertIn(b'player-white-name', body)
+        self.assertIn(b'player-black-name', body)
+        # Stockfish fields are present
+        self.assertIn(b'side-depth', body)
+        self.assertIn(b'side-time', body)
+        self.assertIn(b'stockfish', body)
+
+    def test_dashboard_js_handles_stockfish_descriptors(self):
+        """The frontend buildPlayerDescriptor must handle stockfish dicts."""
+        c = _conn(self.server)
+        c.request("GET", "/dashboard.js")
+        body = c.getresponse().read()
+        # Frontend knows how to build stockfish descriptors
+        self.assertIn(b'buildPlayerDescriptor', body)
+        self.assertIn(b'stockfish', body)
+        self.assertIn(b'time_limit_ms', body)
+        self.assertIn(b'player-white-name', body)
+
+    def test_dashboard_js_handles_player_names(self):
+        """Player name fields must be updated on start and move events."""
+        c = _conn(self.server)
+        c.request("GET", "/dashboard.js")
+        body = c.getresponse().read()
+        self.assertIn(b'player-white-name', body)
+        self.assertIn(b'player-black-name', body)
+        self.assertIn(b'evt.white', body)
+        self.assertIn(b'evt.black', body)
 
     def test_path_escape_blocked(self):
         """Dashboard dir traversal attempts are rejected."""

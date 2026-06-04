@@ -127,7 +127,8 @@
 
   <section class="card">
     <h2>Spectate</h2>
-    <p class="muted">Queue a match between two checkpoints (or try a puzzle drill).</p>
+    <p class="muted">Queue a match between two players. Each side can be a model
+    (live or from a checkpoint) or Stockfish.</p>
     <form id="match-form" class="match-form">
       <label>Type
         <select id="match-type">
@@ -135,10 +136,63 @@
           <option value="puzzle">Puzzle drill</option>
         </select>
       </label>
-      <label>White <input id="match-white" value="baseline" placeholder="variant or 'baseline_step_35'"></label>
-      <label>Black <input id="match-black" value="attack" placeholder="variant or 'attack_step_35'"></label>
-      <label>Puzzle ID <input id="match-puzzle-id" placeholder="optional puzzle id"></label>
-      <label>Visits <input id="match-visits" type="number" value="100" min="10" max="1600"></label>
+
+      <fieldset class="side-config" id="side-white">
+        <legend><span class="side-badge side-white">⬜ White</span></legend>
+        <label>Engine
+          <select class="side-engine" data-side="white">
+            <option value="model">Model (live or checkpoint)</option>
+            <option value="stockfish">Stockfish</option>
+          </select>
+        </label>
+        <label class="model-only">Model
+          <select class="side-model" data-side="white"></select>
+        </label>
+        <label class="model-only">Checkpoint
+          <select class="side-checkpoint" data-side="white">
+            <option value="">— live variant —</option>
+          </select>
+        </label>
+        <label class="stockfish-only" style="display:none">Depth
+          <input class="side-depth" data-side="white" type="number" value="12" min="1" max="30">
+        </label>
+        <label class="stockfish-only" style="display:none">Time limit (ms, optional)
+          <input class="side-time" data-side="white" type="number" placeholder="e.g. 5000">
+        </label>
+        <label class="stockfish-only" style="display:none">Label
+          <input class="side-label" data-side="white" type="text" placeholder="e.g. Stockfish 16">
+        </label>
+      </fieldset>
+
+      <fieldset class="side-config" id="side-black">
+        <legend><span class="side-badge side-black">⬛ Black</span></legend>
+        <label>Engine
+          <select class="side-engine" data-side="black">
+            <option value="model">Model (live or checkpoint)</option>
+            <option value="stockfish">Stockfish</option>
+          </select>
+        </label>
+        <label class="model-only">Model
+          <select class="side-model" data-side="black"></select>
+        </label>
+        <label class="model-only">Checkpoint
+          <select class="side-checkpoint" data-side="black">
+            <option value="">— live variant —</option>
+          </select>
+        </label>
+        <label class="stockfish-only" style="display:none">Depth
+          <input class="side-depth" data-side="black" type="number" value="12" min="1" max="30">
+        </label>
+        <label class="stockfish-only" style="display:none">Time limit (ms, optional)
+          <input class="side-time" data-side="black" type="number" placeholder="e.g. 5000">
+        </label>
+        <label class="stockfish-only" style="display:none">Label
+          <input class="side-label" data-side="black" type="text" placeholder="e.g. Stockfish 16">
+        </label>
+      </fieldset>
+
+      <label id="puzzle-id-row">Puzzle ID <input id="match-puzzle-id" placeholder="optional puzzle id"></label>
+      <label>Visits (MCTS only) <input id="match-visits" type="number" value="100" min="10" max="1600"></label>
       <button type="submit" class="primary">▶ Start match</button>
     </form>
     <div id="match-status" class="muted"></div>
@@ -156,7 +210,15 @@
         <canvas id="spectate-board" width="384" height="384"></canvas>
       </div>
       <div class="eval-wrap">
-        <div class="eval-label">Position eval</div>
+        <div class="player-row">
+          <span class="side-badge side-white">⬜ White</span>
+          <span class="player-name" id="player-white-name">—</span>
+        </div>
+        <div class="player-row">
+          <span class="side-badge side-black">⬛ Black</span>
+          <span class="player-name" id="player-black-name">—</span>
+        </div>
+        <div class="eval-label">Position eval (from white's view)</div>
         <div class="eval-bar"><div id="eval-bar-white" class="eval-bar-white"></div></div>
         <div class="eval-value" id="eval-value">0.00</div>
         <div class="moves-label">Moves</div>

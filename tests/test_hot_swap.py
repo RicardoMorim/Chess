@@ -47,7 +47,7 @@ def _make_trainer(tmpdir: str):
     trainer._current_mcts_visits = 200
     trainer.VARIANTS = ["baseline", "attack", "est"]
     trainer.buffers = {
-        v: ReplayBuffer(max_size=100_000) for v in trainer.VARIANTS
+        v: ReplayBuffer(max_size=1_000) for v in trainer.VARIANTS
     }
     trainer.evaluator = MagicMock()
     trainer.evaluator.mcts_visits = 400
@@ -117,12 +117,12 @@ class HotSwapKnobTests(unittest.TestCase):
     def test_replay_buffer_resize_propagates(self):
         """REPLAY_BUFFER_MAX_SIZE change should resize all variant buffers."""
         for buf in self.trainer.buffers.values():
-            self.assertEqual(buf.max_size, 100_000)
-        self.trainer.set_knob("REPLAY_BUFFER_MAX_SIZE", 250_000)
+            self.assertEqual(buf.max_size, 1_000)
+        self.trainer.set_knob("REPLAY_BUFFER_MAX_SIZE", 2_000)
         # Immediate? No — this is deferred. Apply now:
         self.trainer._apply_pending_changes()
         for buf in self.trainer.buffers.values():
-            self.assertEqual(buf.max_size, 250_000)
+            self.assertEqual(buf.max_size, 2_000)
 
     def test_evaluator_mcts_visits_propagates(self):
         """MCTS_VISITS_EVAL change should reach self.evaluator.mcts_visits."""
