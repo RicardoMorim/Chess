@@ -12,16 +12,16 @@ Two play modes:
     correct/incorrect vs the puzzle's expected line. Useful as a
     quick proxy for tactical strength.
 
-SpectateQueue (worker thread) drains queued matches from the trainer's
-``_spectate_queue`` and publishes events through the control server's
-``MatchEventBus`` so dashboards can stream them via SSE.
+``SpectateWorker`` (background thread) drains queued matches from the
+trainer's ``_spectate_queue`` and publishes events through the control
+server's ``MatchEventBus`` so dashboards can stream them via SSE.
 """
 
 from __future__ import annotations
 
 import logging
+import random
 import threading
-import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -48,19 +48,18 @@ def _load_model_for_spectate(trainer: "LeagueTrainer", name: str) -> Any:
     if "_step_" in name:
         try:
             variant, _, step_str = name.partition("_step_")
-            step = int(step_str)
+            int(step_str)  # validate that it's an int
         except ValueError:
             raise ValueError(f"Cannot parse spectate name: '{name}'")
         ckpt_path = trainer.checkpoint_dir / f"{name}.pt"
         if not ckpt_path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
-        # Use the live model's architecture as a template
         if variant not in trainer.models:
             raise ValueError(f"Unknown variant: '{variant}'")
-        template = trainer.models[variant]
         from train.core.models import create_model
+        import torch
         # Recreate the model from the saved config
-        state = __import__("torch").load(str(ckpt_path), map_location="cpu", weights_only=False)
+        state = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
         cfg = state.get("config", {})
         model = create_model(variant=variant, value_dropout=0.0,
                              **{k: v for k, v in cfg.items() if k != "variant"})
@@ -252,6 +251,16 @@ class PuzzleDrill:
         self.max_wrong = max_wrong
         self.on_event = on_event or (lambda e: None)
         self._cancel = threading.Event()
+        self._autodetect_channels()
+
+    def _autodetect_channels(self) -> None:
+        """Derive input channels from the model if not explicitly set."""
+        if self.config.input_channels is not None or self.model is None:
+            return
+        try:
+            self.config.input_channels = int(self.model.conv_in.weight.shape[1])
+        except Exception:
+            pass
 
     def cancel(self) -> None:
         self._cancel.set()
@@ -506,8 +515,7 @@ class SpectateWorker(threading.Thread):
             meta = puzzles[puzzle_id]
             chosen_id = puzzle_id
         else:
-            # Random pick; deterministic if seed is set on the worker
-            import random
+            # Random pick; seed the caller if determinism is needed
             chosen_id = random.choice(list(puzzles.keys()))
             meta = puzzles[chosen_id]
         return PuzzleSample(
