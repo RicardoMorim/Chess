@@ -126,6 +126,25 @@ class SoftCrossEntropyTests(unittest.TestCase):
         hard = torch.nn.functional.cross_entropy(logits, idx)
         self.assertAlmostEqual(soft.item(), hard.item(), places=4)
 
+    def test_works_on_1d_class_indices(self):
+        """Puzzle/progame datasets return 1D long class indices — must one-hot first."""
+        torch.manual_seed(0)
+        logits = torch.randn(8, 4672, requires_grad=True)
+        idx = torch.randint(0, 4672, (8,))
+        soft = _soft_cross_entropy(logits, idx)
+        hard = torch.nn.functional.cross_entropy(logits, idx)
+        # One-hotted 1D path should match the hard cross_entropy baseline.
+        self.assertAlmostEqual(soft.item(), hard.item(), places=4)
+
+    def test_works_on_2d_1col_class_indices(self):
+        """Stack of 0-d class indices may come out as (B, 1) — must still work."""
+        torch.manual_seed(0)
+        logits = torch.randn(4, 4672, requires_grad=True)
+        idx = torch.randint(0, 4672, (4, 1))
+        soft = _soft_cross_entropy(logits, idx)
+        hard = torch.nn.functional.cross_entropy(logits, idx.squeeze(-1))
+        self.assertAlmostEqual(soft.item(), hard.item(), places=4)
+
 
 class DefaultPolicySizeTests(unittest.TestCase):
     """The default buffer policy size must match the model's policy head."""

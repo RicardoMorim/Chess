@@ -85,14 +85,22 @@ def _convert_pos_channels(
 
 
 def _soft_cross_entropy(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Cross-entropy with a *soft* (probability) target distribution.
+    """Cross-entropy supporting both *soft* and *hard* targets.
 
-    Standard ``F.cross_entropy`` only accepts 1D class-index targets. MCTS
-    policies are visit-count distributions over ``ACTION_SPACE_SIZE = 4672``
-    moves, so we compute ``-sum(target * log_softmax(logits))`` directly. The
-    mean across the batch keeps the loss scale comparable to the hard-target
-    version.
+    Accepts ``target`` in either of two shapes:
+
+      * **Soft (MCTS self-play)** -- ``(B, ACTION_SPACE_SIZE)`` probability
+        distribution over moves. Computed as
+        ``-sum(target * log_softmax(logits))``.
+      * **Hard (puzzle / pro-game)** -- ``(B,)`` long tensor of best-move
+        class indices. One-hotted into a sparse distribution first so the
+        same arithmetic applies.
+
+    The mean across the batch keeps the loss scale comparable to
+    ``F.cross_entropy``.
     """
+    if target.dim() == 1 or (target.dim() == 2 and target.shape[-1] == 1):
+        target = torch.nn.functional.one_hot(target.long().view(-1), logits.shape[-1]).float()
     log_probs = torch.nn.functional.log_softmax(logits, dim=1)
     return -(target * log_probs).sum(dim=1).mean()
 
