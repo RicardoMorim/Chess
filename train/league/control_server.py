@@ -168,6 +168,24 @@ def _trainer_snapshot(trainer: "LeagueTrainer") -> Dict[str, Any]:
         "throughput_gpm": {},
         "buffers": {},
         "resources": _resource_snapshot(),
+        "worker_config": {
+            "use_gpu_batching": bool(getattr(trainer, "use_gpu_batching", False)),
+            "num_self_play_workers": int(getattr(trainer, "_num_self_play_workers", 0) or 0),
+            "variant_parallelism": int(getattr(trainer, "_variant_parallelism", 0) or 0),
+            "gpu_self_play_workers": int(getattr(trainer, "GPU_SELF_PLAY_WORKERS", 0) or 0),
+            "estimated_processes": (
+                int(getattr(trainer, "_num_self_play_workers", 0) or 0)
+                * int(getattr(trainer, "_variant_parallelism", 0) or 0)
+                + 1
+            ),
+            "estimated_worker_ram_gb": round(
+                (int(getattr(trainer, "_num_self_play_workers", 0) or 0)
+                 * int(getattr(trainer, "_variant_parallelism", 0) or 0)
+                 + 1)
+                * 400 / 1024,
+                2,
+            ),
+        },
     }
 
     metrics = getattr(trainer, "metrics", None)

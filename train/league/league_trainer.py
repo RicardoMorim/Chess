@@ -110,7 +110,11 @@ class LeagueTrainer:
 
     # When GPU batching is enabled, self-play is often bottlenecked by request concurrency.
     # More CPU workers helps fill GPU batches even if CPU utilization stays moderate.
-    GPU_SELF_PLAY_WORKERS = 14
+    # NOTE: each Python worker process uses ~300-500 MB at startup (PyTorch + numpy
+    # + chess imports on Windows). With 3 variants in parallel, 14 workers/variant
+    # spawned 42 processes (~17 GB). The default is now 8 to leave headroom on
+    # memory-constrained laptops. Hot-settable via set_knob() at runtime.
+    GPU_SELF_PLAY_WORKERS = 8
 
     # MCTS hyperparameters (AlphaZero paper: 800 sims/move for both training and eval).
     # We use 200 for self-play (4× less than paper, scaled for 1 GPU) and 400 for eval
@@ -950,6 +954,7 @@ class LeagueTrainer:
         "MCTS_VISITS_EVAL",
         "SELF_PLAY_VARIANT_PARALLELISM",
         "NUM_SELF_PLAY_WORKERS",
+        "GPU_SELF_PLAY_WORKERS",
         "REPLAY_BUFFER_MAX_SIZE",
         "GPU_INFER_BATCH_SIZE",
         "CHECKPOINT_EVERY_N_ROUNDS",
@@ -1009,8 +1014,19 @@ class LeagueTrainer:
 
         # Propagate to derived state / collaborators.
         if name == "NUM_SELF_PLAY_WORKERS":
-            target = self.GPU_SELF_PLAY_WORKERS if self.use_gpu_batching else self.NUM_SELF_PLAY_WORKERS
+            # When GPU batching is enabled, both NUM_SELF_PLAY_WORKERS and
+            # GPU_SELF_PLAY_WORKERS control the worker count. Honour whichever
+            # is currently higher (typically the GPU one) so the GPU pipeline
+            # stays fed. The user can also set GPU_SELF_PLAY_WORKERS directly.
+            if self.use_gpu_batching:
+                target = max(self.GPU_SELF_PLAY_WORKERS, self.NUM_SELF_PLAY_WORKERS)
+            else:
+                target = self.NUM_SELF_PLAY_WORKERS
             self._num_self_play_workers = max(1, int(target))
+        elif name == "GPU_SELF_PLAY_WORKERS":
+            # Only relevant when GPU batching is on; otherwise NUM_SELF_PLAY_WORKERS wins.
+            if self.use_gpu_batching:
+                self._num_self_play_workers = max(1, int(self.GPU_SELF_PLAY_WORKERS))
         elif name == "SELF_PLAY_VARIANT_PARALLELISM":
             self._variant_parallelism = max(1, int(self.SELF_PLAY_VARIANT_PARALLELISM))
         elif name == "REPLAY_BUFFER_MAX_SIZE":
@@ -1396,11 +1412,18 @@ class LeagueTrainer:
 
             # Moderate pressure: reduce workers and variant parallelism
             if used_pct >= 90:
-                self._num_self_play_workers = max(1, self.NUM_SELF_PLAY_WORKERS // 2)
+                # Halve workers (works for both CPU and GPU paths)
+                if self.use_gpu_batching:
+                    self._num_self_play_workers = max(1, self.GPU_SELF_PLAY_WORKERS // 2)
+                else:
+                    self._num_self_play_workers = max(1, self.NUM_SELF_PLAY_WORKERS // 2)
                 self._variant_parallelism = 1
                 self._buffer_target_size = max(10000, int(self.REPLAY_BUFFER_MAX_SIZE * 0.6))
             elif used_pct >= 85:
-                self._num_self_play_workers = max(1, self.NUM_SELF_PLAY_WORKERS - 2)
+                if self.use_gpu_batching:
+                    self._num_self_play_workers = max(1, self.GPU_SELF_PLAY_WORKERS - 2)
+                else:
+                    self._num_self_play_workers = max(1, self.NUM_SELF_PLAY_WORKERS - 2)
                 self._variant_parallelism = max(1, self.SELF_PLAY_VARIANT_PARALLELISM - 1)
                 self._buffer_target_size = max(15000, int(self.REPLAY_BUFFER_MAX_SIZE * 0.8))
 

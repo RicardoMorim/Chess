@@ -42,9 +42,10 @@ Keep this file minimal. Link to detailed docs rather than copying them.
 - Hot-swap knobs: many are immediate (next training step), some are deferred (next round). See `train/TUNING_REFERENCE.md` for the split.
 - Puzzle spectate drills need `train/cache/puzzles_meta.pkl` — build it once with `python train/build_puzzle_sidecar.py`.
 - The HTTP control server binds to `127.0.0.1` only by default; do not change `control_host` without adding auth.
-- **Memory budget:** 3 variants × buffer_size × 11KB. `balanced` = 3.3 GB; use `low_memory` (~0.6 GB) on laptops <32GB RAM.
+- **Memory budget:** 3 variants × buffer_size × 11KB. `balanced` = 3.3 GB replay + ~9.4 GB workers; use `low_memory` (~0.6 GB replay + ~3.1 GB workers) on laptops <32GB RAM.
 - **ReplayBuffer is compact:** pre-allocated fp16 arrays (no per-element Python objects). Live `set_max_size()` keeps the most recent entries.
-- **Performance presets (4 total):** `low_memory` (20K buf, 2 workers, 50 visits) → `eco` (30K, 3, 80) → `balanced` (100K, 6, 200) → `boost` (300K, 12, 400). Auto-mode walks this ladder.
+- **Performance presets (4 total):** `low_memory` (20K buf, 4 GPU workers, 50 visits) → `eco` (30K, 6, 80) → `balanced` (100K, 8, 200) → `boost` (300K, 14, 400). Auto-mode walks this ladder.
+- **GPU worker count spike:** the user saw 14 workers/variant × 3 variants = 42 Python processes (~17 GB) at startup. Default `GPU_SELF_PLAY_WORKERS` lowered from 14 to 8. Adjust at runtime via `trainer.set_knob("GPU_SELF_PLAY_WORKERS", N)` or the dashboard.
 
 ## Quick tips for agents
 

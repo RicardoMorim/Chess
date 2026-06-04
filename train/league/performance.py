@@ -43,6 +43,7 @@ PRESET_KNOBS: tuple = (
     "GAMES_PER_WORKER_PER_ROUND",
     "MCTS_VISITS_SELFPLAY",
     "NUM_SELF_PLAY_WORKERS",
+    "GPU_SELF_PLAY_WORKERS",
     "REPLAY_BUFFER_MAX_SIZE",
     "GPU_INFER_BATCH_SIZE",
     "STOCKFISH_BENCH_EVERY_N_ROUNDS",
@@ -62,6 +63,7 @@ class PerformancePreset:
     games_per_worker_per_round: int
     mcts_visits_selfplay: int
     num_self_play_workers: int
+    gpu_self_play_workers: int
     replay_buffer_max_size: int
     gpu_infer_batch_size: int
     stockfish_bench_every_n_rounds: int
@@ -76,6 +78,7 @@ class PerformancePreset:
             "GAMES_PER_WORKER_PER_ROUND": self.games_per_worker_per_round,
             "MCTS_VISITS_SELFPLAY": self.mcts_visits_selfplay,
             "NUM_SELF_PLAY_WORKERS": self.num_self_play_workers,
+            "GPU_SELF_PLAY_WORKERS": self.gpu_self_play_workers,
             "REPLAY_BUFFER_MAX_SIZE": self.replay_buffer_max_size,
             "GPU_INFER_BATCH_SIZE": self.gpu_infer_batch_size,
             "STOCKFISH_BENCH_EVERY_N_ROUNDS": self.stockfish_bench_every_n_rounds,
@@ -83,20 +86,37 @@ class PerformancePreset:
             "SELF_PLAY_VARIANT_PARALLELISM": self.self_play_variant_parallelism,
         }
 
+    def estimated_process_count(self) -> int:
+        """Total Python processes this preset will spawn when GPU batching is on.
+
+        Uses ``gpu_self_play_workers`` (the real worker count in the typical
+        GPU-batched setup). For CPU-only runs, swap to ``num_self_play_workers``.
+        """
+        return self.gpu_self_play_workers * self.self_play_variant_parallelism + 1
+
+    def estimated_worker_ram_gb(self, per_process_mb: float = 400.0) -> float:
+        """Rough RAM budget for self-play worker processes alone.
+
+        Each Windows Python worker process uses ~300-500 MB to import
+        PyTorch + numpy + chess. Use this for memory triage on the dashboard.
+        """
+        return round(self.estimated_process_count() * per_process_mb / 1024, 2)
+
 
 PRESETS: Dict[str, PerformancePreset] = {
     "low_memory": PerformancePreset(
         name="low_memory",
         description=(
-            "Constrained RAM (laptops <32GB). Tiny buffer, 2 workers, very "
+            "Constrained RAM (laptops <32GB). Tiny buffer, 4 GPU workers, very "
             "short MCTS. Trades training quality for low memory footprint "
-            "(~600MB replay buffer across 3 variants)."
+            "(~600MB replay buffer + ~2.5GB workers across 3 variants)."
         ),
         batch_size=64,
         training_steps_per_round=20,
         games_per_worker_per_round=2,
         mcts_visits_selfplay=50,
         num_self_play_workers=2,
+        gpu_self_play_workers=4,
         replay_buffer_max_size=20_000,
         gpu_infer_batch_size=16,
         stockfish_bench_every_n_rounds=200,
@@ -107,13 +127,14 @@ PRESETS: Dict[str, PerformancePreset] = {
         name="eco",
         description=(
             "Light training for when you're using the PC. "
-            "Small batch, few workers, short MCTS, frequent Stockfish benchmarks."
+            "Small batch, 6 GPU workers, short MCTS, frequent Stockfish benchmarks."
         ),
         batch_size=128,
         training_steps_per_round=25,
         games_per_worker_per_round=2,
         mcts_visits_selfplay=80,
         num_self_play_workers=3,
+        gpu_self_play_workers=6,
         replay_buffer_max_size=30_000,
         gpu_infer_batch_size=32,
         stockfish_bench_every_n_rounds=100,
@@ -122,12 +143,16 @@ PRESETS: Dict[str, PerformancePreset] = {
     ),
     "balanced": PerformancePreset(
         name="balanced",
-        description="Default. Matches the original class-level constants.",
+        description=(
+            "Default. 8 GPU workers (was 14), 100K buffer. "
+            "Matches the original class-level constants for everything else."
+        ),
         batch_size=256,
         training_steps_per_round=50,
         games_per_worker_per_round=5,
         mcts_visits_selfplay=200,
         num_self_play_workers=6,
+        gpu_self_play_workers=8,
         replay_buffer_max_size=100_000,
         gpu_infer_batch_size=64,
         stockfish_bench_every_n_rounds=25,
@@ -137,14 +162,15 @@ PRESETS: Dict[str, PerformancePreset] = {
     "boost": PerformancePreset(
         name="boost",
         description=(
-            "Overnight mode. 4x batch, 2x workers, 2x MCTS visits, "
-            "2x buffer. Use when you're away from the PC."
+            "Overnight mode. 14 GPU workers, 4x batch, 2x MCTS visits, "
+            "3x buffer. Use only when you have >32GB RAM."
         ),
         batch_size=1024,
         training_steps_per_round=100,
         games_per_worker_per_round=8,
         mcts_visits_selfplay=400,
         num_self_play_workers=12,
+        gpu_self_play_workers=14,
         replay_buffer_max_size=300_000,
         gpu_infer_batch_size=128,
         stockfish_bench_every_n_rounds=10,

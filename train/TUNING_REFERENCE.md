@@ -179,16 +179,30 @@ Or via the HTTP control server:
   curl -X POST http://127.0.0.1:7860/api/auto_mode -d '{"enabled":true}'
 """
 
-# Memory budget (3 variants x 22-channel fp16 position+policy, fp32 value):
+# Memory budget summary (3 variants, fp16 pos+policy, fp32 value, ~400 MB per
+# Python worker process on Windows because of the PyTorch + numpy + chess
+# imports on the spawn start-method):
+#
+#   mode         gpu_workers  variants  total_procs  replay_buf  worker_ram
+#   low_memory         4         2          9         0.6 GB     3.1 GB
+#   eco                6         2         13         1.0 GB     4.7 GB
+#   balanced           8         3         25         3.3 GB     9.4 GB
+#   boost             14         3         43        10.0 GB    16.4 GB
+#
+# Note: total RAM = worker_ram + replay_buf + 3 GPU inference procs (~1GB each)
+#                  + main process + OS overhead. The numbers above are
+#                  lower bounds; real usage is higher.
+
 PRESETS = {
-    "low_memory": {"BATCH_SIZE":   64, "NUM_SELF_PLAY_WORKERS":  2, "MCTS_VISITS_SELFPLAY":  50, "REPLAY_BUFFER_MAX_SIZE":  20_000, "STOCKFISH_BENCH_EVERY_N_ROUNDS": 200, "PUZZLE_BATCHES_PER_GAME_BATCH": 0, "buffer_gb": 0.6},
-    "eco":        {"BATCH_SIZE":  128, "NUM_SELF_PLAY_WORKERS":  3, "MCTS_VISITS_SELFPLAY":  80, "REPLAY_BUFFER_MAX_SIZE":  30_000, "STOCKFISH_BENCH_EVERY_N_ROUNDS": 100, "PUZZLE_BATCHES_PER_GAME_BATCH": 0, "buffer_gb": 1.0},
-    "balanced":   {"BATCH_SIZE":  256, "NUM_SELF_PLAY_WORKERS":  6, "MCTS_VISITS_SELFPLAY": 200, "REPLAY_BUFFER_MAX_SIZE": 100_000, "STOCKFISH_BENCH_EVERY_N_ROUNDS":  25, "PUZZLE_BATCHES_PER_GAME_BATCH": 1, "buffer_gb": 3.3},
-    "boost":      {"BATCH_SIZE": 1024, "NUM_SELF_PLAY_WORKERS": 12, "MCTS_VISITS_SELFPLAY": 400, "REPLAY_BUFFER_MAX_SIZE": 300_000, "STOCKFISH_BENCH_EVERY_N_ROUNDS":  10, "PUZZLE_BATCHES_PER_GAME_BATCH": 2, "buffer_gb": 10.0},
+    "low_memory": {"BATCH_SIZE":   64, "NUM_SELF_PLAY_WORKERS":  2, "GPU_SELF_PLAY_WORKERS":  4, "MCTS_VISITS_SELFPLAY":  50, "REPLAY_BUFFER_MAX_SIZE":  20_000, "STOCKFISH_BENCH_EVERY_N_ROUNDS": 200, "PUZZLE_BATCHES_PER_GAME_BATCH": 0, "buffer_gb": 0.6, "worker_gb": 3.1},
+    "eco":        {"BATCH_SIZE":  128, "NUM_SELF_PLAY_WORKERS":  3, "GPU_SELF_PLAY_WORKERS":  6, "MCTS_VISITS_SELFPLAY":  80, "REPLAY_BUFFER_MAX_SIZE":  30_000, "STOCKFISH_BENCH_EVERY_N_ROUNDS": 100, "PUZZLE_BATCHES_PER_GAME_BATCH": 0, "buffer_gb": 1.0, "worker_gb": 4.7},
+    "balanced":   {"BATCH_SIZE":  256, "NUM_SELF_PLAY_WORKERS":  6, "GPU_SELF_PLAY_WORKERS":  8, "MCTS_VISITS_SELFPLAY": 200, "REPLAY_BUFFER_MAX_SIZE": 100_000, "STOCKFISH_BENCH_EVERY_N_ROUNDS":  25, "PUZZLE_BATCHES_PER_GAME_BATCH": 1, "buffer_gb": 3.3, "worker_gb": 9.4},
+    "boost":      {"BATCH_SIZE": 1024, "NUM_SELF_PLAY_WORKERS": 12, "GPU_SELF_PLAY_WORKERS": 14, "MCTS_VISITS_SELFPLAY": 400, "REPLAY_BUFFER_MAX_SIZE": 300_000, "STOCKFISH_BENCH_EVERY_N_ROUNDS":  10, "PUZZLE_BATCHES_PER_GAME_BATCH": 2, "buffer_gb": 10.0, "worker_gb": 16.4},
 }
 
-# Selecting a mode live (deferred to next round boundary via set_max_size):
-#   trainer.set_knob("REPLAY_BUFFER_MAX_SIZE", 20_000)
+# Live control:
+#   trainer.set_knob("GPU_SELF_PLAY_WORKERS", 4)   # applied at next round
+#   trainer.set_knob("REPLAY_BUFFER_MAX_SIZE", 20000)  # buffer shrinks live
 # ReplayBuffer is backed by pre-allocated flat numpy arrays (no per-element
 # Python objects), so a live shrink via set_max_size() preserves the most
 # recent N entries and reuses the same storage.
@@ -227,7 +241,8 @@ HOT_KNOBS_IMMEDIATE = [
 # Knobs applied at next ROUND BOUNDARY (deferred, requires re-init):
 HOT_KNOBS_DEFERRED = [
     "MCTS_VISITS_SELFPLAY",                # MCTS search budget
-    "NUM_SELF_PLAY_WORKERS",               # parallel games
+    "NUM_SELF_PLAY_WORKERS",               # CPU-mode parallel games
+    "GPU_SELF_PLAY_WORKERS",               # GPU-batched mode parallel games
     "SELF_PLAY_VARIANT_PARALLELISM",       # variants per round
     "REPLAY_BUFFER_MAX_SIZE",              # per-variant buffer cap
     "MCTS_VISITS_EVAL",                    # evaluation game visits
