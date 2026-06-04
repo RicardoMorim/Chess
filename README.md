@@ -117,6 +117,134 @@ python train.py --model small
 - **Checkpoint saving**: Save progress between training sessions
 - **Tactical recognition testing**: Periodically tests model on tactical positions
 
+# Live Dashboard & Spectate Mode
+
+The training loop exposes a tiny HTTP control plane on `http://127.0.0.1:7860`
+that drives a stateless browser dashboard and a Tkinter dashboard, and lets
+you watch model-vs-model games and puzzle drills live.
+
+## Running the trainer
+
+```bash
+cd train
+python train.py
+```
+
+The trainer auto-starts the control server on `127.0.0.1:7860` (loopback
+only — no LAN exposure). Disable with `LeagueTrainer(enable_control_server=False)`
+in your launcher if you don't need it.
+
+## Browser dashboard
+
+Open `http://127.0.0.1:7860/` in any browser. You get:
+
+- **Mode buttons** — `eco` / `balanced` / `boost` performance presets, applied live
+- **Auto-mode toggle** — trainer promotes/demotes preset based on CPU usage
+- **Pause / resume** — pause training between rounds
+- **Resource bars** — CPU, RAM, GPU usage
+- **Live charts** — loss (policy/value), throughput (games/min), buffer fill
+- **Checkpoint table** — double-click any row to open the spectate modal
+- **Spectate modal** — model-vs-model game (configurable visits, start FEN)
+  and puzzle drills (consumes `train/cache/puzzles_meta.pkl`)
+
+All state lives in the trainer — the dashboard is a stateless consumer.
+
+## Tkinter dashboard (separate process)
+
+```bash
+cd train
+python -m league.dashboard_tk
+```
+
+Same features as the browser but as a native window, polls `/api/status`
+every 2 seconds. Right-click context menus and double-click handlers mirror
+the browser behaviour. Useful when you want a dedicated monitor window
+without keeping a browser tab open.
+
+## HTTP API quick reference
+
+```bash
+# Status snapshot
+curl -s http://127.0.0.1:7860/api/status | python -m json.tool
+
+# Switch mode
+curl -X POST http://127.0.0.1:7860/api/mode -d '{"mode":"boost"}'
+
+# Hot-swap a knob
+curl -X POST http://127.0.0.1:7860/api/knobs -d '{"knobs":{"BATCH_SIZE":512}}'
+
+# Pause / resume
+curl -X POST http://127.0.0.1:7860/api/pause -d '{"paused":true}'
+
+# Watch live match events (Server-Sent Events)
+curl -N http://127.0.0.1:7860/api/matches/stream
+```
+
+Full schema is in `train/league/control_server.py` (search for
+`URL_PATTERNS`).
+
+## Performance presets
+
+| Preset     | BATCH | Workers | MCTS visits | Replay buf | Use case                |
+|------------|------:|--------:|------------:|-----------:|-------------------------|
+| `eco`      |   128 |       3 |          80 |      50K   | Light load (working PC) |
+| `balanced` |   256 |       6 |         200 |     100K   | Default                 |
+| `boost`    |  1024 |      12 |         400 |     300K   | Overnight / idle GPU    |
+
+Switch at runtime with `set_mode("boost")` or via the dashboard. The
+trainer persists the active mode across restarts (`train/perf_mode.json`).
+
+## Spectate mode
+
+Queue a model-vs-model game or a puzzle drill from the dashboard or the
+HTTP API:
+
+```bash
+# Model vs model
+curl -X POST http://127.0.0.1:7860/api/matches -d '{
+  "type": "model",
+  "params": {"white": "baseline", "black": "attack", "visits": 200}
+}'
+
+# Puzzle drill (random from sidecar)
+curl -X POST http://127.0.0.1:7860/api/matches -d '{
+  "type": "puzzle",
+  "params": {"visits": 100}
+}'
+```
+
+Events stream over `/api/matches/stream` (SSE) in this order:
+`start → move / drill_move → done` (or `error`).
+
+To use a specific checkpoint in spectate, use `<variant>_step_<N>` as the
+model name, e.g. `baseline_step_35`. The trainer resolves it to a
+`.pt` file under `train/checkpoints/`.
+
+### Puzzle sidecar
+
+The puzzle cache (`train/cache/puzzle_tensors/*.pkl`) does **not** store
+FENs or solution lines — it only has the input tensors. To run puzzle
+drills you need a small sidecar that maps `puzzle_id → {fen, solution, ...}`:
+
+```bash
+# Build the sidecar (one-time, ~10s for 2.4M puzzles)
+cd train
+python -m league.puzzle_sidecar
+# or, from the repo root:
+python train/build_puzzle_sidecar.py
+```
+
+This writes `train/cache/puzzles_meta.pkl` (~300MB for the full Lichess
+DB). The spectate worker loads it lazily on the first drill request and
+keeps it in memory. Re-run the command if you update your puzzle CSV.
+
+## Hot-swap knobs
+
+Most training knobs are changeable at runtime via `set_knob()` or the
+`/api/knobs` endpoint. Changes are batched and applied at the next safe
+checkpoint (round boundary for structural knobs, training step for
+hyperparameters). See `train/TUNING_REFERENCE.md` for the full list.
+
 # Game Controls
 -> Click on a piece to select it.
 -> Drag the selected piece to the desired square to make a move.

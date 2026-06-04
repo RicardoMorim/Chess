@@ -286,7 +286,9 @@ class PuzzleDrill:
         solution_uci = list(self.puzzle.solution_moves)
         correct = 0
         wrong = 0
-        for step in range(len(solution_uci)):
+        plies = 0
+        model_idx = 0  # index in solution_uci of the side-to-move's turn
+        while model_idx < len(solution_uci):
             if self._cancel.is_set():
                 break
             try:
@@ -296,12 +298,19 @@ class PuzzleDrill:
                 break
             if move is None:
                 break
-            expected_uci = solution_uci[step]
-            expected_move = chess.Move.from_uci(expected_uci)
+            expected_uci = solution_uci[model_idx]
+            try:
+                expected_move = chess.Move.from_uci(expected_uci)
+            except Exception:
+                logger.warning(f"Bad expected move in puzzle: {expected_uci}")
+                break
             is_correct = (move == expected_move)
             san = _san(board, move)
-            expected_san = _san(board, expected_move) if expected_move in board.legal_moves else expected_uci
-            # Eval
+            expected_san = (
+                _san(board, expected_move)
+                if expected_move in board.legal_moves
+                else expected_uci
+            )
             try:
                 inp = torch.tensor(
                     board_to_tensor(board, 0, in_ch),
@@ -320,33 +329,48 @@ class PuzzleDrill:
                 "san": san,
                 "expected_san": expected_san,
                 "correct": is_correct,
-                "ply": step + 1,
+                "ply": plies + 1,
                 "eval": eval_white,
             })
-            if move in board.legal_moves:
+            plies += 1
+            if is_correct:
+                correct += 1
                 board.push(move)
             else:
                 wrong += 1
                 if wrong >= self.max_wrong:
                     break
-                # Skip the expected move
+                # Push the correct move instead so the puzzle can keep going
                 if expected_move in board.legal_moves:
                     board.push(expected_move)
-            if is_correct:
-                correct += 1
-            else:
-                wrong += 1
-                if wrong >= self.max_wrong:
+                else:
+                    # No legal expected move — puzzle is stuck
                     break
+            # Opponent's forced reply
+            if model_idx + 1 < len(solution_uci):
+                opp_uci = solution_uci[model_idx + 1]
+                try:
+                    opp_move = chess.Move.from_uci(opp_uci)
+                except Exception:
+                    break
+                if opp_move in board.legal_moves:
+                    board.push(opp_move)
+                else:
+                    # Forced reply isn't actually forced — puzzle ends
+                    break
+            model_idx += 2
 
-        solved = (correct == len(solution_uci)) and wrong < self.max_wrong
+        expected_model_moves = max(
+            1, (len(solution_uci) + 1) // 2
+        )
+        solved = (wrong == 0) and (correct == expected_model_moves)
         self.on_event({
             "type": "done",
             "result": "solved" if solved else "failed",
             "solved": solved,
             "correct": correct,
             "wrong": wrong,
-            "plies": correct + wrong,
+            "plies": plies,
         })
         return {"solved": solved, "correct": correct, "wrong": wrong}
 
@@ -462,20 +486,34 @@ class SpectateWorker(threading.Thread):
         drill.play()
 
     def _find_puzzle(self, puzzle_id: Optional[str]) -> Optional[PuzzleSample]:
-        """Best-effort puzzle lookup. Returns None if nothing's available.
+        """Best-effort puzzle lookup via the ``puzzle_sidecar`` module.
 
-        The trainer's aux_loader has a PuzzleDataset. Each item is a
-        (position_tensor, policy, value) tuple. We don't currently have
-        the original FEN in the cache, so this is a stub that returns
-        None with a clear error message in the worker.
+        Loads (or builds) ``train/cache/puzzles_meta.pkl`` and returns
+        either a specific puzzle (if ``puzzle_id`` is given and present)
+        or a random one. Returns ``None`` if no sidecar can be built.
         """
-        loader = getattr(self.trainer, "aux_loader", None)
-        if loader is None or not getattr(loader, "_puzzle_ready", lambda: False)():
+        # Local import keeps the spectate module lean for non-puzzle use
+        from league.puzzle_sidecar import load_puzzle_sidecar
+
+        try:
+            puzzles = load_puzzle_sidecar()
+        except Exception as e:
+            logger.warning(f"puzzle sidecar load failed: {e}")
+            puzzles = None
+        if not puzzles:
             return None
-        ds = loader.puzzle_dataset
-        if ds is None or len(ds) == 0:
-            return None
-        # The cached tensors don't preserve FENs; we would need to either
-        # keep a sidecar (puzzle_id -> FEN) or re-parse the CSV. For the
-        # MVP, we return None and let the UI show a clear error.
-        return None
+        if puzzle_id and puzzle_id in puzzles:
+            meta = puzzles[puzzle_id]
+            chosen_id = puzzle_id
+        else:
+            # Random pick; deterministic if seed is set on the worker
+            import random
+            chosen_id = random.choice(list(puzzles.keys()))
+            meta = puzzles[chosen_id]
+        return PuzzleSample(
+            puzzle_id=chosen_id,
+            fen=meta["fen"],
+            solution_moves=meta["solution_moves"],
+            rating=meta.get("rating"),
+            themes=meta.get("themes", []),
+        )

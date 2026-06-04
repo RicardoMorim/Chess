@@ -157,3 +157,155 @@ MAX_BUFFER_FILES_PER_VARIANT = 3
 DISK_USAGE_CHECK_EVERY_N_ROUNDS = 10
 CRITICAL_DISK_THRESHOLD_PCT = 5
 """
+
+
+# ============================================================================
+# PERFORMANCE PRESETS (eco / balanced / boost) — Fase 1
+# ============================================================================
+
+# File: train/league/performance.py
+
+"""
+Switch modes at runtime (no restart):
+
+  trainer.set_mode("boost")          # applies on next round
+  trainer.set_mode("eco")
+  trainer.set_auto_mode(True)        # trainer picks based on CPU usage
+
+Or via the HTTP control server:
+
+  curl -X POST http://127.0.0.1:7860/api/mode -d '{"mode":"boost"}'
+  curl -X POST http://127.0.0.1:7860/api/auto_mode -d '{"enabled":true}'
+"""
+
+PRESETS = {
+    "eco":      {"BATCH_SIZE": 128,  "NUM_SELF_PLAY_WORKERS": 3,  "MCTS_VISITS_SELFPLAY":  80, "REPLAY_BUFFER_MAX_SIZE":  50_000, "STOCKFISH_BENCH_EVERY_N_ROUNDS": 100, "PUZZLE_BATCHES_PER_GAME_BATCH": 0},
+    "balanced": {"BATCH_SIZE": 256,  "NUM_SELF_PLAY_WORKERS": 6,  "MCTS_VISITS_SELFPLAY": 200, "REPLAY_BUFFER_MAX_SIZE": 100_000, "STOCKFISH_BENCH_EVERY_N_ROUNDS":  25, "PUZZLE_BATCHES_PER_GAME_BATCH": 1},
+    "boost":    {"BATCH_SIZE": 1024, "NUM_SELF_PLAY_WORKERS": 12, "MCTS_VISITS_SELFPLAY": 400, "REPLAY_BUFFER_MAX_SIZE": 300_000, "STOCKFISH_BENCH_EVERY_N_ROUNDS":  10, "PUZZLE_BATCHES_PER_GAME_BATCH": 2},
+}
+
+
+# ============================================================================
+# HOT-SWAP KNOBS — Fase 0
+# ============================================================================
+
+"""
+Most training knobs are changeable at runtime without restarting the
+trainer. The trainer's internal RLock guarantees thread-safety; the
+ControlServer and Tkinter dashboard both call set_knob() under the hood.
+
+  trainer.set_knob("BATCH_SIZE", 512)            # one knob
+  trainer.set_knobs({"BATCH_SIZE": 512,          # batch update
+                     "TRAINING_STEPS_PER_ROUND": 400})
+  trainer.list_hot_knobs()                        # what's tunable
+
+Or via HTTP:
+
+  curl -X POST http://127.0.0.1:7860/api/knobs -d '{"knobs":{"BATCH_SIZE":512}}'
+"""
+
+# Knobs applied IMMEDIATELY (next training step):
+HOT_KNOBS_IMMEDIATE = [
+    "BATCH_SIZE",                          # GPU batch
+    "TRAINING_STEPS_PER_ROUND",            # gradient steps per round
+    "PUZZLE_BATCHES_PER_GAME_BATCH",       # # puzzle batches to mix in
+    "PROGAME_BATCHES_PER_GAME_BATCH",      # # pro-game batches
+    "POLICY_LOSS_WEIGHT",                  # loss weights
+    "VALUE_LOSS_WEIGHT",
+    "GPU_INFER_BATCH_SIZE",                # GPU batcher size
+]
+
+# Knobs applied at next ROUND BOUNDARY (deferred, requires re-init):
+HOT_KNOBS_DEFERRED = [
+    "MCTS_VISITS_SELFPLAY",                # MCTS search budget
+    "NUM_SELF_PLAY_WORKERS",               # parallel games
+    "SELF_PLAY_VARIANT_PARALLELISM",       # variants per round
+    "REPLAY_BUFFER_MAX_SIZE",              # per-variant buffer cap
+    "MCTS_VISITS_EVAL",                    # evaluation game visits
+    "GAMES_PER_WORKER_PER_ROUND",          # how many games per worker
+    "CHECKPOINT_EVERY_N_ROUNDS",           # checkpoint cadence
+    "EVAL_EVERY_N_ROUNDS",                 # eval cadence
+    "BUFFER_SAVE_EVERY_N_ROUNDS",          # buffer save cadence
+    "METRICS_EVERY_N_ROUNDS",              # metrics write cadence
+    "DISK_USAGE_CHECK_EVERY_N_ROUNDS",     # disk-check cadence
+    "MAX_BUFFER_FILES_PER_VARIANT",        # buffer file retention
+    "TARGET_GAMES_PER_MINUTE",             # adaptive MCTS target
+    "VISITS_ADJUSTMENT_FACTOR",            # adaptive MCTS step
+    "STOCKFISH_BENCH_EVERY_N_ROUNDS",      # Stockfish benchmark cadence
+    "STOCKFISH_BENCH_NUM_GAMES",           # # games per benchmark
+    "STOCKFISH_BENCH_TIME_LIMIT_MS",       # time control per game
+]
+
+# NOT hot-settable (require restart or model rebuild):
+NOT_HOT_SETTABLE = [
+    "VARIANTS",                            # variant list
+    "INITIAL_LR", "LR_MILESTONES", "LR_GAMMA",  # LR schedule
+    "USE_PUZZLE_INJECTION", "USE_PROGAME_INJECTION",  # toggles need a reload
+    "C_PUCT", "TEMPERATURE_*",             # search hyperparams
+    "SELF_PLAY_DEVICE", "use_gpu_batching",       # device changes
+]
+
+
+# ============================================================================
+# CONTROL SERVER + DASHBOARDS — Fase 2/3
+# ============================================================================
+
+"""
+The trainer auto-starts a stdlib HTTP control server on
+http://127.0.0.1:7860 (loopback only) when constructed. The browser
+dashboard lives under /, and SSE events stream over /api/matches/stream.
+
+Endpoints:
+  GET  /                        - Browser dashboard (vanilla HTML+Chart.js)
+  GET  /api/status              - Trainer state snapshot (JSON)
+  GET  /api/checkpoints         - List checkpoint files with metadata
+  GET  /api/variants            - List active variants + buffer fill
+  GET  /api/modes               - List performance modes + describe each
+  GET  /api/knobs               - List hot-settable knobs + current values
+  GET  /api/matches             - List in-flight / recent matches
+  GET  /api/matches/stream      - SSE stream of match events
+  POST /api/mode                - Switch mode  {"mode": "boost"}
+  POST /api/knobs               - Hot-swap     {"knobs": {"BATCH_SIZE": 512}}
+  POST /api/auto_mode           - Toggle       {"enabled": true}
+  POST /api/pause               - Pause/Resume {"paused": true}
+  POST /api/matches             - Queue match  {"type":"model","params":{...}}
+
+Run the Tkinter dashboard in a separate process:
+  cd train && python -m league.dashboard_tk
+
+Security: bound to 127.0.0.1 only by default. Set LeagueTrainer(control_host="0.0.0.0")
+explicitly to expose on LAN (NOT recommended without auth).
+"""
+
+
+# ============================================================================
+# SPECTATE + PUZZLE SIDECAR — Fase 4/4b
+# ============================================================================
+
+"""
+The spectate worker drains a queue of model-vs-model and puzzle-drill
+matches and publishes events via the control server's MatchEventBus
+(SSE-backed). Two match types:
+
+  type: "model"  params: {white, black, visits, start_fen?}
+  type: "puzzle" params: {puzzle_id?, visits}
+
+Model names: a live variant ("baseline", "attack", "est") or a
+checkpoint spec ("baseline_step_35") to load a frozen .pt.
+
+Puzzle drills need the sidecar (Fase 4b). The cached tensor files
+don't preserve FENs, so we parse the original CSV once into a small
+sidecar:
+
+  cd train
+  python -m league.puzzle_sidecar                 # builds train/cache/puzzles_meta.pkl
+  # or, from the repo root:
+  python train/build_puzzle_sidecar.py
+
+  # Quick smoke (first 1000 puzzles only):
+  python train/build_puzzle_sidecar.py --max-rows 1000
+
+The sidecar is loaded lazily on the first drill request and kept in
+memory (~300MB for the full Lichess DB).
+"""
+

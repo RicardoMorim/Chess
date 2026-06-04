@@ -215,13 +215,20 @@ class SpectateSessionTests(unittest.TestCase):
 
 
 class PuzzleDrillTests(unittest.TestCase):
+    """PuzzleDrill plays only side-to-move turns; opponent replies are
+    pushed from the puzzle's solution_moves. The MCTS script contains
+    ONLY the side-to-move's turns.
+    """
 
     def setUp(self):
         import tempfile, chess
         self.tmp = tempfile.mkdtemp()
         self.trainer = _make_trainer(self.tmp)
         self.fen = chess.STARTING_FEN  # 1.e4 Nf6 2.e5 Nd5
+        # Full solution: [model_white, opp_black, model_white, opp_black]
         self.solution = ["e2e4", "g8f6", "e4e5", "f6d5"]
+        # Model's script: only white's turns
+        self.model_script = ["e2e4", "e4e5"]
 
     def _patch_mcts(self, scripted_moves: List[str]):
         import chess as _chess
@@ -240,7 +247,7 @@ class PuzzleDrillTests(unittest.TestCase):
         return patch.dict(sys.modules, {"core.mcts": fake_mcts_module})
 
     def test_drill_solves_when_all_correct(self):
-        with self._patch_mcts(self.solution):
+        with self._patch_mcts(self.model_script):
             from train.league.spectate import PuzzleDrill, PuzzleSample
             events: List[dict] = []
             drill = PuzzleDrill(
@@ -250,15 +257,17 @@ class PuzzleDrillTests(unittest.TestCase):
             )
             result = drill.play()
         self.assertTrue(result["solved"])
-        self.assertEqual(result["correct"], 4)
+        self.assertEqual(result["correct"], 2)
         self.assertEqual(result["wrong"], 0)
-        # Each move event should have 'correct' field
+        # Only the side-to-move's turns become drill_move events
         move_events = [e for e in events if e["type"] == "drill_move"]
-        self.assertEqual(len(move_events), 4)
+        self.assertEqual(len(move_events), 2)
+        self.assertEqual(move_events[0]["move"], "e2e4")
+        self.assertEqual(move_events[1]["move"], "e4e5")
         self.assertTrue(all(e["correct"] for e in move_events))
 
     def test_drill_fails_with_wrong_move(self):
-        with self._patch_mcts(["d2d4"] + self.solution):  # wrong first move
+        with self._patch_mcts(["d2d4"]):  # wrong model move
             from train.league.spectate import PuzzleDrill, PuzzleSample
             drill = PuzzleDrill(
                 self.trainer, MagicMock(),
@@ -266,10 +275,10 @@ class PuzzleDrillTests(unittest.TestCase):
             )
             result = drill.play()
         self.assertFalse(result["solved"])
-        self.assertGreaterEqual(result["wrong"], 1)
+        self.assertEqual(result["wrong"], 1)
 
     def test_drill_done_event_has_result(self):
-        with self._patch_mcts(self.solution):
+        with self._patch_mcts(self.model_script):
             from train.league.spectate import PuzzleDrill, PuzzleSample
             events: List[dict] = []
             drill = PuzzleDrill(

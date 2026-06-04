@@ -77,11 +77,20 @@ The architecture separates concerns into four independent layers:
 
 ```
 league/
-├── replay_buffer.py      # Per-model FIFO buffers with thread-safety
-├── self_play_worker.py   # CPU worker: generates games via MCTS
-├── league_trainer.py     # Main orchestrator (this is the control hub)
-├── evaluator.py          # Low-freq evaluation vs checkpoints
-└── monitoring.py         # Metrics collection + logging
+├── replay_buffer.py         # Per-model FIFO buffers with thread-safety
+├── self_play_worker.py      # CPU worker: generates games via MCTS
+├── league_trainer.py        # Main orchestrator (this is the control hub)
+├── evaluator.py             # Low-freq evaluation vs checkpoints
+├── monitoring.py            # Metrics collection + logging
+├── performance.py           # eco/balanced/boost presets + auto-mode controller
+├── control_server.py        # stdlib HTTP control plane (Fase 2)
+├── spectate.py              # model-vs-model + puzzle drills (Fase 4)
+├── puzzle_sidecar.py        # puzzle_id -> {fen, solution, ...} builder (Fase 4b)
+├── dashboard/               # Vanilla HTML+Chart.js browser UI (Fase 3a)
+│   ├── index.html
+│   ├── style.css
+│   └── dashboard.js
+└── dashboard_tk.py          # Standalone Tkinter dashboard (Fase 3b)
 
 checkpoints/
 ├── baseline_step_0.pt    # Saved model states
@@ -93,6 +102,12 @@ logs/
 ├── metrics.log           # All metric events
 ├── metrics_round_0.json  # Periodic snapshots
 └── metrics_round_5.json
+
+cache/
+├── puzzles/              # raw Lichess puzzle CSVs (cached pickles)
+├── puzzle_tensors/       # training-ready (tensor, policy, value) tuples
+├── labelled_pgns/        # Stockfish-labelled pro-game positions
+└── puzzles_meta.pkl      # puzzle sidecar (Fase 4b) for spectate drills
 ```
 
 ## The Rule in Action

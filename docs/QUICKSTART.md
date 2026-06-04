@@ -237,6 +237,82 @@ for metrics_file in sorted(logs_dir.glob("metrics_round_*.json")):
 4. **Evaluate**: Check evaluation results after 20-30 rounds
 5. **Iterate**: Continue until models converge
 
+## Live monitoring (Fase 2/3)
+
+The trainer auto-starts an HTTP control server on `http://127.0.0.1:7860`
+when constructed. The browser dashboard lives at `/`; the Tkinter
+dashboard runs as a separate process.
+
+```bash
+# Open the browser dashboard
+xdg-open http://127.0.0.1:7860/    # Linux
+start http://127.0.0.1:7860/       # Windows
+
+# Or run the Tkinter dashboard
+cd train && python -m league.dashboard_tk
+```
+
+You can:
+- Switch performance mode (`eco` / `balanced` / `boost`) with a click
+- Toggle auto-mode (trainer promotes/demotes based on CPU)
+- Pause/resume training
+- Hot-swap knobs without restart (e.g. `BATCH_SIZE`, `MCTS_VISITS_SELFPLAY`)
+- Watch model-vs-model games and puzzle drills in the spectate modal
+
+Full API reference is in `train/TUNING_REFERENCE.md` ("Control Server +
+Dashboards" section).
+
+## Hot-swap knobs (Fase 0)
+
+Most training constants are changeable at runtime:
+
+```python
+trainer.set_knob("BATCH_SIZE", 512)
+trainer.set_knobs({"MCTS_VISITS_SELFPLAY": 400, "NUM_SELF_PLAY_WORKERS": 12})
+print(trainer.list_hot_knobs())   # what's tunable
+```
+
+Or via HTTP:
+
+```bash
+curl -X POST http://127.0.0.1:7860/api/knobs -d '{"knobs":{"BATCH_SIZE":512}}'
+```
+
+Immediate knobs (`BATCH_SIZE`, loss weights, puzzle batches) apply on the
+next training step. Deferred knobs (`MCTS_VISITS_SELFPLAY`,
+`NUM_SELF_PLAY_WORKERS`, `REPLAY_BUFFER_MAX_SIZE`, eval cadence) apply
+at the next round boundary.
+
+## Spectate + puzzle sidecar (Fase 4/4b)
+
+Watch model-vs-model games or run puzzle drills from the dashboard or
+the HTTP API:
+
+```bash
+# Model vs model
+curl -X POST http://127.0.0.1:7860/api/matches -d '{
+  "type": "model", "params": {"white": "baseline", "black": "attack", "visits": 200}
+}'
+
+# Puzzle drill (random from sidecar)
+curl -X POST http://127.0.0.1:7860/api/matches -d '{
+  "type": "puzzle", "params": {"visits": 100}
+}'
+```
+
+Events stream over `/api/matches/stream` (SSE). Puzzle drills need a
+sidecar — the cached tensors don't preserve FENs:
+
+```bash
+cd train
+python -m league.puzzle_sidecar
+# or from the repo root:
+python train/build_puzzle_sidecar.py
+```
+
+This writes `train/cache/puzzles_meta.pkl` (~300MB for the full Lichess
+DB). The sidecar is loaded lazily on the first drill request.
+
 ---
 
 **The Rule**: Only MCTS self-play improves models. Everything else is measurement, cold-start reduction, or regression detection.
