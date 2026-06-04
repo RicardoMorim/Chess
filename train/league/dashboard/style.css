@@ -15,6 +15,10 @@
   --boost: #f85149;
 }
 
+body {
+  background: radial-gradient(ellipse at top, #131a22 0%, var(--bg) 60%) fixed;
+}
+
 * { box-sizing: border-box; }
 
 html, body {
@@ -30,7 +34,9 @@ html, body {
 .topbar {
   position: sticky;
   top: 0;
-  background: var(--panel);
+  background: linear-gradient(180deg, rgba(35,43,54,0.95) 0%, rgba(26,32,40,0.95) 100%);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
   border-bottom: 1px solid var(--border);
   padding: 12px 24px;
   display: flex;
@@ -41,8 +47,15 @@ html, body {
 }
 
 .brand { display: flex; align-items: center; gap: 12px; }
-.brand .logo { font-size: 24px; }
-.brand .title { font-weight: 600; font-size: 16px; }
+.brand .logo {
+  font-size: 28px;
+  background: linear-gradient(135deg, var(--accent), var(--good));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  filter: drop-shadow(0 0 6px rgba(74,158,255,0.4));
+}
+.brand .title { font-weight: 700; font-size: 17px; letter-spacing: 0.3px; }
 
 .pill {
   background: var(--panel-2);
@@ -59,22 +72,24 @@ html, body {
   background: var(--panel-2);
   padding: 3px;
   border-radius: 8px;
+  border: 1px solid var(--border);
 }
 .mode-btn {
   background: transparent;
   color: var(--muted);
   border: none;
-  padding: 6px 16px;
+  padding: 6px 18px;
   border-radius: 6px;
   cursor: pointer;
-  font-weight: 600;
-  font-size: 12px;
-  letter-spacing: 0.5px;
+  font-weight: 700;
+  font-size: 11px;
+  letter-spacing: 1.2px;
+  transition: all 0.15s;
 }
-.mode-btn:hover { color: var(--text); }
-.mode-btn.active[data-mode="eco"] { background: var(--eco); color: #000; }
-.mode-btn.active[data-mode="balanced"] { background: var(--balanced); color: #000; }
-.mode-btn.active[data-mode="boost"] { background: var(--boost); color: #fff; }
+.mode-btn:hover { color: var(--text); background: var(--border); }
+.mode-btn.active[data-mode="eco"] { background: var(--eco); color: #000; box-shadow: 0 0 12px rgba(63,185,80,0.4); }
+.mode-btn.active[data-mode="balanced"] { background: var(--balanced); color: #000; box-shadow: 0 0 12px rgba(74,158,255,0.4); }
+.mode-btn.active[data-mode="boost"] { background: var(--boost); color: #fff; box-shadow: 0 0 12px rgba(248,81,73,0.4); }
 
 .controls { display: flex; align-items: center; gap: 12px; }
 .toggle { display: flex; align-items: center; gap: 6px; color: var(--muted); cursor: pointer; }
@@ -104,14 +119,29 @@ main {
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 16px 20px;
+  transition: border-color 0.15s;
+}
+.card:hover {
+  border-color: #3a4552;
 }
 .card h2 {
   margin: 0 0 12px;
-  font-size: 14px;
-  font-weight: 600;
+  font-size: 12px;
+  font-weight: 700;
   color: var(--muted);
   text-transform: uppercase;
-  letter-spacing: 0.5px;
+  letter-spacing: 1.2px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.card h2::before {
+  content: "";
+  width: 3px;
+  height: 12px;
+  background: var(--accent);
+  border-radius: 2px;
+  display: inline-block;
 }
 
 .card-grid {
@@ -124,9 +154,23 @@ main {
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 14px 16px;
+  position: relative;
+  overflow: hidden;
 }
-.metric-card .label { color: var(--muted); font-size: 12px; }
-.metric-card .value { font-size: 24px; font-weight: 700; margin-top: 4px; }
+.metric-card::before {
+  content: "";
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 3px;
+  background: var(--accent);
+  opacity: 0.7;
+}
+.metric-card:nth-child(1)::before { background: var(--good); }
+.metric-card:nth-child(2)::before { background: var(--accent); }
+.metric-card:nth-child(3)::before { background: var(--warn); }
+.metric-card:nth-child(4)::before { background: var(--bad); }
+.metric-card .label { color: var(--muted); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.8px; }
+.metric-card .value { font-size: 26px; font-weight: 700; margin-top: 6px; font-family: 'Consolas', 'Monaco', monospace; }
 
 .bar-group { display: flex; flex-direction: column; gap: 10px; }
 .bar-row { display: flex; align-items: center; gap: 10px; }

@@ -38,6 +38,64 @@ class DashboardTkImportTests(unittest.TestCase):
         self.assertTrue(callable(main))
 
 
+class DashboardTkSmokeTests(unittest.TestCase):
+    """Headless smoke tests — construct widgets in a hidden root."""
+
+    def setUp(self):
+        # Try to use the real Tk if there's a display; otherwise
+        # skip with a clear message (CI is typically headless).
+        try:
+            import tkinter as tk
+            self.root = tk.Tk()
+            self.root.withdraw()
+        except Exception as e:
+            self.skipTest(f"no Tk display available: {e}")
+
+    def tearDown(self):
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+    def test_widgets_construct(self):
+        import tkinter as tk
+        from train.league.dashboard_tk import (
+            ResourceBars, VariantsPanel, CheckpointTable,
+            StatusBar, ModePanel, ResourcesPanel, MetricCard, apply_theme,
+        )
+        apply_theme(self.root)
+        # Each widget must construct without raising
+        rb = ResourceBars(self.root); rb.pack()
+        vp = VariantsPanel(self.root); vp.pack()
+        ck = CheckpointTable(self.root); ck.pack()
+        sb = StatusBar(self.root); sb.pack()
+        mp = ModePanel(self.root, on_mode=lambda m: None, on_auto=lambda e: None,
+                       on_pause=lambda: None); mp.pack()
+        rp = ResourcesPanel(self.root); rp.pack()
+        mc = MetricCard(self.root, "test", "#3fb950"); mc.pack()
+        # Update with a fake status to exercise the codepaths
+        vp.update({"losses": {"baseline": 0.42, "attack": 0.51, "est": 0.38},
+                   "throughput_gpm": {"baseline": 10.0, "attack": 8.5, "est": 9.2},
+                   "buffers": {"baseline": {"size": 1000, "capacity": 5000, "fill_pct": 20.0},
+                               "attack": {"size": 4500, "capacity": 5000, "fill_pct": 90.0},
+                               "est": {"size": 2500, "capacity": 5000, "fill_pct": 50.0}}})
+        rb.update({"vram_pct": 45, "vram_used_mb": 7000, "vram_total_mb": 16000,
+                   "cpu_pct": 32.0, "ram_pct": 60.0})
+        rp.update({"vram_pct": 45, "vram_used_mb": 7000, "vram_total_mb": 16000,
+                   "cpu_pct": 32.0, "ram_pct": 60.0})
+        ck.set_items([{"variant": "baseline", "step": 35, "size_mb": 144.0,
+                       "mtime": 1234567890.0, "name": "baseline_step_35.pt"}])
+        mc.set("123", "sub")
+        sb.set_status(True, "ok")
+        sb.set_round(7, 210, 5000)
+        mp.set_mode("boost")
+        mp.set_auto(True)
+        mp.set_paused(False)
+        # Spin the event loop briefly
+        self.root.update_idletasks()
+        self.root.update()
+
+
 class TrainerClientTests(unittest.TestCase):
     """The HTTP client wrapper that the dashboard uses."""
 

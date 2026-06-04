@@ -314,11 +314,18 @@ class LeagueTrainer:
         # Control plane (Fase 2)
         self._control_server: Optional[ControlServer] = None
         if enable_control_server:
+            # Auto-detect the bundled dashboard if no explicit path is given,
+            # so the trainer "just works" out of the box.
+            if dashboard_dir:
+                resolved_dashboard_dir = Path(dashboard_dir)
+            else:
+                bundled = Path(__file__).resolve().parent / "dashboard"
+                resolved_dashboard_dir = bundled if bundled.exists() else None
             self._control_server = ControlServer(
                 self,
                 host=control_host,
                 port=control_port,
-                dashboard_dir=Path(dashboard_dir) if dashboard_dir else None,
+                dashboard_dir=resolved_dashboard_dir,
             )
             try:
                 self._control_server.start()
