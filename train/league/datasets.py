@@ -294,22 +294,3 @@ class AuxDataLoader:
         val_t = torch.stack(values)
         return pos_t, pol_t, val_t
 
-    def sample_progame_batch(self, batch_size: int):
-        """Return a (positions, policies, values) tuple as torch tensors on CPU.
-
-        Returns None if progame injection is disabled or the dataset is empty.
-        """
-        if not self._progame_ready():
-            return None
-        n = len(self.progame_dataset)
-        idxs = [self._rng.randrange(n) for _ in range(batch_size)]
-        positions, policies, values = [], [], []
-        for i in idxs:
-            pos, pol, val = self.progame_dataset[i]
-            positions.append(pos)
-            policies.append(pol)
-            values.append(val)
-        pos_t = torch.stack(positions)
-        pol_t = torch.stack(policies)
-        val_t = torch.stack(values)
-        return pos_t, pol_t, val_t

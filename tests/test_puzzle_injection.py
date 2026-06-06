@@ -328,6 +328,51 @@ class ChannelConversionTests(unittest.TestCase):
         pos_22, _, _ = loader.sample_puzzle_batch(2, input_channels=22)
         self.assertEqual(pos_22.shape, (2, 22, 8, 8))
 
+    def test_sample_progame_batch_respects_input_channels(self):
+        """Regression: a duplicate ``sample_progame_batch`` (no ``input_channels``
+        kwarg) silently shadowed the real one and broke every training step
+        on every variant with 'unexpected keyword argument input_channels'."""
+        from train.league.datasets import AuxDataLoader
+        import torch
+
+        class FakeProgame:
+            def __init__(self, n=5):
+                self._n = n
+            def __len__(self):
+                return self._n
+            def __getitem__(self, i):
+                pos = torch.randn(22, 8, 8)
+                pol = torch.tensor(i, dtype=torch.long)
+                val = torch.tensor(0.5)
+                return pos, pol, val
+
+        loader = AuxDataLoader.__new__(AuxDataLoader)
+        loader.puzzle_dataset = None
+        loader.progame_dataset = FakeProgame()
+        loader._rng = __import__("random").Random(0)
+
+        # Both signatures must work; this is the one the trainer uses.
+        pos_18, _, _ = loader.sample_progame_batch(2, input_channels=18)
+        self.assertEqual(pos_18.shape, (2, 18, 8, 8))
+
+        pos_22, _, _ = loader.sample_progame_batch(2, input_channels=22)
+        self.assertEqual(pos_22.shape, (2, 22, 8, 8))
+
+    def test_no_duplicate_methods_on_aux_loader(self):
+        """Regression: a duplicate method definition silently shadows the
+        original. Catch this by scanning the source for two ``def`` lines
+        with the same name in the same class body."""
+        import inspect
+        from train.league.datasets import AuxDataLoader
+        source = inspect.getsource(AuxDataLoader)
+        for method_name in ("sample_puzzle_batch", "sample_progame_batch"):
+            count = source.count(f"def {method_name}(")
+            self.assertEqual(
+                count, 1,
+                f"AuxDataLoader.{method_name} is defined {count} times "
+                "(duplicate shadows the real implementation)",
+            )
+
     def test_train_one_step_derives_input_channels_from_model(self):
         """Bug fix: must read model.conv_in.shape, not hard-code 22."""
         import inspect
